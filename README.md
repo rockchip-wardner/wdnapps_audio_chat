@@ -64,6 +64,29 @@ pip install -e wdnapps_audio_chat
      所以写了 `static/previews/*`）：`static/*` 只匹配直接子项，漏掉的子目录
      在 editable 装法下完全看不出来，只有真 wheel 才暴露。
 
+## 重新生成试听样例
+
+自带音色的试听样例（`cards/tts/static/previews/*.wav`）是**离线产物**：
+一个音色合成一段要十几秒（NPU 上跑），放到页面上现算等不得。生成脚本
+在 `scripts/gen_voice_previews.py`：
+
+```bash
+# 在本包仓库根跑；.venv 是宿主 wdnwebui 的 —— 脚本走宿主的 HTTP 接口合成
+cd <wdnwebui>/.venv/src/wdnapps-audio-chat
+<wdnwebui>/.venv/bin/python -u scripts/gen_voice_previews.py
+```
+
+它调宿主的 `POST /api/tts/start` 合成（`play_to=browser`，批量生成不往
+板载喇叭出声），再把 SDK 写的 **32bit float** WAV 转成 **16bit PCM**
+（体积减半、播放器兼容性更稳），落到卡片的 `static/previews/`。
+
+改了音色表或试听文案后要重新跑一遍，否则样例与实际音色对不上 —— 试听
+按钮放的就是这些文件。
+
+> 另两个插件包（video-analyzer / hdmi-processor）没有 `scripts/`：它们的
+> 静态资源全是手写的，没有「需要离线生成的产物」。本包有，所以工具跟
+> 产物放一起 —— 谁改了音色表，就地就能重新生成。
+
 ## 与宿主的边界
 
 插件**只能** `from app.core.*`，不能 import 宿主的 `app.apps.*`（那是别的卡，
