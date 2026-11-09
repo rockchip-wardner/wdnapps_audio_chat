@@ -36,7 +36,7 @@ manifest `"id"` 与 entry point 名逐字相同 → 卡片目录有 `static/`」
 ```bash
 # 落在 wdnwebui 的 venv 里，与 wdnai/wdnav/wdndds 平级
 cd <wdnwebui>/.venv/src
-git clone git@10.10.10.10:wardner/wdnapps_audio_chat.git
+git clone git@github.com:rockchip-wardner/wdnapps_audio_chat.git
 pip install -e wdnapps_audio_chat
 ```
 

@@ -28,6 +28,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "build>=1.0"]
 
+[project.urls]
+Homepage = "https://github.com/rockchip-wardner/wdnapps_audio_chat"
+Repository = "https://github.com/rockchip-wardner/wdnapps_audio_chat"
+Issues = "https://github.com/rockchip-wardner/wdnapps_audio_chat/issues"
+
 # ---------------------------------------------------------------------------
 # 插件注册表 —— wdnwebui manifest 加载器唯一识别的 group
 #
