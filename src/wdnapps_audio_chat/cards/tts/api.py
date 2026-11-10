@@ -97,6 +97,9 @@ _MIN_UPLOAD_SECONDS = 1.0
 _MAX_UPLOAD_SECONDS = 30.0
 # 提取走 NPU:开 RKNN 上下文(~0.45s)+ 推理(~20ms)。给 60s 余量。
 _REGISTER_TIMEOUT_MS = 60_000
+# WebSocket 发送超时(秒)。对端半开(CLOSE-WAIT 且写缓冲排不空)时 send 会
+# 永远挂着 ⇒ 必须有上限。详见 image_editor 卡的同款说明。
+_WS_SEND_TIMEOUT = 5.0
 
 
 def _worker_rpc_session():
@@ -820,28 +823,37 @@ async def tts_ws(ws: WebSocket) -> None:
     audio_sr = 24000
     audio_ch = 1
     stop_event = asyncio.Event()
+    pump_task: Optional[asyncio.Task] = None
 
     async def _pump_audio() -> None:
         nonlocal sub_id, audio_q
         assert audio_q is not None
         try:
-            await ws.send_json({
-                "type": "audio_start",
-                "sample_rate": audio_sr,
-                "channels": audio_ch,
-            })
+            await asyncio.wait_for(
+                ws.send_json({
+                    "type": "audio_start",
+                    "sample_rate": audio_sr,
+                    "channels": audio_ch,
+                }),
+                timeout=_WS_SEND_TIMEOUT,
+            )
             chunks_sent = 0
             while not stop_event.is_set():
                 data = await audio_q.get()
                 if data == b"EOF":
                     break
                 try:
-                    await ws.send_bytes(data)
+                    # ⚠️ send 必须加超时：对端半开时写缓冲排不空 ⇒ 永远挂着
+                    await asyncio.wait_for(ws.send_bytes(data),
+                                          timeout=_WS_SEND_TIMEOUT)
                     chunks_sent += 1
                 except Exception:
                     return
             try:
-                await ws.send_json({"type": "audio_end"})
+                await asyncio.wait_for(
+                    ws.send_json({"type": "audio_end"}),
+                    timeout=_WS_SEND_TIMEOUT,
+                )
             except Exception:
                 pass
             _tts_log(f"ws[{id(ws)}] audio_end ({chunks_sent} chunks)")
@@ -855,7 +867,7 @@ async def tts_ws(ws: WebSocket) -> None:
             audio_q = None
 
     async def _client_msg_loop() -> None:
-        nonlocal sub_id, audio_q
+        nonlocal sub_id, audio_q, pump_task
         try:
             while True:
                 raw = await ws.receive_text()
@@ -866,7 +878,8 @@ async def tts_ws(ws: WebSocket) -> None:
                 mtype = (msg or {}).get("type")
                 if mtype == "ping":
                     try:
-                        await ws.send_json({"type": "pong"})
+                        await asyncio.wait_for(ws.send_json({"type": "pong"}),
+                                              timeout=_WS_SEND_TIMEOUT)
                     except Exception:
                         return
                 elif mtype == "subscribe_audio" and sub_id is None:
@@ -875,7 +888,7 @@ async def tts_ws(ws: WebSocket) -> None:
                         sub_id, asyncio.get_running_loop())
                     stop_event.clear()
                     _tts_log(f"ws[{id(ws)}] subscribe_audio sub_id={sub_id}")
-                    asyncio.create_task(_pump_audio())
+                    pump_task = asyncio.create_task(_pump_audio())
                 elif mtype == "unsubscribe_audio" and sub_id is not None:
                     stop_event.set()
                     sess.unsubscribe_audio(sub_id)
@@ -890,16 +903,19 @@ async def tts_ws(ws: WebSocket) -> None:
         snap["type"] = "status"
         return snap
 
-    client_task = asyncio.create_task(_client_msg_loop())
+    async def _push_loop() -> None:
+        """状态变化时推快照。
 
-    try:
-        await ws.send_json(_push_snap())
+        ⚠️ **状态不变时不 send** ⇒ 一条已经死掉但没关闭的连接永远等不到
+        一次 send ⇒ 也就永远发现不了它死了 ⇒ 必须靠「只读」的
+        ``_client_msg_loop`` 感知断开，由下面的 FIRST_COMPLETED 收尾。
+        """
+        nonlocal last_state, last_frames, last_msg, last_cap
         snap0 = sess.snapshot()
         last_state = snap0["state"]
         last_frames = snap0["frames"]
         last_msg = snap0["error"]
         last_cap = snap0.get("capability_ready")
-
         while True:
             snap = sess.snapshot()
             changed = (
@@ -909,12 +925,35 @@ async def tts_ws(ws: WebSocket) -> None:
                 or snap.get("capability_ready") != last_cap
             )
             if changed:
-                await ws.send_json(_push_snap())
+                try:
+                    # ⚠️ send 必须加超时：对端半开时写缓冲排不空 ⇒ 永远挂着
+                    await asyncio.wait_for(ws.send_json(_push_snap()),
+                                          timeout=_WS_SEND_TIMEOUT)
+                except (asyncio.TimeoutError, WebSocketDisconnect):
+                    return
+                except Exception:             # noqa: BLE001
+                    return
                 last_state = snap["state"]
                 last_frames = snap["frames"]
                 last_msg = snap["error"]
                 last_cap = snap.get("capability_ready")
             await asyncio.sleep(0.2)
+
+    client_task = asyncio.create_task(_client_msg_loop())
+    push_task = asyncio.create_task(_push_loop())
+
+    try:
+        try:
+            await asyncio.wait_for(ws.send_json(_push_snap()),
+                                   timeout=_WS_SEND_TIMEOUT)
+        except (asyncio.TimeoutError, WebSocketDisconnect):
+            return
+        except Exception:                     # noqa: BLE001
+            return
+        # 推送协程与「只读」client_task 赛跑：客户端断开 ⇒ client_task 先
+        # 结束 ⇒ 这里立刻收尾（否则推送协程会一直空转，handler 永不退出）
+        await asyncio.wait({push_task, client_task},
+                           return_when=asyncio.FIRST_COMPLETED)
     except WebSocketDisconnect:
         return
     except Exception as e:                       # pragma: no cover
@@ -926,8 +965,11 @@ async def tts_ws(ws: WebSocket) -> None:
         stop_event.set()
         if sub_id is not None:
             sess.unsubscribe_audio(sub_id)
-        client_task.cancel()
-        try:
-            await client_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        _tts_log(f"ws[{id(ws)}] closed")
+        for t in (push_task, client_task):
+            t.cancel()
+        if pump_task is not None:
+            pump_task.cancel()
+        await asyncio.gather(push_task, client_task,
+                             *([pump_task] if pump_task is not None else []),
+                             return_exceptions=True)
