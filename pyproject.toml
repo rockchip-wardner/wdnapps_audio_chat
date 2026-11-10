@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wdnapps-audio-chat"
 version = "0.1.0"
-description = "wdnwebui 音频类应用插件：语音生成"
+description = "wdnwebui 音频类应用插件：语音生成 + 流式语音识别"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
@@ -43,6 +43,7 @@ Issues = "https://github.com/rockchip-wardner/wdnapps_audio_chat/issues"
 # ---------------------------------------------------------------------------
 [project.entry-points."wdnwebui.cards"]
 "tts" = "wdnapps_audio_chat.cards.tts"
+"qwen3-asr" = "wdnapps_audio_chat.cards.qwen3_asr"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -57,5 +58,10 @@ exclude = ["tests*"]
 # 匹配 static 下的直接子项，匹配不到 previews/ 里的 *.wav —— 少写
 # 一条的表现是「卡片正常，但试听 404」，且 editable 装法下完全看不出来
 # （读的是源码树），只有真 wheel 才暴露。
+#
+# qwen3-asr 卡的 static/ 下还有 **capture-worklet.js**（AudioWorkletProcessor
+# 必须独立成文件）—— 它在 static 的直接子项里，`static/*` 覆盖得到；
+# preview.mp4 同理。
 [tool.setuptools.package-data]
 "wdnapps_audio_chat.cards.tts" = ["manifest.json", "static/*", "static/previews/*"]
+"wdnapps_audio_chat.cards.qwen3_asr" = ["manifest.json", "static/*"]

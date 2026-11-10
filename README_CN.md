@@ -2,17 +2,19 @@
 
 # wdnapps_audio_chat
 
-wdnwebui 的**音频类应用插件包**。装上之后，宿主页面上会出现这张卡：
+wdnwebui 的**音频类应用插件包**。装上之后，宿主页面上会出现这两张卡：
 
 | 卡 id | 标题 | 说明 |
 |---|---|---|
 | `tts` | 语音生成 | Qwen3-TTS 文本转语音；带音色选择、离线试听样例、用户音色克隆（上传/录制参考音频现场提取 x-vector） |
+| `qwen3-asr` | 流式语音识别 | Qwen3-ASR 流式识别；音频文件 / 含音轨的视频转写，浏览器麦克风或板载 ALSA 实时识别 |
 
 ## 它是什么形态
 
 **这是 wdnwebui 的插件，不是独立应用。** 卡片后端 `from app.core.*` import 宿主
 的服务——`ComputeRegistry`（LLMSession 唯一来源）、`app.core.audio.tts_bridge`
-（TTSRequest / session 代理）、`app.core.uploads`（用户音色落盘路径）等。这些是
+（TTSRequest / session 代理）、`app.core.audio.capture` / `app.core.audio.endpoint`
+（PCM 采集 / 重采样 / 停顿检测）、`app.core.uploads`（用户音色落盘路径）等。这些是
 wdnwebui 设计原则 4/5 规定的调用路径，插件绕不过去也不该绕。所以本 wheel 必须和
 wdnwebui 在**同一个解释器**里，且 wdnwebui 仓库根在 `sys.path` 上。
 
@@ -55,6 +57,9 @@ pip install -e wdnapps_audio_chat
 1. 建 `src/wdnapps_audio_chat/cards/<新卡>/`，目录结构照抄现有卡：
    `__init__.py`（`register_api` / `register_shutdown`）、`api.py`、`service.py`、
    `manifest.json`、`static/{template.html,app.js,app.css,wizard.json}`。
+   可以再加自己的后端模块，**不用**登记进 `package-data`（只有
+   `manifest.json` 和 `static/*` 算 data）：`qwen3-asr` 卡就在
+   `api.py` / `service.py` 旁边带了 `board_mic.py`（板载 ALSA 采集子进程管理）。
 2. 卡内 import 一律写全 `wdnapps_audio_chat.cards.<新卡>.xxx`，**不要**写
    `app.apps.*`。
 3. 在 `pyproject.toml` 注册 **两处**，缺一不可：
@@ -96,6 +101,14 @@ cd <wdnwebui>/.venv/src/wdnapps-audio-chat
 里的 `get_session()` 因此走**候选路径列表**（先试本包，再试树内旧路径），
 插件没装时抛 ImportError，由调用方（内置工具 `tts_alert`）按「工具不可用」
 软失败处理。
+
+> **`qwen3-asr` 卡的一个例外：板载麦克风采集脚本仍在宿主。**
+> `tools/asr_mic_agent.py`（独立进程跑 ALSA 采集）import 的是
+> `app.core.audio.alsa` —— 它是**宿主**的工具，所以留在宿主的 `tools/` 下，
+> 没跟着卡片搬进本包。卡片通过 `board_mic.py::_host_repo_root()`（从
+> `app.core.__file__` 反推宿主仓库根）定位它，**不依赖插件装在哪儿** ——
+> editable 装在 `.venv/src/` 下、还是真 wheel 装进 site-packages，都指向
+> 同一个宿主 `tools/`。找不到就报「找不到采集脚本」，不会让整张卡 import 失败。
 
 ## License
 

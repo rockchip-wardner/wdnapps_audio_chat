@@ -2,21 +2,23 @@
 
 # wdnapps_audio_chat
 
-Audio application plugin package for wdnwebui. Once installed, this card appears on
+Audio application plugin package for wdnwebui. Once installed, these cards appear on
 the host UI:
 
 | Card id | Title | Description |
 |---|---|---|
 | `tts` | Voice Generation | Qwen3-TTS text-to-speech; with voice selection, offline preview samples, and user voice cloning (upload/record a reference clip and extract the x-vector on the spot) |
+| `qwen3-asr` | Streaming Speech Recognition | Qwen3-ASR streaming transcription of audio files / videos with an audio track, plus live recognition from the browser microphone or the on-board ALSA device |
 
 ## What Form It Takes
 
 **This is a wdnwebui plugin, not a standalone application.** The card backend imports
 host services with `from app.core.*` — `ComputeRegistry` (the only source of
 `LLMSession`), `app.core.audio.tts_bridge` (TTSRequest / session proxy),
-`app.core.uploads` (where user voices land on disk), and so on. These are the call
-paths mandated by wdnwebui design principles 4/5; a plugin cannot route around them
-and should not try. Therefore this wheel must live in the **same interpreter** as
+`app.core.audio.capture` / `app.core.audio.endpoint` (PCM capture, resampling, pause
+detection), `app.core.uploads` (where user voices land on disk), and so on. These are
+the call paths mandated by wdnwebui design principles 4/5; a plugin cannot route around
+them and should not try. Therefore this wheel must live in the **same interpreter** as
 wdnwebui, with the wdnwebui repo root on `sys.path`.
 
 ## Installation
@@ -63,6 +65,10 @@ No host code or configuration needs to change after installation.
    existing card: `__init__.py` (`register_api` / `register_shutdown`), `api.py`,
    `service.py`, `manifest.json`,
    `static/{template.html,app.js,app.css,wizard.json}`.
+   Extra backend modules are allowed and are **not** listed in `package-data`
+   (only `manifest.json` and `static/*` are data): the `qwen3-asr` card, for
+   instance, carries `board_mic.py` (on-board ALSA capture subprocess
+   management) next to `api.py` / `service.py`.
 2. Always write in-card imports in full as
    `wdnapps_audio_chat.cards.<new-card>.xxx`; **do not** write `app.apps.*`.
 3. Register in **two** places in `pyproject.toml`, both required:
@@ -115,6 +121,16 @@ core must not depend on plugins — which is why `get_session()` in the host's
 first, then the old in-tree path). When the plugin is not installed it raises
 ImportError, and the caller (the built-in `tts_alert` tool) soft-fails with "tool
 unavailable".
+
+> **One exception for the `qwen3-asr` card: the on-board microphone capture script
+> stays in the host.** `tools/asr_mic_agent.py` (the standalone process that runs ALSA
+> capture) imports `app.core.audio.alsa` — it is a **host** tool, so it stays under the
+> host's `tools/` instead of moving into this package with the card. The card locates
+> it through `board_mic.py::_host_repo_root()` (which back-derives the host repo root
+> from `app.core.__file__`), so the lookup **does not depend on where the plugin is
+> installed** — an editable install under `.venv/src/` and a real wheel in
+> site-packages both point at the same host `tools/`. When it cannot be found the card
+> reports "capture script not found" instead of failing to import.
 
 ## License
 
