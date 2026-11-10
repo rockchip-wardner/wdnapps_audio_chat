@@ -1,96 +1,121 @@
+[English](README.md) | [简体中文](README_CN.md)
+
 # wdnapps_audio_chat
 
-wdnwebui 的**音频类应用插件包**。装上之后，宿主页面上会出现这张卡：
+Audio application plugin package for wdnwebui. Once installed, this card appears on
+the host UI:
 
-| 卡 id | 标题 | 说明 |
+| Card id | Title | Description |
 |---|---|---|
-| `tts` | 语音生成 | Qwen3-TTS 文本转语音；带音色选择、离线试听样例、用户音色克隆（上传/录制参考音频现场提取 x-vector） |
+| `tts` | Voice Generation | Qwen3-TTS text-to-speech; with voice selection, offline preview samples, and user voice cloning (upload/record a reference clip and extract the x-vector on the spot) |
 
-## 它是什么形态
+## What Form It Takes
 
-**这是 wdnwebui 的插件，不是独立应用。** 卡片后端 `from app.core.*` import 宿主
-的服务——`ComputeRegistry`（LLMSession 唯一来源）、`app.core.audio.tts_bridge`
-（TTSRequest / session 代理）、`app.core.uploads`（用户音色落盘路径）等。这些是
-wdnwebui 设计原则 4/5 规定的调用路径，插件绕不过去也不该绕。所以本 wheel 必须和
-wdnwebui 在**同一个解释器**里，且 wdnwebui 仓库根在 `sys.path` 上。
+**This is a wdnwebui plugin, not a standalone application.** The card backend imports
+host services with `from app.core.*` — `ComputeRegistry` (the only source of
+`LLMSession`), `app.core.audio.tts_bridge` (TTSRequest / session proxy),
+`app.core.uploads` (where user voices land on disk), and so on. These are the call
+paths mandated by wdnwebui design principles 4/5; a plugin cannot route around them
+and should not try. Therefore this wheel must live in the **same interpreter** as
+wdnwebui, with the wdnwebui repo root on `sys.path`.
 
-## 安装
+## Installation
 
-宿主仓库根有一条 `update_rkwhl.sh`，它同时驱动四个 SDK 和三个卡片插件包。
-**首选跑它**，别手动 pip：
+The host repo root carries an `update_rkwhl.sh` that drives the four SDKs and the
+three card plugin packages together. **Prefer running it** over manual pip:
 
 ```bash
 cd <wdnwebui>
-./update_rkwhl.sh                       # 按 git HEAD 决定哪些要重装
-UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh   # 强制全部重装
+./update_rkwhl.sh                       # reinstall only what the git HEAD says changed
+UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh   # force a full reinstall
 ```
 
-脚本对本包做的事：HEAD 没变就完全不碰 `.venv`（连 pip 都不跑）；HEAD 变了
-才 `purge_install_traces` + `pip install -e`。装完会跑一遍卡片注册校验
-（`scripts/check_plugin_entrypoints.py`），逐张卡确认「entry point 能解析 →
-manifest `"id"` 与 entry point 名逐字相同 → 卡片目录有 `static/`」。这挡的
-是那个静默失败：pip 全程报成功，宿主启动却把这张卡 FATAL 跳过。
+What the script does for this package: if HEAD is unchanged it does not touch `.venv`
+at all (pip is not even run); only when HEAD changes does it run `purge_install_traces`
++ `pip install -e`. After installing it runs a card registration check
+(`scripts/check_plugin_entrypoints.py`) that verifies, card by card: "the entry point
+resolves → the manifest `"id"` is character-for-character identical to the entry point
+name → the card directory has `static/`". This blocks the silent failure where pip
+reports success all the way through, yet the host startup FATAL-skips this card.
 
-手工装也可以（首次 clone 时脚本走的就是这条路）：
+Manual installation also works (this is the path the script takes on first clone):
 
 ```bash
-# 落在 wdnwebui 的 venv 里，与 wdnai/wdnav/wdndds 平级
+# lands in wdnwebui's venv, next to wdnai/wdnav/wdndds
 cd <wdnwebui>/.venv/src
 git clone git@github.com:rockchip-wardner/wdnapps_audio_chat.git
 pip install -e wdnapps_audio_chat
 ```
 
-宿主重启时扫描 `wdnwebui.cards` entry point 组，逐张卡片读 `manifest.json` 并
-挂载路由 + `/static/apps/<id>` 静态目录。装完不必改宿主任何一行代码或配置。
+On host restart it scans the `wdnwebui.cards` entry point group, reads each card's
+`manifest.json`, and mounts its routes plus the `/static/apps/<id>` static directory.
+No host code or configuration needs to change after installation.
 
-> `pip install` 不会因为缺依赖而静默跳过——宿主侧的
-> `_discover_from_entry_points()` 对每张卡单独 try/except，某张卡 import 失败
-> 只 `LOG.error` 并跳过该卡，其余卡照常加载，web UI 不会因此起不来。
-> 排错直接看宿主日志里的 `[<card_id>] plugin entry point ... not importable`。
+> `pip install` does not silently skip a card for missing dependencies — the host's
+> `_discover_from_entry_points()` wraps each card in its own try/except: if one card
+> fails to import it only logs `LOG.error` and skips that card, the rest load normally
+> and the web UI still starts. For troubleshooting, look straight for
+> `[<card_id>] plugin entry point ... not importable` in the host log.
 
-## 加一张新卡
+## Adding a New Card
 
-1. 建 `src/wdnapps_audio_chat/cards/<新卡>/`，目录结构照抄现有卡：
-   `__init__.py`（`register_api` / `register_shutdown`）、`api.py`、`service.py`、
-   `manifest.json`、`static/{template.html,app.js,app.css,wizard.json}`。
-2. 卡内 import 一律写全 `wdnapps_audio_chat.cards.<新卡>.xxx`，**不要**写
-   `app.apps.*`。
-3. 在 `pyproject.toml` 注册 **两处**，缺一不可：
-   - `[project.entry-points."wdnwebui.cards"]` 加 `<卡id> = "…cards.<新卡>"`
-     ——左边必须与 `manifest.json` 的 `"id"` **逐字**相同，否则宿主判 FATAL 跳过。
-   - `[tool.setuptools.package-data]` 加该卡的 `["manifest.json", "static/*"]`
-     ——不加的话静态资源不进 wheel，卡片能被发现但前端 404。
-     **静态资源有子目录时要一并列出**（本卡的试听样例在 `static/previews/`，
-     所以写了 `static/previews/*`）：`static/*` 只匹配直接子项，漏掉的子目录
-     在 editable 装法下完全看不出来，只有真 wheel 才暴露。
+1. Create `src/wdnapps_audio_chat/cards/<new-card>/`, copying the layout of the
+   existing card: `__init__.py` (`register_api` / `register_shutdown`), `api.py`,
+   `service.py`, `manifest.json`,
+   `static/{template.html,app.js,app.css,wizard.json}`.
+2. Always write in-card imports in full as
+   `wdnapps_audio_chat.cards.<new-card>.xxx`; **do not** write `app.apps.*`.
+3. Register in **two** places in `pyproject.toml`, both required:
+   - Add `<card-id> = "…cards.<new-card>"` under
+     `[project.entry-points."wdnwebui.cards"]` — the left side must be
+     character-for-character identical to the `"id"` in `manifest.json`, otherwise the
+     host marks it FATAL and skips it.
+   - Add the card's `["manifest.json", "static/*"]` under
+     `[tool.setuptools.package-data]` — without it the static assets do not enter the
+     wheel, so the card is discoverable but the front end 404s.
+     **List sub-directories explicitly** when there are any (this card's preview
+     samples live in `static/previews/`, so `static/previews/*` is listed):
+     `static/*` only matches direct children, and a missing sub-directory is
+     completely invisible under an editable install — it only shows up in a real
+     wheel.
 
-## 重新生成试听样例
+## Regenerating the Preview Samples
 
-自带音色的试听样例（`cards/tts/static/previews/*.wav`）是**离线产物**：
-一个音色合成一段要十几秒（NPU 上跑），放到页面上现算等不得。生成脚本
-在 `scripts/gen_voice_previews.py`：
+The preview samples for the built-in voices (`cards/tts/static/previews/*.wav`) are
+**offline artefacts**: synthesizing one clip per voice takes over ten seconds (it runs
+on the NPU), which is far too slow to compute on the fly when the page loads. The
+generation script lives at `scripts/gen_voice_previews.py`:
 
 ```bash
-# 在本包仓库根跑；.venv 是宿主 wdnwebui 的 —— 脚本走宿主的 HTTP 接口合成
+# run in this package's repo root; the .venv is the host wdnwebui's — the script synthesizes through the host's HTTP API
 cd <wdnwebui>/.venv/src/wdnapps-audio-chat
 <wdnwebui>/.venv/bin/python -u scripts/gen_voice_previews.py
 ```
 
-它调宿主的 `POST /api/tts/start` 合成（`play_to=browser`，批量生成不往
-板载喇叭出声），再把 SDK 写的 **32bit float** WAV 转成 **16bit PCM**
-（体积减半、播放器兼容性更稳），落到卡片的 `static/previews/`。
+It calls the host's `POST /api/tts/start` to synthesize (`play_to=browser`, so batch
+generation does not sound out of the board's speaker), then converts the SDK's
+**32bit float** WAV into **16bit PCM** (half the size, far more compatible with
+players) and drops it into the card's `static/previews/`.
 
-改了音色表或试听文案后要重新跑一遍，否则样例与实际音色对不上 —— 试听
-按钮放的就是这些文件。
+After changing the voice table or the preview text, run it again — otherwise the
+samples no longer match the actual voices, and it is those files the preview button
+plays.
 
-> 另两个插件包（video-analyzer / hdmi-processor）没有 `scripts/`：它们的
-> 静态资源全是手写的，没有「需要离线生成的产物」。本包有，所以工具跟
-> 产物放一起 —— 谁改了音色表，就地就能重新生成。
+> The other two plugin packages (video-analyzer / hdmi-processor) have no `scripts/`:
+> all of their static assets are hand-written, with no "artefacts that need offline
+> generation". This package does, so the tool lives next to the artefact it produces
+> — whoever changes the voice table can regenerate in place.
 
-## 与宿主的边界
+## Boundary with the Host
 
-插件**只能** `from app.core.*`，不能 import 宿主的 `app.apps.*`（那是别的卡，
-可能压根没装）。反向也不允许：core 不得依赖插件——宿主 `app/core/audio/tts_bridge.py`
-里的 `get_session()` 因此走**候选路径列表**（先试本包，再试树内旧路径），
-插件没装时抛 ImportError，由调用方（内置工具 `tts_alert`）按「工具不可用」
-软失败处理。
+A plugin may **only** `from app.core.*`; it must not import the host's `app.apps.*`
+(those are other cards and may not even be installed). The reverse is forbidden too:
+core must not depend on plugins — which is why `get_session()` in the host's
+`app/core/audio/tts_bridge.py` goes through a **candidate path list** (this package
+first, then the old in-tree path). When the plugin is not installed it raises
+ImportError, and the caller (the built-in `tts_alert` tool) soft-fails with "tool
+unavailable".
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
