@@ -3,7 +3,7 @@
   "title": "语音生成",
   "category": "audio",
   "description": "把中文文本转成自然语音。",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "preview_video": "/static/apps/tts/preview.mp4",
   "preview_image": "",
   "software_capabilities": [

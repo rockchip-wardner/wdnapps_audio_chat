@@ -3,7 +3,7 @@
   "title": "流式语音识别",
   "category": "audio",
   "description": "对音频流进行语音识别：上传文件/视频，或用麦克风做实时识别",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "preview_video": "/static/apps/qwen3-asr/preview.mp4",
   "preview_image": "",
   "software_capabilities": [
