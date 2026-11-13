@@ -9,7 +9,7 @@ the host UI:
 |---|---|---|
 | `tts` | Voice Generation | Qwen3-TTS text-to-speech; with voice selection, offline preview samples, and user voice cloning (upload/record a reference clip and extract the x-vector on the spot) |
 | `qwen3-asr` | Streaming Speech Recognition | Qwen3-ASR streaming transcription of audio files / videos with an audio track, plus live recognition from the browser microphone or the on-board ALSA device |
-| `text-chat` | Text Chat | Multi-turn text conversation with a local LLM (Qwen3.5-VL 4B / 9B), streaming tokens, tool calls and a context-window counter. **Staged here — see below** |
+| `text-chat` | Text Chat | Multi-turn text conversation with a local LLM (Qwen3.5-VL 4B / 9B), streaming tokens, tool calls and a context-window counter. The model is resolved **by capability**, so any installed model providing `swcap_text_chat` works — 9B is preferred, 4B is the fallback, and a newly installed provider is picked up without a code change. **Staged here — see below** |
 
 > ### `text-chat` is staged here, not finally placed ⚠️
 >

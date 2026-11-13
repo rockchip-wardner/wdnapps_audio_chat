@@ -3,10 +3,13 @@
 设计要点
 ========
 
-* **LLMSession 必须从 ComputeRegistry 取**：优先
-  ``get_session_for_model("swcap_text_chat", "qwen3.5-vl-9b")``，找不到再回退
-  ``qwen3.5-vl-4b``；拿到的是 ``wdndds.LLMRPCSession``，都找不到抛
+* **LLMSession 必须从 ComputeRegistry 取**：按**候选顺序**试
+  ``get_session_for_model("swcap_text_chat", <model_id>)`` —— 候选 =
+  卡片声明的偏好（``wizard.json`` 的 ``models``，首选在前）+ 本板已安装的
+  provider（后端动态列）+ 正在跑的 provider；拿到的是
+  ``wdndds.LLMRPCSession``，都找不到抛
   ``RuntimeError("功能未启用: swcap_text_chat")``。
+  ⇒ **新增模型不必改代码**（装完即进候选池）。
 * **推理在 compute_worker 子进程里跑**：``session.respond(...)`` 经 wdndds
   RPC 发出 ``{prompt, history, tools, options}``；worker 跑完
   ``LLMLocalSession`` 并把**原始文本**回传。ChatML 拼接在调用方完成
@@ -60,6 +63,7 @@ WS 帧类型
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue as _queue
 import re
@@ -67,7 +71,8 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, List, Optional
+from pathlib import Path
+from typing import Callable, Deque, Iterable, List, Optional, Tuple
 
 from app.core.chat.runner import MAX_NEW_TOKENS, split_thinking
 from app.core.thinking import effective_thinking
@@ -79,6 +84,104 @@ _LOG = logging.getLogger("text_chat")
 
 # Max buffered frames per WS subscriber before the oldest is dropped.
 _SUB_QUEUE_MAX = 500
+
+
+# --------------------------------------------------------------------------- #
+# 模型解析（运行期）
+# --------------------------------------------------------------------------- #
+#
+# 本卡按 **capability** 取 session，不认 model_id —— 哪个模型顶上由
+# 「本板实际有哪些 provider」决定。所以「偏好哪个模型」只能表达成
+# **顺序**，不能表达成「唯一那个」。
+#
+# 候选顺序 = 卡片声明的偏好 → 其余已安装 provider → 正在跑的 provider。
+# 三段各有各的用处：
+#
+# 1. **卡片声明的偏好**（``static/wizard.json``）—— 单一真源。向导的
+#    「一键开启」用它决定启哪个，运行期用它决定先试哪个 ⇒ 两边永远
+#    一致，不会出现「向导启了 9B、运行期却去要 4B」。
+# 2. **其余已安装 provider**（后端 ``list_supported_models()``）——
+#    「新增模型不必改代码」成立的地方：装完新模型、点「刷新模型」，
+#    它就进候选池。
+# 3. **正在跑的 provider**（``list_sessions``）—— 兜住**远端 peer**：
+#    peer 上的模型本板没装，第 2 段里没有，但它确实能提供这个能力。
+
+#: 本卡提供的 capability（= ``wizard.json`` 的 ``swcap_to_model`` 键名）。
+CAPABILITY = "swcap_text_chat"
+
+#: 卡片声明的模型偏好 —— **单一真源**。
+#: ``static/wizard.json`` 的 ``swcap_to_model.swcap_text_chat.models``
+#: （有序，首选在前）。``model_id`` 保持兼容（= 首选）。
+_WIZARD_JSON_PATH = Path(__file__).with_name("static") / "wizard.json"
+
+#: ``_declared_models()`` 的缓存 —— 卡片包是只读的，运行期不会变。
+_declared_models_cache: Optional[Tuple[str, ...]] = None
+
+
+def _declared_models() -> Tuple[str, ...]:
+    """卡片声明的模型偏好顺序（首选在前）。
+
+    读 ``static/wizard.json`` 的 ``swcap_to_model[CAPABILITY].models``；
+    没写 ``models`` 的老卡片退化成「只有 ``model_id``」（= 旧行为）。
+
+    读不到 / 解析失败时返回空序列 ⇒ 调用方退回「纯动态」策略，
+    不会因为配置文件坏了就把整张卡判死。
+    """
+    global _declared_models_cache
+    if _declared_models_cache is not None:
+        return _declared_models_cache
+    order: List[str] = []
+    try:
+        with open(_WIZARD_JSON_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        pin = ((raw or {}).get("swcap_to_model") or {}).get(CAPABILITY) or {}
+        for mid in pin.get("models") or []:
+            if isinstance(mid, str) and mid and mid not in order:
+                order.append(mid)
+        mid = pin.get("model_id")
+        if isinstance(mid, str) and mid and mid not in order:
+            order.insert(0, mid)      # model_id = 首选
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("读卡片声明的模型偏好失败（退回动态 provider）: %s", e)
+    _declared_models_cache = tuple(order)
+    return _declared_models_cache
+
+
+def _provider_models() -> Tuple[str, ...]:
+    """本板**已安装**且提供 ``CAPABILITY`` 的模型（动态）。
+
+    数据源 = ``registry.list_supported_models()`` —— 它遍历
+    ``MODEL_PRESETS``，而后者是「扫描模型根目录得到的**已安装**模型集合」
+    （worker manifest 随模型文件夹一起分发）。所以新装的模型
+    （clone 完点「刷新模型」）**不需要改任何代码**就会进候选池。
+    """
+    try:
+        from app.core.compute.registry import get_registry
+        models = get_registry().list_supported_models()
+    except Exception as e:  # noqa: BLE001
+        _LOG.debug("列 provider 失败: %s", e)
+        return ()
+    out: List[str] = []
+    for m in models or []:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if not mid or mid in out:
+            continue
+        if CAPABILITY in (m.get("capability_types") or []):
+            out.append(mid)
+    return tuple(out)
+
+
+def _candidate_models(running_ids: Optional[Iterable[str]] = None) -> Tuple[str, ...]:
+    """候选模型顺序：声明的偏好 → 其余已安装 provider → 正在跑的 provider。"""
+    out: List[str] = []
+    for mid in (list(_declared_models())
+                + list(_provider_models())
+                + list(running_ids or [])):
+        if mid and mid not in out:
+            out.append(mid)
+    return tuple(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -111,8 +214,9 @@ class _TextChatManager:
 
     # ---- 限制 ----
     HISTORY_MAX        = 200          # deque maxlen
-    #: 文本对话优先使用的模型。9B 占两张卡；4B 是回退（手动启用时）。
-    PREFERRED_MODELS   = ("qwen3.5-vl-9b", "qwen3.5-vl-4b")
+    # 注：模型偏好**不再写死在这里** —— 见模块级 `_candidate_models()`。
+    # 「先试哪个模型」= 卡片声明的偏好（wizard.json）+ 本板已安装的
+    # provider（后端动态列）。新增模型不必改代码。
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -190,17 +294,25 @@ class _TextChatManager:
 
         try:
             handles = get_registry().list_sessions(
-                "swcap_text_chat", include_remote=True,
+                CAPABILITY, include_remote=True,
             )
         except Exception:  # noqa: BLE001
             handles = []
+        # 候选顺序 = 声明偏好 → 已装 provider → 正在跑的 provider。
+        # 真正决定「用哪个」的是**哪个在跑**（handles），顺序只决定
+        # 「同时跑着多个时先要哪个」。
+        candidates = _candidate_models(h.model_id for h in handles)
         selected = None
-        for model_id in self.PREFERRED_MODELS:
+        for model_id in candidates:
             selected = next(
                 (h for h in handles if h.model_id == model_id), None,
             )
             if selected is not None:
                 break
+        if selected is None and handles:
+            # 兜底：handles 里有的模型既不在声明里、也不在已装清单里
+            # （例如远端 peer 提供的模型）—— 它确实能提供这个能力。
+            selected = handles[0]
         if selected is None:
             with self._lock:
                 self._session = None
@@ -352,7 +464,8 @@ class _TextChatManager:
     def _run_one(self, req: ChatRequest) -> None:
         """一轮推理：拿 proxy session → 拼 ChatML → 上下文检查 → reset+respond →
         切 thinking/answer → 推 WS → 写历史。"""
-        # 1. 拿 LLMRPCSession：9B 优先，4B 回退。实际用哪个以运行中的实例为准。
+        # 1. 拿 LLMRPCSession：按候选顺序（声明偏好 → 已装 provider →
+        #    正在跑的 provider）。实际用哪个以运行中的实例为准。
         try:
             model_id, session = self._select_session()
         except RuntimeError as e:
@@ -513,18 +626,24 @@ class _TextChatManager:
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     def _select_session(self):
+        """取本卡能提供 ``CAPABILITY`` 的 session（按候选顺序试）。
+
+        候选 = 卡片声明的偏好 → 本板已装 provider → 正在跑的 provider。
+        「都拿不到」时抛 ``RuntimeError("功能未启用: swcap_text_chat")`` ——
+        文案不变（前端 / 微信桥都按它判「功能未启用」）。
+        """
         from app.core.compute.registry import get_registry
 
         reg = get_registry()
         last_error: Optional[RuntimeError] = None
-        for model_id in self.PREFERRED_MODELS:
+        for model_id in _candidate_models():
             try:
                 return model_id, reg.get_session_for_model(
-                    "swcap_text_chat", model_id,
+                    CAPABILITY, model_id,
                 )
             except RuntimeError as e:
                 last_error = e
-        raise RuntimeError("功能未启用: swcap_text_chat") from last_error
+        raise RuntimeError(f"功能未启用: {CAPABILITY}") from last_error
 
     @staticmethod
     def _limits_for_session(session):

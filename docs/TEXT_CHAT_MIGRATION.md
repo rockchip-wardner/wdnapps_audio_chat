@@ -293,6 +293,34 @@ python scripts/verify_plugin_cards.py
 > `/tmp/wdnwebui-worker/`），且**跑前要腾空 NPU** —— 脚本自带 registry 会自己
 > spawn worker，跟服务侧同模型抢卡；跑完记得把服务侧的实例拉回来。
 
+---
+
+## 6.1 模型解析（2026-11-13）
+
+本卡**不认 model_id**，只认 capability `swcap_text_chat`。「用哪个模型」表达成
+**顺序**，写在**单一真源** `cards/text_chat/static/wizard.json`：
+
+```jsonc
+"swcap_to_model": {
+  "swcap_text_chat": {
+    "model_id": "qwen3.5-vl-9b",                    // = 首选（兼容旧字段）
+    "models": ["qwen3.5-vl-9b", "qwen3.5-vl-4b"],    // 候选列表（有序）
+    "npu_index": [0, 1]                             // 首选的卡位
+  }
+}
+```
+
+运行期（`service.py`）候选顺序 = ① 声明的偏好 → ② 本板**已安装**的 provider
+（后端 `list_supported_models()` 动态列）→ ③ 正在跑的 provider（兜住远端 peer）。
+⇒ **新增模型不必改代码**。宿主向导读**同一份** `wizard.json` ⇒ 向导启哪个、
+运行期先用哪个，永远一致。
+
+本板现状：`qwen3.5-vl-9b` **未安装**、只有 `qwen3.5-vl-4b` ⇒ 走回退路径，
+向导提示「⚠ 已改用本板可用的模型」，「一键开启所需模型」**可用**（旧逻辑在这里
+禁用 ⇒ 死路）。
+
+---
+
 ## 7. 本包的边界（不要越界）
 
 text_chat 迁进来之后，本包**同时**装了两类东西：

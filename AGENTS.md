@@ -84,3 +84,36 @@ the host UI: `qwen3-asr`（流式语音识别）、`tts`（语音生成）、`te
 > ⚠️ **text_chat 不使用任何 `app.core.audio.*`** —— 它和本包原有的两张卡没有
 > 代码共享，只有「住在同一个包里」这一层关系。别因为它在本包里就给音频卡
 > 引入文本依赖，反之亦然。依赖方向永远是**卡片 → `app.core.*`**。
+
+## text_chat 的模型解析：**候选列表** + 动态 provider
+
+本卡**不认 model_id**，只认 capability `swcap_text_chat`（卡片按 capability
+取 session）。所以「用哪个模型」只能表达成**顺序**，不能表达成「唯一那个」。
+
+**单一真源 = `cards/text_chat/static/wizard.json`**：
+
+```jsonc
+"swcap_to_model": {
+  "swcap_text_chat": {
+    "model_id": "qwen3.5-vl-9b",                    // = 首选（兼容旧字段）
+    "models": ["qwen3.5-vl-9b", "qwen3.5-vl-4b"],    // 候选列表（有序，首选在前）
+    "npu_index": [0, 1]                             // 首选的卡位
+  }
+}
+```
+
+运行期（`service.py`）的候选顺序 = **① 声明的偏好** → **② 本板已安装的
+provider**（后端 `list_supported_models()` 动态列）→ **③ 正在跑的 provider**
+（兜住远端 peer：peer 上的模型本板没装，第 ② 段里没有）。
+
+⇒ **新增模型不必改代码**：装完模型、算力页点「刷新模型」，它就进候选池。
+宿主向导读的是**同一份** `wizard.json`（`swcap_to_model.models`）⇒ 向导
+「一键开启」启哪个模型、运行期先用哪个模型，永远一致。
+
+⚠️ **`service.py` 里仍有一处模型 id 字面量**：`if model_id ==
+"qwen3.5-vl-9b"` —— 那是 9B **特有的思考段输出格式**（专用解析器），不是
+模型偏好。换模型要换解析器是另一件事，不要跟「偏好写死」混为一谈。
+
+回归（宿主仓）：`.venv/bin/python scripts/verify_wizard_model_fallback.py`
+（运行期解析 + 前端解析 + env 步提示与按钮，共 33 条断言）。
+
