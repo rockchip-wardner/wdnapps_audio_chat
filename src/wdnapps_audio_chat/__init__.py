@@ -1,12 +1,15 @@
-"""``wdnapps_audio_chat`` —— wdnwebui 的音频类应用插件包。
+"""``wdnapps_audio_chat`` —— wdnwebui 的应用插件包。
 
-提供 2 张卡片（通过 ``wdnwebui.cards`` entry point 暴露给 wdnwebui 的
+提供 3 张卡片（通过 ``wdnwebui.cards`` entry point 暴露给 wdnwebui 的
 manifest 加载器）：
 
 * ``tts`` —— 语音生成（Qwen3-TTS 文本转语音；带音色选择、试听样例、
   用户音色克隆）
 * ``qwen3-asr`` —— 流式语音识别（Qwen3-ASR；文件 / 含音轨的视频转写、
   浏览器麦克风实时识别、板载 ALSA 采集）
+* ``text-chat`` —— 文本对话（Qwen3.5-VL；多轮流式 + 工具调用）——
+  **暂存**：它是文本→文本的卡，与音频无关，最终会拆到独立的
+  ``wdnapps-chat`` 包。详见 ``docs/TEXT_CHAT_MIGRATION.md``。
 
 与宿主 wdnwebui 的关系
 ----------------------
@@ -28,6 +31,6 @@ URL、后端路由、wizard 字段 id 一个都没改**，只有 manifest.json �
 """
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 __all__ = ["__version__"]

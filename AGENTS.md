@@ -2,9 +2,9 @@
 
 Quick reference for agent sessions in this repo.
 
-Audio application plugin package for `wdnwebui`. Installing it makes
-these cards appear on the host UI: `qwen3-asr`（流式语音识别）、`tts`
-（语音生成）。
+Plugin package for `wdnwebui`. Installing it makes these cards appear on
+the host UI: `qwen3-asr`（流式语音识别）、`tts`（语音生成）、`text-chat`
+（文本对话 —— **暂存**，见下）。
 
 ## 仓库地址与同步策略（2026-11-10）
 
@@ -52,5 +52,35 @@ these cards appear on the host UI: `qwen3-asr`（流式语音识别）、`tts`
 
 - `src/wdnapps_audio_chat/cards/<card_id>/` — one directory per card: `manifest.json` + `api.py` / `service.py` + `static/`（`capture-worklet.js` 是 ASR 卡的采集 worklet）。
 - The host discovers the cards through the `wdnwebui.cards` entry point group —— `manifest.json` 是宿主装载的唯一契约。
+- `docs/TEXT_CHAT_MIGRATION.md` —— **text_chat 卡片的暂存说明 + 迁入步骤 + 未来拆包到 `wdnapps-chat` 的步骤**。
 - `scripts/` — helper scripts.
 - `src/wdnapps_audio_chat/__init__.py` — the package version.
+
+## text_chat 是**暂存**，不是最终归属 ⚠️
+
+`text-chat`（纯文本 → 文本的 LLM 对话卡）**不属于本包的语义边界**。本包是
+「音频类应用插件包」：`tts`（文本→语音）、`qwen3-asr`（音频→文本）。text_chat
+既不产生也不消费音频，能力词表 `swcap_text_chat` 也不在音频域。
+
+它暂存在这里是**分步推进的中间态**：
+
+1. **第一步（已做）**：把卡片从宿主仓 `app/apps/text_chat/` 搬进插件体系 ——
+   消除宿主仓对具体某张卡片的源码耦合，宿主只留 core + system 页。
+2. **第二步（计划中）**：把纯文本卡拆到独立的 `wdnapps-chat` 插件包 —— 与生态
+   「**按模态分包**」的惯例一致（video-analyzer / audio-chat / media-generator /
+   hdmi-processor 各自按模态成包）。
+
+**第二步什么时候做**：宿主仓 `app/apps/` 清空后；或出现第二张纯文本卡时；
+或本包的语义边界开始造成实际困扰时。
+
+**拆包只换包、不换契约** —— 卡 id `text-chat`、API 前缀 `/api/text-chat`、
+静态路径 `/static/apps/text-chat/*`、向导全局名 `window.ImApp_text_chat.*`
+**全部不变**，用户侧零感知。宿主仓的 `{% card_slot "text-chat" %}` 占位符
+**留在宿主**（现有 5 张插件卡也都在那儿）。
+
+**做改动前先读** `docs/TEXT_CHAT_MIGRATION.md` —— 里面有完整的迁入步骤、
+拆包步骤、回归验证命令，以及本包的边界提醒。
+
+> ⚠️ **text_chat 不使用任何 `app.core.audio.*`** —— 它和本包原有的两张卡没有
+> 代码共享，只有「住在同一个包里」这一层关系。别因为它在本包里就给音频卡
+> 引入文本依赖，反之亦然。依赖方向永远是**卡片 → `app.core.*`**。

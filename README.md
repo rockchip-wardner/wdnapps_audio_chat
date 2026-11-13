@@ -2,13 +2,43 @@
 
 # wdnapps_audio_chat
 
-Audio application plugin package for wdnwebui. Once installed, these cards appear on
+Plugin package for wdnwebui. Once installed, these cards appear on
 the host UI:
 
 | Card id | Title | Description |
 |---|---|---|
 | `tts` | Voice Generation | Qwen3-TTS text-to-speech; with voice selection, offline preview samples, and user voice cloning (upload/record a reference clip and extract the x-vector on the spot) |
 | `qwen3-asr` | Streaming Speech Recognition | Qwen3-ASR streaming transcription of audio files / videos with an audio track, plus live recognition from the browser microphone or the on-board ALSA device |
+| `text-chat` | Text Chat | Multi-turn text conversation with a local LLM (Qwen3.5-VL 4B / 9B), streaming tokens, tool calls and a context-window counter. **Staged here — see below** |
+
+> ### `text-chat` is staged here, not finally placed ⚠️
+>
+> `text-chat` is a **text → text** LLM card: it neither produces nor consumes
+> audio, and its capability `swcap_text_chat` does not belong to the audio
+> domain. This package is the *audio* application plugin package.
+>
+> It lives here as a **staging step**, not as a final decision:
+>
+> 1. **Done** — the card moved out of the host repo (`app/apps/text_chat/`) into
+>    the plugin system, so the host keeps only core + system pages and no
+>    longer carries the source of any individual card.
+> 2. **Planned** — the text card moves to a dedicated `wdnapps-chat` package,
+>    matching how this ecosystem groups cards **by modality**
+>    (`wdnapps_video_analyzer` / `wdnapps_audio_chat` /
+>    `wdnapps_media_generator` / `wdnapps_hdmi_processor`).
+>
+> Do the split when the host's `app/apps/` is empty, when a second text-only
+> card shows up, or when this package's semantic boundary starts to hurt.
+>
+> The split **changes the package, never the contract**: the card id
+> `text-chat`, the API prefix `/api/text-chat`, the static path
+> `/static/apps/text-chat/*` and the wizard hook
+> `window.ImApp_text_chat.applyWizardSnapshot` all stay unchanged — users
+> notice nothing.
+>
+> Read [`docs/TEXT_CHAT_MIGRATION.md`](docs/TEXT_CHAT_MIGRATION.md) before
+> touching this card: it has the full migration steps, the extraction steps
+> and the regression commands.
 
 ## What Form It Takes
 
@@ -20,6 +50,14 @@ detection), `app.core.uploads` (where user voices land on disk), and so on. Thes
 the call paths mandated by wdnwebui design principles 4/5; a plugin cannot route around
 them and should not try. Therefore this wheel must live in the **same interpreter** as
 wdnwebui, with the wdnwebui repo root on `sys.path`.
+
+> ⚠️ The `app.core.audio.*` services above are what the two **audio** cards
+> (`tts` / `qwen3-asr`) depend on. The staged `text_chat` card uses a different
+> set: `app.core.chat.*` (agent / runner / serial), `app.core.compute.registry`,
+> `app.core.tools.registry` and `app.core.thinking` — it does not touch a single
+> `app.core.audio.*` module. The three cards share **no code** with each other;
+> they merely live in the same package. The dependency direction is always
+> **card → `app.core.*`**.
 
 ## Installation
 

@@ -2,12 +2,36 @@
 
 # wdnapps_audio_chat
 
-wdnwebui 的**音频类应用插件包**。装上之后，宿主页面上会出现这两张卡：
+wdnwebui 的应用插件包。装上之后，宿主页面上会出现这三张卡：
 
 | 卡 id | 标题 | 说明 |
 |---|---|---|
 | `tts` | 语音生成 | Qwen3-TTS 文本转语音；带音色选择、离线试听样例、用户音色克隆（上传/录制参考音频现场提取 x-vector） |
 | `qwen3-asr` | 流式语音识别 | Qwen3-ASR 流式识别；音频文件 / 含音轨的视频转写，浏览器麦克风或板载 ALSA 实时识别 |
+| `text-chat` | 文本对话 | 与本地大模型（Qwen3.5-VL 4B / 9B）多轮对话：流式出字、工具调用、上下文窗口计数。**暂存于此，见下** |
+
+> ### `text-chat` 是**暂存**，不是最终归属 ⚠️
+>
+> `text-chat` 是**文本 → 文本**的 LLM 对话卡：它既不产生也不消费音频，能力
+> `swcap_text_chat` 也不在音频域 —— 而本包是**音频类**应用插件包。
+>
+> 它待在这里是**分步推进的中间态**，不是最终决定：
+>
+> 1. **已完成** —— 卡片从宿主仓（`app/apps/text_chat/`）搬进插件体系，宿主
+>    只留 core + system 页，不再持有任何单张卡片的源码。
+> 2. **计划中** —— 文本卡独立成 `wdnapps-chat` 包，与生态**按模态分包**的
+>    惯例一致（`wdnapps_video_analyzer` / `wdnapps_audio_chat` /
+>    `wdnapps_media_generator` / `wdnapps_hdmi_processor`）。
+>
+> **什么时候拆**：宿主 `app/apps/` 清空后；或出现第二张纯文本卡时；或本包的
+> 语义边界开始造成实际困扰时。
+>
+> 拆包**只换包、不换契约** —— 卡 id `text-chat`、API 前缀
+> `/api/text-chat`、静态路径 `/static/apps/text-chat/*`、向导回调
+> `window.ImApp_text_chat.applyWizardSnapshot` 全部不变，用户侧零感知。
+>
+> 动这张卡之前先读 [`docs/TEXT_CHAT_MIGRATION.md`](docs/TEXT_CHAT_MIGRATION.md)
+> —— 里面有完整的迁入步骤、拆包步骤和回归验证命令。
 
 ## 它是什么形态
 
@@ -17,6 +41,12 @@ wdnwebui 的**音频类应用插件包**。装上之后，宿主页面上会出�
 （PCM 采集 / 重采样 / 停顿检测）、`app.core.uploads`（用户音色落盘路径）等。这些是
 wdnwebui 设计原则 4/5 规定的调用路径，插件绕不过去也不该绕。所以本 wheel 必须和
 wdnwebui 在**同一个解释器**里，且 wdnwebui 仓库根在 `sys.path` 上。
+
+> ⚠️ 上面的 `app.core.audio.*` 是 `tts` / `qwen3-asr` 两张**音频卡**的依赖。
+> 暂存的 `text_chat` 用的是另一套：`app.core.chat.*`（agent / runner / serial）、
+> `app.core.compute.registry`、`app.core.tools.registry`、`app.core.thinking`
+> —— **它一行 `app.core.audio.*` 都不用**。三张卡之间没有代码共享，
+> 只是住在同一个包里。依赖方向永远是**卡片 → `app.core.*`**。
 
 ## 安装
 
