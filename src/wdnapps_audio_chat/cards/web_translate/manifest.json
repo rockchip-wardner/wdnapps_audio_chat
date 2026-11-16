@@ -1,0 +1,45 @@
+{
+  "id": "web-translate",
+  "title": "网页翻译",
+  "category": "chat",
+  "description": "用本板 NPU（RK1828）做界面翻译：右上角「界面语言」切换即走本地模型，不吃外网配额。",
+  "version": "0.1.0",
+  "preview_video": "",
+  "preview_image": "",
+  "software_capabilities": [
+    "swcap_translate"
+  ],
+  "hardware_capabilities": [],
+  "backend": {
+    "module": "wdnapps_audio_chat.cards.web_translate",
+    "register_api": "register_api",
+    "register_shutdown": "register_shutdown"
+  },
+  "frontend": {
+    "template": "/static/apps/web-translate/template.html",
+    "js": [
+      "/static/apps/web-translate/app.js"
+    ],
+    "css": [
+      "/static/apps/web-translate/app.css"
+    ]
+  },
+  "demo_guard": {
+    "active_state_keys": [
+      "busy"
+    ],
+    "stop_endpoints": [],
+    "stop_sync_endpoints": []
+  },
+  "prompts": {
+    "schema_class": "",
+    "editable_fields": [],
+    "prompt_template": ""
+  },
+  "requires_core": [
+    "compute.registry"
+  ],
+  "uploads_dir": "uploads/web_translate",
+  "display_order": 71,
+  "wizard_config": "wizard.json"
+}

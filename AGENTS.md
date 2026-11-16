@@ -4,7 +4,82 @@ Quick reference for agent sessions in this repo.
 
 Plugin package for `wdnwebui`. Installing it makes these cards appear on
 the host UI: `qwen3-asr`（流式语音识别）、`tts`（语音生成）、`text-chat`
-（文本对话 —— **暂存**，见下）。
+（文本对话 —— **暂存**，见下）、`web-translate`（网页翻译）。
+
+## `web-translate` 卡（网页翻译）
+
+界面翻译的**服务开关**：启用 = 起本板 NPU 上的翻译模型（HY-MT1.5，默认
+**4 个实例 = 2 张 1828 协卡 × 每卡 2 份**）**并**把 `npu` 这一路 provider
+接进板端的翻译链；禁用 = 先摘链再停模型。之后网页右上角「界面语言」切换
+就走本板 NPU。
+
+| 位置 | 内容 |
+|---|---|
+| `src/wdnapps_audio_chat/cards/web_translate/service.py` | 启停 + 状态（`WebTranslateManager`） |
+| `src/wdnapps_audio_chat/cards/web_translate/api.py` | `GET /api/web-translate/status`、`POST /enable`、`POST /disable`、`POST /translate` |
+| `src/wdnapps_audio_chat/cards/web_translate/static/` | `template.html`（功能页）+ `app.js` + `app.css` + `wizard.json` |
+
+### 4 个实例（2 卡 × 每卡 2 份）
+
+真源 = `static/wizard.json` 的 `swcap_to_model.swcap_translate.instance_slots`
+（4 条）—— **向导和卡片读的是同一份**，两处不一致会出现「向导开了 4 个、
+卡片只起 1 个」。
+
+实测（RK1828 双卡，24 条界面文案）：
+
+| 布局 | provider 层 | 端到端¹ |
+|---|---|---|
+| 1 实例 / 1 卡 | 3.30s (1.00×) | 5.52s |
+| 4 实例 / 2 卡×2 | 1.45s (2.31×) | 2.78s (1.99×) |
+
+¹ 端到端 = `POST /api/translate`（10 个有效轮次的中位；同一批文案、同一串
+目标语言、每次 disable→enable 清缓存后重跑）。
+
+⚠️ **加速的单位是「卡」不是「实例」** —— 同卡加一份只 +21%，加到第二张卡
+直接 +85%。
+
+⚠️ **批间 1.2s 间隔只对「走外网的 provider」生效** —— 那是给免费外网接口
+防限流用的，本板 NPU 没有外网连接，不 sleep。之前 NPU 路径也照睡，白等
+1.2s（占 4 实例端到端时间的 30%），把加速比从 1.99× 压到 1.69×。判据是
+provider 自己的属性 `TranslationProvider.local`，见宿主仓
+`app/core/translate/`。
+
+⚠️ **两条容易踩的**：
+
+1. **卡号 0 是合法值** —— `i.get("npu_index") or -1` 在卡 0 时会返回 -1
+   （falsy-zero），于是卡 0 上的实例永远匹配不上（表现为「明明 running 却报
+   启动失败」，然后干等 120s 超时）。要用
+   `if not isinstance(npu, int) or npu != int(card): continue`。
+2. **禁用要停全部份数**，不只是第一个 —— 同卡多份时漏停会留下还在占显存的
+   僵尸 worker。
+
+⚠️ **三条**：
+
+1. **端点必须是同步 `def`** —— 启用要等模型加载完（~20~30s）、禁用要等
+   unload + shutdown + SIGTERM 宽限（~3~5s）。写成 `async def` 的话这
+   30 秒里整个 Web UI 都没响应（FastAPI 只把 `async def` 跑在事件循环里）。
+2. **禁用要走 `reg.stop_instance_local(model_id, npu_index, replica)`** —— 那是
+   算力页「禁用」的同一套语义（unload → RPC shutdown → SIGTERM → 3s → SIGKILL）。
+   只 unload 会把 NPU 显存还回去但把 worker 进程留着。
+   ⚠️ `reg.snapshot()` 给的是**字典**，不是 `ModelInstance` 对象 ——
+   拿快照字典去调 `unload_one_instance()` 会报
+   `'dict' object has no attribute '_probe_gen'`（而且被 except 吞掉，
+   表现是「禁用成功但模型还在跑」）。
+3. **默认卡位 = `npu_index=0`** —— 本机 EP 协卡按 PCI BDF 排序编号，
+   0 号就是第一张 1828。翻译模型只要一张卡；图像生成（`qwenimage21`）要
+   两张，同占 0 号卡会抢显存起不来 —— 卡片会提前把这个冲突说出来。
+
+⚠️ **测吞吐时会被两个东西骗到**（写基准脚本时踩过）：
+
+* **缓存** —— `TranslateService` 按 `(source, target, text)` 记账，命中缓存
+  根本不调 provider（24 条全命中只要 0.01s）。绕缓存要**轮换目标语言**，
+  **不能**给文案加后缀（`（1）` / `#1`）—— 那会让 HY-MT 把短文案复读回来，
+  整批回退外网。
+* **整批回退** —— 一条翻不出来整批都走外网。所以基准的文案集必须是
+  「NPU 能整批翻通」的（宿主仓 `scripts/probe_npu_items.py` 逐条试出来）。
+
+向导走完（`ImApp_web_translate.applyWizardSnapshot`）→ **直接启用**翻译
+服务；失败抛 `start_failed:`，向导会显示错误并给「重新开启模型」的重试入口。
 
 ## 仓库地址与同步策略（2026-11-10）
 

@@ -48,6 +48,9 @@ Issues = "https://github.com/rockchip-wardner/wdnapps_audio_chat/issues"
 # 独立的 wdnapps-chat 包。卡 id / 路由 / 静态路径在拆包时全部不变。
 # 详见 docs/TEXT_CHAT_MIGRATION.md。
 "text-chat" = "wdnapps_audio_chat.cards.text_chat"
+# web-translate —— 界面翻译服务（NPU 本板翻译）。卡 id / 路由 / 静态路径
+# 与 manifest.json 逐字对应，改一处必须同时改另一处（宿主会做一致性校验）。
+"web-translate" = "wdnapps_audio_chat.cards.web_translate"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -72,3 +75,6 @@ exclude = ["tests*"]
 # text_chat 的 static/ 下没有子目录（app.css / app.js / template.html /
 # wizard.json / preview.mp4），static/* 覆盖得到。
 "wdnapps_audio_chat.cards.text_chat" = ["manifest.json", "static/*"]
+# web_translate 的 static/ 下同样没有子目录（app.css / app.js /
+# template.html / wizard.json），static/* 覆盖得到。
+"wdnapps_audio_chat.cards.web_translate" = ["manifest.json", "static/*"]

@@ -1,0 +1,113 @@
+      <section id="page-web-translate" class="page hidden" data-page="web-translate">
+        <header class="page-header">
+          <h2>网页翻译</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="wt-status-line">未启用</span>
+            <button class="wizard-mode-btn" data-wizard-mode data-page-id="web-translate">向导模式</button>
+          </div>
+        </header>
+
+        <!--
+          服务启停条 —— 这张卡的主控件。
+
+          为什么放在页面最上面而不是塞进别的卡片里：用户点完向导回到功能页，
+          第一眼要看到的必须是「翻译服务现在是开还是关」。状态、原因、
+          启停按钮全在这一条里，不用去别的页面找。
+
+          data-state 有三态：
+            off     —— 未启用（界面翻译走外网翻译站）
+            on      —— 已启用（界面翻译走本板 NPU）
+            pending —— 启停中（模型加载 / 卸载）
+        -->
+        <div id="wt-service" class="wt-service" data-state="off">
+          <div class="wt-service-head">
+            <span class="wt-service-dot" aria-hidden="true"></span>
+            <span class="wt-service-title" id="wt-service-title">翻译服务未启用</span>
+            <span class="wt-service-badge" id="wt-service-badge">外网翻译</span>
+          </div>
+          <p class="wt-service-detail" id="wt-service-detail">
+            正在读取状态…
+          </p>
+          <div class="wt-service-actions">
+            <button class="vd-btn vd-btn-primary" id="wt-enable-btn">启用翻译服务</button>
+            <button class="vd-btn" id="wt-disable-btn" disabled>禁用翻译服务</button>
+            <span class="wt-service-note" id="wt-service-note"></span>
+          </div>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <div class="imb-card-head-title">
+              <h3>服务详情</h3>
+              <span class="imb-status" id="wt-service-badge-inline" data-state="idle">未启用</span>
+            </div>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="wt-chain-note"></span>
+          </div>
+          <div class="imb-card-body">
+            <dl class="wt-info">
+              <div class="wt-info-row">
+                <dt class="wt-info-key">翻译模型</dt>
+                <dd class="wt-info-val" id="wt-model">—</dd>
+              </div>
+              <div class="wt-info-row">
+                <dt class="wt-info-key">计算卡</dt>
+                <dd class="wt-info-val" id="wt-card">—</dd>
+              </div>
+              <div class="wt-info-row">
+                <dt class="wt-info-key">模型实例</dt>
+                <dd class="wt-info-val" id="wt-instance">—</dd>
+              </div>
+              <div class="wt-info-row">
+                <dt class="wt-info-key">并行实例</dt>
+                <dd class="wt-info-val" id="wt-slots">—</dd>
+              </div>
+              <div class="wt-info-row">
+                <dt class="wt-info-key">provider 链</dt>
+                <dd class="wt-info-val" id="wt-chain">—</dd>
+              </div>
+            </dl>
+
+            <p class="wt-hint">
+              启用后，网页右上角「界面语言」切换会走本板 NPU（RK1828）翻译，
+              不消耗外网翻译站的免费额度；NPU 翻译不出来时会自动回退到外网，
+              界面翻译永远有结果。
+            </p>
+          </div>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <div class="imb-card-head-title">
+              <h3>试一下</h3>
+              <span class="imb-status" id="wt-test-badge" data-state="idle">就绪</span>
+            </div>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="wt-test-provider"></span>
+          </div>
+          <div class="imb-card-body">
+            <div class="wt-test-row">
+              <textarea id="wt-test-input" class="imb-textarea" rows="2"
+                        placeholder="输入一句中文，回车或点「翻译」试试"></textarea>
+              <div class="wt-test-actions">
+                <select id="wt-test-target" class="wt-select" aria-label="目标语言">
+                  <option value="en">英语</option>
+                  <option value="ja">日语</option>
+                  <option value="ko">韩语</option>
+                  <option value="fr">法语</option>
+                  <option value="de">德语</option>
+                  <option value="es">西班牙语</option>
+                  <option value="ru">俄语</option>
+                </select>
+                <button class="vd-btn vd-btn-primary" id="wt-test-btn">翻译</button>
+              </div>
+            </div>
+            <div class="wt-test-output" id="wt-test-output"></div>
+          </div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-web-translate"></pre>
+        </details>
+      </section>

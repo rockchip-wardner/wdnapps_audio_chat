@@ -1,0 +1,192 @@
+/* web-translate 卡片样式 —— 复用 framework.css 的 .imb-* / .vd-* 基础类，
+   这里只补这张卡特有的部分。
+ *
+ * ⚠️ 配色跟 **framework.css 的浅色主题** 走：卡片 `#fff` + `var(--border)`
+ * + 正文 `#111827` + 次要 `var(--muted)`。别用暗色主题的
+ * `rgba(0,0,0,0.12)` 底 + 近白文字 —— 框架没有 `--text` / `--text-dim`
+ * 这两个变量，`var(--text, #e6e9ee)` 会落到近白，在浅色底上直接看不见。 */
+
+/* ------------------------------------------------------------------ *
+ * 服务状态条 —— 页面最上面那块，用户进卡第一眼看到的东西
+ * ------------------------------------------------------------------ */
+.wt-service {
+  border: 1px solid var(--border, #e5e7eb);
+  border-left-width: 4px;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  padding: 12px 16px;
+  margin-bottom: 12px;
+}
+
+/* 三态：未启用（灰）/ 处理中（蓝，脉动）/ 已启用（绿） */
+.wt-service[data-state="off"] { border-left-color: #9ca3af; }
+.wt-service[data-state="pending"] { border-left-color: var(--accent, #2563eb); }
+.wt-service[data-state="on"] { border-left-color: #16a34a; }
+
+.wt-service-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.wt-service-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #9ca3af;
+  flex: 0 0 auto;
+}
+.wt-service[data-state="pending"] .wt-service-dot {
+  background: var(--accent, #2563eb);
+  animation: wt-pulse 1.1s ease-in-out infinite;
+}
+.wt-service[data-state="on"] .wt-service-dot { background: #16a34a; }
+
+@keyframes wt-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.wt-service-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #111827;
+}
+
+/* 「NPU 翻译」/「外网翻译」徽标 —— 翻译走哪条路，一眼能看出来 */
+.wt-service-badge {
+  font-size: 0.72rem;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border, #e5e7eb);
+  color: var(--muted, #6b7280);
+  background: #f9fafb;
+  white-space: nowrap;
+}
+.wt-service-badge[data-kind="npu"] {
+  color: #166534;
+  background: #dcfce7;
+  border-color: #86efac;
+  font-weight: 600;
+}
+.wt-service-badge[data-kind="pending"] {
+  color: #1d4ed8;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.wt-service-detail {
+  margin: 6px 0 0;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  color: var(--muted, #6b7280);
+}
+
+.wt-service-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.wt-service-note {
+  font-size: 0.8rem;
+  color: var(--muted, #6b7280);
+}
+.wt-service-note[data-kind="error"] { color: #b91c1c; }
+.wt-service-note[data-kind="ok"] { color: #15803d; }
+.wt-service-note[data-kind="busy"] { color: #1d4ed8; }
+
+/* ------------------------------------------------------------------ *
+ * 服务详情表
+ * ------------------------------------------------------------------ */
+.wt-info {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wt-info-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 0.45rem 0;
+  border-bottom: 1px dashed var(--border, #e5e7eb);
+}
+.wt-info-row:last-child { border-bottom: 0; }
+
+.wt-info-key {
+  flex: 0 0 6.5rem;
+  font-size: 0.84rem;
+  color: var(--muted, #6b7280);
+}
+
+.wt-info-val {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #111827;
+  word-break: break-word;
+}
+
+.wt-hint {
+  margin: 12px 0 0;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: var(--muted, #6b7280);
+}
+
+/* ------------------------------------------------------------------ *
+ * 试一下
+ * ------------------------------------------------------------------ */
+.wt-test-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wt-test-row .imb-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.wt-test-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.wt-select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 4px;
+  background: #fff;
+  color: #111827;
+  font-family: inherit;
+  font-size: 0.85rem;
+}
+
+.wt-test-output {
+  margin-top: 10px;
+  min-height: 1.6rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 6px;
+  background: #f9fafb;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  color: #111827;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.wt-test-output:empty { display: none; }
+.wt-test-output[data-state="error"] {
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #b91c1c;
+}
