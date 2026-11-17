@@ -51,6 +51,9 @@ Issues = "https://github.com/rockchip-wardner/wdnapps_audio_chat/issues"
 # web-translate —— 界面翻译服务（NPU 本板翻译）。卡 id / 路由 / 静态路径
 # 与 manifest.json 逐字对应，改一处必须同时改另一处（宿主会做一致性校验）。
 "web-translate" = "wdnapps_audio_chat.cards.web_translate"
+# content-review —— 图文内容审查（决策模型：图片+文字 → 逐项概率估计）。
+# 卡 id / 路由 / 静态路径与 manifest.json 逐字对应，改一处必须同时改另一处。
+"content-review" = "wdnapps_audio_chat.cards.content_review"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "wizard_title": "图文内容审查快速配置",
+  "swcap_to_model": {
+    "swcap_decision": {
+      "model_id": "intern-decision-4b",
+      "models": ["intern-decision-4b"],
+      "npu_index": [0]
+    }
+  },
+  "open_source_button": "",
+  "start_buttons": [],
+  "steps": [
+    { "id": "env",    "title": "运行环境检查", "kind": "env_check" },
+    { "id": "finish", "title": "完成配置",     "kind": "finish" }
+  ]
+}

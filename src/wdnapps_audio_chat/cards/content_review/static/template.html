@@ -1,0 +1,123 @@
+      <section id="page-content-review" class="page hidden" data-page="content-review">
+        <header class="page-header">
+          <h2>图文内容审查</h2>
+          <div class="header-meta">
+            <span class="collected-at" id="cr-status-line">未启用</span>
+            <button class="wizard-mode-btn" data-wizard-mode data-page-id="content-review">向导模式</button>
+          </div>
+        </header>
+
+        <!--
+          服务启停条 —— 这张卡的主控件。
+
+          决策模型（Intern-Decision-4B）不是对话模型：它不生成文本，而是对
+          任务里的每个「决策字段」输出候选符号的 logits，由 CPU 侧换算成
+          概率。所以这张卡做的事 = 把用户维护的审查维度列表翻译成一组
+          「是否」字段，每项各出一个概率。
+
+          data-state 有三态：
+            off     —— 未启用（审查不可用）
+            on      —— 已启用
+            pending —— 启停中（模型加载 / 卸载）
+        -->
+        <div id="cr-service" class="cr-service" data-state="off">
+          <div class="cr-service-head">
+            <span class="cr-service-dot" aria-hidden="true"></span>
+            <span class="cr-service-title" id="cr-service-title">决策模型未启用</span>
+            <span class="cr-service-badge" id="cr-service-badge">未就绪</span>
+          </div>
+          <p class="cr-service-detail" id="cr-service-detail">
+            正在读取状态…
+          </p>
+          <div class="cr-service-actions">
+            <button class="vd-btn vd-btn-primary" id="cr-enable-btn">启用决策模型</button>
+            <button class="vd-btn" id="cr-disable-btn" disabled>禁用决策模型</button>
+            <span class="cr-service-note" id="cr-service-note"></span>
+          </div>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <div class="imb-card-head-title">
+              <h3>审查维度</h3>
+              <span class="imb-status" id="cr-items-badge" data-state="idle">0 项</span>
+            </div>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="cr-items-limit"></span>
+          </div>
+          <div class="imb-card-body">
+            <!--
+              可增删的列表 —— 每项是一个审查维度。
+
+              ⚠️ 「名称」会**直接进模型的 prompt**（决策任务的字段名），所以
+              它就是模型看到的语义：「广告」「诈骗」比 item_0 有用得多。
+              「说明」是给模型的补充判定口径（可选）。
+
+              每个维度跑出来的是**独立的**概率（0~1），各项之间不归一化 ——
+              一条内容可以同时命中多个维度。
+            -->
+            <div class="cr-items" id="cr-items"></div>
+
+            <div class="cr-items-actions">
+              <button class="vd-btn" id="cr-add-item" type="button">+ 添加一项</button>
+              <button class="vd-btn" id="cr-reset-items" type="button">恢复默认</button>
+            </div>
+
+            <p class="cr-hint">
+              每个维度会被问一次「待审查内容里有没有它」，并给出 0~100% 的
+              概率。维度之间相互独立，同一条内容可以命中多个。
+            </p>
+          </div>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <div class="imb-card-head-title">
+              <h3>待审查内容</h3>
+              <span class="imb-status" id="cr-review-badge" data-state="idle">就绪</span>
+            </div>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="cr-review-meta"></span>
+          </div>
+          <div class="imb-card-body">
+            <div class="cr-input-row">
+              <textarea id="cr-text" class="imb-textarea" rows="4"
+                        placeholder="输入待审查的文字（可留空 —— 只给图也行）"></textarea>
+            </div>
+
+            <div class="cr-image-row">
+              <input type="file" id="cr-image-input" accept="image/*" hidden>
+              <button class="vd-btn" id="cr-image-btn" type="button">选择图片…</button>
+              <span class="cr-image-hint" id="cr-image-hint">可不选 —— 纯文字也能审查</span>
+              <button class="vd-btn" id="cr-image-clear" type="button" hidden>移除图片</button>
+              <img id="cr-image-preview" class="cr-image-preview" alt="待审查图片预览" hidden>
+            </div>
+
+            <div class="cr-run-row">
+              <button class="vd-btn vd-btn-primary" id="cr-run-btn">开始审查</button>
+              <span class="cr-run-note" id="cr-run-note"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="imb-card">
+          <div class="imb-card-head">
+            <div class="imb-card-head-title">
+              <h3>审查结果</h3>
+              <span class="imb-status" id="cr-result-badge" data-state="idle">未审查</span>
+            </div>
+            <span class="vd-spacer"></span>
+            <span class="imb-meta-inline" id="cr-result-meta"></span>
+          </div>
+          <div class="imb-card-body">
+            <div class="cr-results" id="cr-results">
+              <p class="cr-empty">还没有结果 —— 填好上面的维度和内容，点「开始审查」。</p>
+            </div>
+          </div>
+        </div>
+
+        <details class="raw-output">
+          <summary>完整 JSON</summary>
+          <pre class="payload" id="data-content-review"></pre>
+        </details>
+      </section>
