@@ -308,7 +308,7 @@
       }
 
       this._busy = true;
-      this.setRunNote("审查中…（图文决策约 9 秒，首次还要加载视觉模型）", "busy");
+      this.setRunNote("审查中…", "busy");
       const badge = $("cr-review-badge");
       if (badge) { badge.textContent = "审查中…"; badge.dataset.state = "busy"; }
       const btn = $("cr-run-btn");
