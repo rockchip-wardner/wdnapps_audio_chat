@@ -13,6 +13,8 @@
   const API = "/api/content-review";
   const POLL_MS = 3000;
   const LS_KEY = "wdnwebui.content_review.items";
+  /** 本地存储格式版本（结构变了才 +1）。 */
+  const STORE_VERSION = 2;
   /** 模型硬上限（决策任务最多 16 个字段）。 */
   const MAX_ITEMS = 16;
   /** 图像上传前先在浏览器缩到这么大长边（省流量；模型端还会再缩到 384×384）。 */
@@ -24,7 +26,24 @@
     { name: "诈骗", description: "涉及转账、冒充、诱导点击等欺诈内容" },
     { name: "色情低俗", description: "露骨或低俗的性相关内容" },
     { name: "暴力血腥", description: "血腥、暴力、伤害相关的画面或描述" },
+    { name: "政治", description: "涉及政治敏感、时政争议或相关不当表述" },
+    { name: "辱骂", description: "辱骂、贬损、攻击他人或群体的言论" },
+    { name: "火星文", description: "用拼音、谐音、符号等变体写法规避审核的内容" },
   ];
+
+  /**
+   * 上一版的默认维度名 —— 用来识别「这一版新增了哪些默认维度」。
+   *
+   * ⚠️ 默认维度是**存在浏览器 localStorage 里的**（LS_KEY），所以光改
+   * DEFAULT_ITEMS 对「已经用过这张卡」的浏览器**不生效** —— 刷新后还是旧的。
+   * 这里记一份「上一版的名字」，加载时只把**真正新增**的名字补进去：
+   *
+   *   - 新增的名字 → 追加到用户列表末尾（用户能看见「默认变了」）
+   *   - 已知的旧名字 → **不复活** —— 用户自己删掉的维度不会被塞回来
+   *
+   * 往后每次加默认维度，把「当前全部默认名」写进这里即可。
+   */
+  const PREV_DEFAULT_NAMES = ["广告", "诈骗", "色情低俗", "暴力血腥"];
 
   const $ = (id) => document.getElementById(id);
 
@@ -41,8 +60,10 @@
       if (this._inited) return;
       this._inited = true;
 
-      this._items = loadItems();
+      const loaded = loadItems();
+      this._items = loaded.items;
       this.renderItems();
+      if (loaded.notice) this.setRunNote(loaded.notice, "ok");
 
       $("cr-enable-btn")?.addEventListener("click", () => this.enable());
       $("cr-disable-btn")?.addEventListener("click", () => this.disable());
@@ -500,23 +521,80 @@
     });
   }
 
+  /**
+   * 读本地存的维度列表，并做**默认维度增量迁移**。
+   *
+   * 存储格式（2026-11-17 起）：
+   *   { "v": 2, "items": [...], "known": ["广告", ...] }
+   * 旧格式（裸数组）仍然认 —— 那种情况按「上一版默认名」处理，
+   * 于是只补真正新增的那几项，用户自己删/改过的旧维度不受影响。
+   *
+   * 返回 { items, notice }：notice 是给用户看的一句提示（有新增时才有）。
+   */
   function loadItems() {
+    let store = null;
     try {
       const raw = localStorage.getItem(LS_KEY);
-      const arr = raw ? JSON.parse(raw) : null;
-      if (Array.isArray(arr) && arr.length) {
-        return arr
-          .filter((x) => x && typeof x === "object")
-          .slice(0, MAX_ITEMS)
-          .map((x) => ({ name: String(x.name || ""), description: String(x.description || "") }));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          // 旧格式：裸数组（没有版本信息）
+          store = { items: parsed, known: PREV_DEFAULT_NAMES.slice() };
+        } else if (parsed && Array.isArray(parsed.items)) {
+          store = {
+            items: parsed.items,
+            known: Array.isArray(parsed.known) ? parsed.known : PREV_DEFAULT_NAMES.slice(),
+          };
+        }
       }
-    } catch (_) { /* 坏了就用默认 */ }
-    return DEFAULT_ITEMS.map((x) => ({ ...x }));
+    } catch (_) { /* 坏了就当没存过 */ }
+
+    // 从来没存过 ⇒ 直接给全套默认维度
+    if (!store) {
+      return { items: DEFAULT_ITEMS.map((x) => ({ ...x })), notice: "" };
+    }
+
+    const items = store.items
+      .filter((x) => x && typeof x === "object")
+      .slice(0, MAX_ITEMS)
+      .map((x) => ({ name: String(x.name || ""), description: String(x.description || "") }));
+
+    // 增量迁移：把这一版新增的默认维度补到列表末尾。
+    const known = store.known.length ? store.known : PREV_DEFAULT_NAMES;
+    const existing = new Set(items.map((x) => x.name).filter(Boolean));
+    const fresh = DEFAULT_ITEMS.filter((d) => known.indexOf(d.name) < 0 && !existing.has(d.name));
+
+    let added = 0;
+    let skipped = 0;
+    fresh.forEach((d) => {
+      if (items.length >= MAX_ITEMS) { skipped++; return; }
+      items.push({ ...d });
+      existing.add(d.name);
+      added++;
+    });
+
+    let notice = "";
+    if (added) {
+      notice = "已自动补充 " + added + " 个新的默认维度（"
+        + fresh.slice(0, added).map((d) => d.name).join("、") + "）";
+    }
+    if (skipped) {
+      notice += (notice ? "；" : "") + "已达 " + MAX_ITEMS + " 项上限，其余 " + skipped + " 项未自动添加";
+    }
+
+    // 把迁移结果写回去（顺带把 known 更新成当前默认名 ⇒ 下次不再重复补）
+    if (added || skipped) saveItems(items);
+
+    return { items: items, notice: notice };
   }
 
   function saveItems(items) {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify(items));
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        v: STORE_VERSION,
+        items: items,
+        known: DEFAULT_ITEMS.map((x) => x.name),
+      }));
     } catch (_) { /* 配额满了就算了 */ }
   }
 
