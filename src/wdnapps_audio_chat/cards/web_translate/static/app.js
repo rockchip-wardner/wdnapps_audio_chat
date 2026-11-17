@@ -17,6 +17,18 @@
   const API = "/api/web-translate";
   const POLL_MS = 3000;
 
+  // ---- 对外的翻译服务地址（宿主 core 的接口，不是卡片自己的） ----
+  //
+  // ⚠️ 这里只拼**路径**，host/协议交给 location.origin —— 板子前面有 TLS
+  // relay（8000 HTTP / 8443 HTTPS 都通），用户从哪个口访问只有浏览器知道，
+  // 后端猜端口必错。
+  //
+  // 指向 POST /api/translate（板端翻译代理）而不是卡片自己的
+  // /api/web-translate/*：后两个是给这张卡的界面用的，别的程序要调翻译
+  // 服务走前者。
+  const TRANSLATE_API = "/api/translate";
+  const TRANSLATE_STATUS_API = "/api/translate/status";
+
   const $ = (id) => document.getElementById(id);
 
   const WebTranslate = {
@@ -32,6 +44,7 @@
       $("wt-enable-btn")?.addEventListener("click", () => this.enable());
       $("wt-disable-btn")?.addEventListener("click", () => this.disable());
       $("wt-test-btn")?.addEventListener("click", () => this.test());
+      $("wt-copy-url")?.addEventListener("click", () => this.copyUrl());
       $("wt-test-input")?.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
@@ -161,6 +174,24 @@
           : "外网翻译站（本板 NPU 未启用）";
       }
 
+      // ---- 服务地址（对外可调用的翻译接口） ----
+      //
+      // origin 来自浏览器（板子可能有 8000/8443 两个入口），后端给不出
+      // 「用户看到的那个地址」。
+      const origin = (window.location && window.location.origin) || "";
+      const urlEl = $("wt-service-url");
+      if (urlEl) {
+        urlEl.textContent = origin + TRANSLATE_API;
+        urlEl.title = origin + TRANSLATE_API;
+      }
+      const curlEl = $("wt-service-curl");
+      if (curlEl) {
+        curlEl.textContent =
+          `curl -X POST ${origin}${TRANSLATE_API} `
+          + `-H 'Content-Type: application/json' `
+          + `-d '{"segments":["你好"],"source":"zh-CN","target":"en"}'`;
+      }
+
       // ---- 页头 / 卡头徽标 ----
       const line = $("wt-status-line");
       if (line) {
@@ -277,6 +308,25 @@
     },
 
     // ------------------------------------------------------------------ //
+    // 复制服务地址
+    // ------------------------------------------------------------------ //
+    async copyUrl() {
+      const btn = $("wt-copy-url");
+      const el = $("wt-service-url");
+      const text = (el && el.textContent) || "";
+      if (!text || text === "—") return;
+      const ok = await _copyText(text);
+      if (!btn) return;
+      const old = btn.textContent;
+      btn.textContent = ok ? "已复制" : "复制失败";
+      btn.dataset.kind = ok ? "ok" : "err";
+      setTimeout(() => {
+        btn.textContent = old;
+        btn.dataset.kind = "";
+      }, 1500);
+    },
+
+    // ------------------------------------------------------------------ //
     // 内部
     // ------------------------------------------------------------------ //
     async _post(url, body) {
@@ -304,6 +354,34 @@
   // ------------------------------------------------------------------ //
   // 小工具
   // ------------------------------------------------------------------ //
+  // 复制到剪贴板。
+  //
+  // ⚠️ 板子多半是 http://192.168.x.x:8000 ⇒ **非安全上下文**，
+  // navigator.clipboard 根本不存在 ⇒ 必须留 execCommand 的退路，
+  // 否则「复制」按钮在真机上永远失败（本地调试却是 https，反而好使）。
+  async function _copyText(text) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* 落到下面的退路 */ }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function _instanceText(st) {
     const s = st.instance_status || "not_loaded";
     const label = {

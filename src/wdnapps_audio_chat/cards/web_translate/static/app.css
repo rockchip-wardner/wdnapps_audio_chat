@@ -139,6 +139,52 @@
   color: var(--muted, #6b7280);
 }
 
+/* 「服务地址」那一行 —— 等宽字体 + 复制按钮，URL 要能一眼扫到 */
+.wt-info-val-url {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wt-info-val-url code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 4px;
+  background: #f9fafb;
+  color: #111827;
+  word-break: break-all;
+}
+.wt-copy-btn {
+  padding: 0.15rem 0.55rem;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.wt-copy-btn[data-kind="ok"] {
+  color: #15803d;
+  border-color: #86efac;
+  background: #dcfce7;
+}
+.wt-copy-btn[data-kind="err"] {
+  color: #b91c1c;
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+/* 调用示例那行 —— 长命令行要能换行，不能把卡片撑出横向滚动条 */
+.wt-hint-code code {
+  display: block;
+  margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.6;
+  color: #374151;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
 /* ------------------------------------------------------------------ *
  * 试一下
  * ------------------------------------------------------------------ */

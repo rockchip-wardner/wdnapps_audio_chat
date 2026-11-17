@@ -16,6 +16,10 @@
   },
   "open_source_button": "",
   "start_buttons": [],
+  "finish_extra": [
+    { "label": "服务地址",   "url_path": "/api/translate" },
+    { "label": "状态查询",   "url_path": "/api/translate/status" }
+  ],
   "steps": [
     { "id": "env",    "title": "运行环境检查", "kind": "env_check" },
     { "id": "finish", "title": "完成配置",     "kind": "finish" }

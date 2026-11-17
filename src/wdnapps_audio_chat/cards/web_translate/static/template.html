@@ -66,7 +66,31 @@
                 <dt class="wt-info-key">provider 链</dt>
                 <dd class="wt-info-val" id="wt-chain">—</dd>
               </div>
+              <!--
+                服务地址 —— 走完向导后给用户的「这个服务在哪儿」。
+
+                指向**宿主板端**的翻译接口 POST /api/translate（不是卡片自己的
+                /api/web-translate/*）：卡片那两个端点是给界面用的，对外
+                暴露的翻译服务是前者，别的程序照这个地址调即可。
+
+                URL 由前端用 location.origin 拼 —— 板子前面有 TLS relay，
+                用户可能是 http://板子IP:8000 也可能是 https://板子IP:8443，
+                后端不知道也不该猜端口。
+              -->
+              <div class="wt-info-row">
+                <dt class="wt-info-key">服务地址</dt>
+                <dd class="wt-info-val wt-info-val-url">
+                  <code id="wt-service-url">—</code>
+                  <button type="button" class="vd-btn wt-copy-btn"
+                          id="wt-copy-url">复制</button>
+                </dd>
+              </div>
             </dl>
+
+            <p class="wt-hint wt-hint-code">
+              外部程序直接 POST 这个地址即可（JSON body）：
+              <code id="wt-service-curl">—</code>
+            </p>
 
             <p class="wt-hint">
               启用后，网页右上角「界面语言」切换会走本板 NPU（RK1828）翻译，
