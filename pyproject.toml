@@ -81,3 +81,6 @@ exclude = ["tests*"]
 # web_translate 的 static/ 下同样没有子目录（app.css / app.js /
 # template.html / wizard.json），static/* 覆盖得到。
 "wdnapps_audio_chat.cards.web_translate" = ["manifest.json", "static/*"]
+# content_review 同上 —— ⚠️ 漏了这条，它的 static/ 不会进 wheel
+# （editable 安装看不出来，一打包分发，宿主挂载的目录就是空的）。
+"wdnapps_audio_chat.cards.content_review" = ["manifest.json", "static/*"]

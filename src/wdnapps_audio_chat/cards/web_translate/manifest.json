@@ -4,7 +4,7 @@
   "category": "chat",
   "description": "用本板 NPU（RK1828）做界面翻译：右上角「界面语言」切换即走本地模型，不吃外网配额。",
   "version": "0.1.0",
-  "preview_video": "",
+  "preview_video": "/static/apps/web-translate/preview.mp4",
   "preview_image": "",
   "software_capabilities": [
     "swcap_translate"
