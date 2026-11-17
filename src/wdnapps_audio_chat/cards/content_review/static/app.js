@@ -399,7 +399,15 @@
       try {
         const st = await this._post(API + "/enable", {});
         this.status = st;
-        this.setNote("决策模型已就绪 —— 可以提交图文审查。", "ok");
+        // 后端为了腾出这张卡，可能**自动停掉了**别的模型（决策模型要独占
+        // 一整张卡）—— 必须告诉用户，否则他会发现翻译服务莫名停了。
+        const stopped = (st && st.stopped) || [];
+        this.setNote(
+          stopped.length
+            ? "已就绪 —— 为腾出这张卡，已自动停掉：" +
+              stopped.map((s) => s.label || s.model_id).join("、")
+            : "决策模型已就绪 —— 可以提交图文审查。",
+          "ok");
         return st;
       } catch (err) {
         this.setNote(errText(err), "error");

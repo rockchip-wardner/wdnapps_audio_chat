@@ -70,32 +70,103 @@ _LOAD_POLL_S = 2.0
 _WARMUP_PROMPT = "Translate the following text from zh to en:\nok"
 
 
-def _slots() -> List[tuple]:
+#: 一张 EP 协卡的 NPU 显存（MB）。实测 RK1828 协卡 = 5120 MB。
+CARD_MEMORY_MB = 5120
+
+#: 翻译模型每份的显存估算（manifest 的 ``memory_estimate_mb``）。
+TRANSLATE_MEMORY_MB = 2200
+
+
+def _slots(reg=None) -> List[tuple]:
     """本卡默认启用的槽位表 [(卡号, 本卡第几份), ...]。
 
     读同目录 ``static/wizard.json`` 的 ``instance_slots``（向导读的是同一
     份）；读不到就退回 :data:`DEFAULT_SLOTS`。
+
+    ⚠️ **给了 ``reg`` 就会避开放不下的卡**：一张 1828 协卡只有 5120 MB，
+    而决策模型（LLM + 视觉常驻）一份就 ~3200 MB ⇒ 它占着的卡**塞不下**
+    翻译模型（3200 + 2200 = 5400 > 5120）。
+
+    ⇒ 所以「决策模型独占卡 0」时，翻译自动只在**另一张卡**上跑 —— 两边
+    都不用用户去算力页一格格取消勾选。翻译自己的实例**不计入**占用
+    （否则第二次 enable 会把自己起的份也算成「占着」）。
     """
     import json as _json
     from pathlib import Path as _Path
 
+    out: List[tuple] = []
     try:
         cfg = _json.loads(
             (_Path(__file__).resolve().parent / "static" / "wizard.json")
             .read_text(encoding="utf-8"))
         raw = (((cfg.get("swcap_to_model") or {})
                 .get(CAPABILITY) or {}).get("instance_slots"))
-        out = []
         for sl in raw or []:
             n = int(sl.get("npu_index"))
             r = int(sl.get("replica") or 0)
             if n >= 0:
                 out.append((n, r))
-        if out:
-            return out
+        if not out:
+            out = list(DEFAULT_SLOTS)
     except Exception as exc:  # noqa: BLE001
         LOG.debug("web_translate: 读 wizard.json 的 instance_slots 失败: %s", exc)
-    return list(DEFAULT_SLOTS)
+        out = list(DEFAULT_SLOTS)
+
+    if reg is None:
+        return out
+    free = _cards_with_room_for_one_copy(reg)
+    if not free:
+        raise RuntimeError(
+            "没有一张协卡放得下翻译模型（每份约 %d MB，一张卡 %d MB）"
+            % (TRANSLATE_MEMORY_MB, CARD_MEMORY_MB)
+        )
+    kept = [(n, r) for (n, r) in out if n in free]
+    if not kept:
+        raise RuntimeError(
+            "没有一张协卡放得下翻译模型 —— 已被别的模型占满了"
+        )
+    skipped = sorted({n for (n, _r) in out} - free)
+    if skipped:
+        LOG.info("web_translate: 卡 %s 放不下翻译模型（被别的模型占着），"
+                 "只在卡 %s 上起", skipped, sorted({n for (n, _r) in kept}))
+    return kept
+
+
+def _cards_with_room_for_one_copy(reg) -> set:
+    """还能再塞**一份**翻译模型的卡号集合。
+
+    按实例的 ``memory_estimate_mb`` 估算每张卡的占用 —— 决策模型那个
+    3200 MB 就是「LLM + 视觉常驻」的峰值估算，正好表达了「它要独占一卡」。
+    """
+    try:
+        all_cards = set(int(c) for c in reg.model_cards())
+    except Exception:  # noqa: BLE001
+        return set()
+    if not all_cards:
+        return set()
+    used: dict = {}
+    try:
+        snap = reg.snapshot()
+    except Exception:  # noqa: BLE001
+        return set()
+    for inst in snap.get("instances") or []:
+        # 翻译模型自己的实例不算 —— 我们问的是「还能不能再加一份」
+        if inst.get("model_id") == DEFAULT_MODEL:
+            continue
+        if inst.get("status") not in ("running", "loading"):
+            continue
+        mem = int(inst.get("memory_estimate_mb") or 0)
+        if mem <= 0:
+            continue
+        cards = inst.get("npu_indices") or [inst.get("npu_index")]
+        for c in cards:
+            if c is None:
+                continue
+            used[int(c)] = used.get(int(c), 0) + mem
+    return {
+        c for c in all_cards
+        if used.get(c, 0) + TRANSLATE_MEMORY_MB <= CARD_MEMORY_MB
+    }
 
 
 class WebTranslateManager:
@@ -122,7 +193,13 @@ class WebTranslateManager:
         inst_status = (inst or {}).get("status") or "not_loaded"
         installed = self._installed(reg, model_id)
         chain_has_npu = self._chain_has_npu()
-        slots = _slots()
+        # 「计划几份」要和**实际能起几份**一致 —— 决策模型独占一张卡时，
+        # 翻译只能起另一张卡的 2 份，说「计划 4 份」是误导。
+        # （取不到就退回全量，status 不该因为这个炸掉。）
+        try:
+            slots = _slots(reg)
+        except RuntimeError:
+            slots = _slots()
 
         # 正在跑的份数（每个实例一个 worker 进程，能同时跑一个推理）
         running = [i for i in mine if i.get("status") == "running"]
@@ -165,12 +242,16 @@ class WebTranslateManager:
         推理 —— 这是界面翻译能并行的**唯一**单位（一个 session 的 RPC
         执行器是 ``max_workers=1``）。
 
+        ⚠️ 但**放不下的卡会被自动跳过**：决策模型独占一张卡时（LLM+视觉
+        常驻 ~3200 MB），那张卡塞不下翻译模型（3200+2200 > 5120）⇒ 翻译
+        只在另一张卡上起（2 份而不是 4 份）。
+
         ``npu_index`` 给了就只起**那一张卡的 1 份**（老调用方 / 手工排查用）。
         """
-        slots = ([(int(npu_index), 0)] if npu_index is not None
-                 else _slots())
         with self._op_lock:
             reg = self._registry()
+            slots = ([(int(npu_index), 0)] if npu_index is not None
+                     else _slots(reg))
             if not self._installed(reg, DEFAULT_MODEL):
                 raise RuntimeError(
                     f"本机没有安装翻译模型 {DEFAULT_MODEL}"

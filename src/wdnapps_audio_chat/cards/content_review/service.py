@@ -197,12 +197,17 @@ class ContentReviewManager:
     # 启停
     # ------------------------------------------------------------------ #
     def enable(self, npu_index: Optional[int] = None) -> Dict[str, Any]:
-        """启用：起决策模型的一个实例。
+        """启用：起决策模型的一个实例，并把**这张卡清空**。
 
-        决策模型 ``max_replicas_per_card`` = 1（一次 prefill 就吃掉一整张
-        卡的量），所以这里只起**一份**。
+        决策模型要**独占**一整张卡：它的 LLM + 视觉编码器常驻，实测
+        ~3100 MB，而一张 1828 协卡只有 5120 MB —— 同卡再塞一个翻译模型
+        （2266 MB）就是 5366 MB，**顶爆**。
 
-        ``npu_index`` 给了就起那一张卡，否则默认第一张 1828 协卡。
+        ⇒ 所以这里**先清场**：把这张卡上的**所有其它模型实例**停掉，再起
+        决策模型。用户点一下「启用」就该拿到一个独占的卡，而不是自己
+        去算力页一格格取消勾选。
+
+        决策模型一份要 ~50 秒加载，所以这是**慢端点** —— 界面上按钮转圈。
         """
         card = DEFAULT_NPU_INDEX if npu_index is None else int(npu_index)
         with self._op_lock:
@@ -215,6 +220,10 @@ class ContentReviewManager:
             bad = reg.npu_card_error(card)
             if bad:
                 raise RuntimeError(bad)
+
+            # ---- 清场：停掉这张卡上的所有其它模型 --------------------------
+            stopped = self._clear_card(reg, card)
+
             conflict = self._conflict(reg, card)
             if conflict:
                 raise RuntimeError(conflict)
@@ -233,10 +242,18 @@ class ContentReviewManager:
                     raise RuntimeError(
                         "决策模型启动失败（卡 #%d）：%s"
                         % (card, err.get("error") or "未知原因")
-                        + "（该模型每份约需 3200 MB 显存 —— 同卡别的模型占着"
-                          "就会挤不下）"
+                        + "（该模型一份约需 3100 MB 显存 —— 视觉编码器是"
+                          "常驻的，同卡别的模型放不下）"
                     )
-            return self.status()
+            out = self.status()
+            # 告诉用户「为了腾出这张卡，我停掉了什么」
+            out["stopped"] = stopped
+            if stopped:
+                out["detail"] = (
+                    "决策模型已就绪（独占卡 #%d）—— 启用时已自动停掉：%s。"
+                    % (card, "、".join(s["label"] for s in stopped))
+                )
+            return out
 
     def disable(self) -> Dict[str, Any]:
         """禁用：停掉决策模型实例。
@@ -514,6 +531,52 @@ class ContentReviewManager:
         except Exception:  # noqa: BLE001
             pass
         return "(未知)"
+
+    @staticmethod
+    def _clear_card(reg, card: int) -> List[Dict[str, Any]]:
+        """停掉**这张卡上的所有其它模型实例**，让决策模型独占它。
+
+        返回停掉了什么（给前端显示「已为你停掉 …」）。
+
+        ⚠️ **必须逐实例停**：``stop_instance_local(model, npu, replica)`` 停的是
+        **一个**实例 —— 翻译模型每卡 2 份，只停「卡 0 的第 0 份」的话第 1 份
+        还占着显存，清场等于没清。
+
+        ⚠️ 跨卡模型（``npu_indices`` 有多张）的实例要按**它自己的主卡**
+        (``npu_index``) 去停，不能拿目标卡号去停 —— 那可能命中别的实例。
+        """
+        stopped: List[Dict[str, Any]] = []
+        for inst in ContentReviewManager._instances(reg):
+            mid = inst.get("model_id")
+            if not mid or mid == DEFAULT_MODEL:
+                continue
+            if inst.get("status") not in ("running", "loading"):
+                continue
+            used = inst.get("npu_indices")
+            if not used:
+                used = [inst.get("npu_index")]
+            used = [int(u) for u in (used or []) if u is not None]
+            if int(card) not in used:
+                continue
+            npu = inst.get("npu_index")
+            npu = int(npu) if isinstance(npu, int) and npu >= 0 else None
+            replica = int(inst.get("replica") or 0)
+            label = inst.get("label") or mid
+            try:
+                with reg.model_op_lock(mid):
+                    reg.stop_instance_local(mid, npu, replica)
+                stopped.append({"model_id": mid, "label": label,
+                                "card": int(card), "replica": replica})
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("content_review: 清场停掉 %s 失败: %s", label, exc)
+                raise RuntimeError(
+                    "无法腾出卡 #%d：停掉「%s」失败（%s）"
+                    % (card, label, exc)
+                ) from exc
+        if stopped:
+            LOG.info("content_review: 清场卡 #%d，已停掉 %s",
+                     card, "、".join(s["label"] for s in stopped))
+        return stopped
 
     @staticmethod
     def _conflict(reg, card: Optional[int] = None) -> str:
