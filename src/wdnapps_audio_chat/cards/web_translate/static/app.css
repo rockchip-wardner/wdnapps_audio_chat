@@ -245,23 +245,13 @@
  *
  * 为什么需要紧凑 —— 框架的 `.imb-card` 带
  *   `height: calc(100vh - 220px); min-height: 480px`
- * 那是给「**并排两列的网格页**」准备的。这张卡原本是**单列堆叠两个大卡**
+ * 那是给「**并排两列的网格页**」准备的。这张卡是**上下堆叠两个大卡**
  * ⇒ 「服务详情」内容只 ~370px 却占 480px（底下空 ~110px），「试一下」
  * 内容只 ~150px 却占 480px ⇒ 整页大半是空白。
+ *
+ * ⚠️ 两张卡**保持上下堆叠**，不要改成并排 —— 「服务详情」是 6 行的信息表，
+ * 挤进半宽的列里会难看，「试一下」放它下面全宽才顺手。
  * ------------------------------------------------------------------ */
-
-/* 下面两张卡并排；窄屏回落成上下堆叠 */
-#page-web-translate .wt-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
-}
-@media (max-width: 1080px) {
-  #page-web-translate .wt-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 
 /* 卡片按内容高度自适应，不再撑满一屏 */
 #page-web-translate .imb-card {
@@ -308,6 +298,9 @@
 
 /* 试一下 */
 #page-web-translate .wt-test-row {
+  gap: 8px;
+}
+#page-web-translate .wt-test-actions {
   gap: 8px;
 }
 #page-web-translate .wt-test-output {
