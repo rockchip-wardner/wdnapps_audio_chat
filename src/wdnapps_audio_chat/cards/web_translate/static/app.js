@@ -329,6 +329,9 @@
       if (btn) btn.disabled = true;
       if (badge) { badge.textContent = "翻译中…"; badge.dataset.state = "busy"; }
       if (out) { out.textContent = ""; out.dataset.state = "busy"; }
+      // ⚠️ 上一轮的数字要**先清掉** —— 不然「翻译中…」的时候上一轮的
+      // 「1.83s · 18.2 tok/s」还挂在那儿，看着像这一轮的结果。
+      _clearPerf($("wt-test-perf"));
       try {
         const r = await fetch(API + "/translate", {
           method: "POST",
@@ -354,12 +357,15 @@
           providerEl.textContent = (srcLabel ? ("源：" + srcLabel + autoMark + " · ") : "")
             + (npu ? "由本板 NPU 翻译" : "由外网翻译站提供");
         }
+        // ---- 推理性能：总时间 + tokens/s ----
+        _renderPerf($("wt-test-perf"), data);
       } catch (err) {
         if (out) {
           out.textContent = _errText(err);
           out.dataset.state = "error";
         }
         if (badge) { badge.textContent = "失败"; badge.dataset.state = "error"; }
+        _clearPerf($("wt-test-perf"));
       } finally {
         if (btn) btn.disabled = false;
       }
@@ -408,6 +414,62 @@
       note.dataset.kind = kind || "";
     },
   };
+
+  // ------------------------------------------------------------------ //
+  // 推理性能显示（总时间 + tokens/s）
+  //
+  // ⚠️ **前端一个数都不算**（用户明确要求：不要在 JS 端计时）。
+  //
+  //   · ``elapsed_s``          —— 后端算好的端到端耗时（秒）
+  //   · ``tokens_per_second``  —— 后端算好的解码吞吐（tokens/s，
+  //     用的是 **SDK 自己那张 perf 表的公式**）
+  //
+  // ⚠️ **外网 provider 不推理** ⇒ ``tokens_per_second`` 是 0 ⇒ 只显示
+  // 总耗时。那条路上压根没有「推理」这回事，显示一个编出来的 tok/s
+  // 才是骗人。
+  //
+  // 这里只做**显示格式化**（把数字变成字符串），不做任何计时或换算。
+  // ------------------------------------------------------------------ //
+  function _renderPerf(el, data) {
+    if (!el) return;
+    const src = data || {};
+    const elapsed = Number(src.elapsed_s);
+    const tps = Number(src.tokens_per_second);
+    const perf = src.perf || {};
+
+    const bits = [];
+    // ⚠️ 缓存命中时 elapsed_s 就是 0 —— 那是**真实的**（没推理，秒回），
+    // 所以照常显示，别把这一行藏掉（藏掉的话用户会以为功能坏了）。
+    if (Number.isFinite(elapsed)) bits.push(elapsed.toFixed(2) + " s");
+    if (tps > 0) bits.push(tps.toFixed(1) + " tok/s");
+    if (src.cached > 0) bits.push("缓存命中");
+    if (!bits.length) {
+      _clearPerf(el);
+      return;
+    }
+    el.textContent = "总耗时 " + bits.join(" · ");
+    el.hidden = false;
+    // 悬停给细账：token 数与两段耗时（也是后端给的原始数）
+    const detail = [];
+    if (perf.decode_tokens) detail.push("解码 " + perf.decode_tokens + " token");
+    if (perf.prefill_tokens) detail.push("预填充 " + perf.prefill_tokens + " token");
+    if (perf.decode_ms) detail.push("解码耗时 " + Number(perf.decode_ms).toFixed(0) + " ms");
+    if (perf.prefill_ms) detail.push("预填充耗时 " + Number(perf.prefill_ms).toFixed(0) + " ms");
+    if (perf.llm_latency_ms) {
+      detail.push("LLM 延迟 " + Number(perf.llm_latency_ms).toFixed(0) + " ms");
+    }
+    if (Number.isFinite(Number(src.elapsed_ms))) {
+      detail.push("端到端 " + Number(src.elapsed_ms).toFixed(0) + " ms");
+    }
+    el.title = detail.join(" · ");
+  }
+
+  function _clearPerf(el) {
+    if (!el) return;
+    el.textContent = "";
+    el.title = "";
+    el.hidden = true;
+  }
 
   // ------------------------------------------------------------------ //
   // 小工具

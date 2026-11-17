@@ -207,6 +207,16 @@
   flex-wrap: wrap;
 }
 
+/* 推理性能（总时间 + tokens/s）—— 靠 margin-left:auto 顶到这一行**右边**。 */
+.wt-test-perf {
+  margin-left: auto;
+  font-size: 0.78rem;
+  color: #6b7280;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.wt-test-perf[hidden] { display: none; }
+
 .wt-select {
   padding: 0.35rem 0.5rem;
   border: 1px solid var(--border, #e5e7eb);

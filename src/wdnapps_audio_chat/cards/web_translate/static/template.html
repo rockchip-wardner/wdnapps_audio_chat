@@ -198,6 +198,19 @@
                   <option value="he">希伯来语</option>
                   <option value="uk">乌克兰语</option>
                 </select>
+                <!--
+                  推理性能 —— 这一行**右边**显示「总时间 + tokens/s」。
+
+                  ⚠️ **数字全是后端算好的，前端一个都不算**（用户要求：
+                  不要在 JS 端计时）。后端给的是：
+                    · ``elapsed_s``         —— 端到端耗时（秒）
+                    · ``tokens_per_second`` —— 解码吞吐（tokens/s，用 SDK
+                      自己那张 perf 表的公式）
+
+                  ⚠️ **外网 provider 不推理** ⇒ 没有 tokens/s ⇒ 只显示总时间。
+                  这不是 bug：那条路压根没有「推理」这回事。
+                -->
+                <span class="wt-test-perf" id="wt-test-perf" hidden></span>
               </div>
             </div>
             <!--
