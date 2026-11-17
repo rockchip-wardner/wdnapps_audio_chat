@@ -29,91 +29,7 @@
   const TRANSLATE_API = "/api/translate";
   const TRANSLATE_STATUS_API = "/api/translate/status";
 
-  // ------------------------------------------------------------------ //
-  // 目标语言清单
-  //
-  // ⚠️ **只有一份真相**：框架的 `app/static/core/translate.js` 把界面语言
-  // 清单公开成了 `window.Translate.languages`（右上角那个「界面语言」下拉
-  // 就是用它渲染的）⇒ 卡片直接读它。
-  //
-  // 为什么要这样：卡片原来**自己抄了一份**（只有 7 种），框架那份是 21 种
-  // + 「中文(原文)」⇒ 两份清单各改各的，对不上（2026-11-17 用户报：
-  // 「目标语言也不全，和右上角对不上，中文都没有」）。抄第二份必然漂移。
-  //
-  // 下面是**兜底**副本（框架脚本还没就绪时用）。它由
-  // `scripts/verify_web_translate_service_url.py` 断言与框架那份**逐项
-  // 相等** —— 漂移会被回归抓住，不会悄悄溜过去。
-  // ------------------------------------------------------------------ //
-  const SOURCE_LANG = "zh-CN";
-  const FALLBACK_LANGUAGES = [
-    { code: "zh-CN", zh: "中文(原文)" },
-    { code: "en", zh: "英语" },
-    { code: "ja", zh: "日语" },
-    { code: "ko", zh: "韩语" },
-    { code: "fr", zh: "法语" },
-    { code: "de", zh: "德语" },
-    { code: "es", zh: "西班牙语" },
-    { code: "pt", zh: "葡萄牙语" },
-    { code: "it", zh: "意大利语" },
-    { code: "ru", zh: "俄语" },
-    { code: "ar", zh: "阿拉伯语" },
-    { code: "hi", zh: "印地语" },
-    { code: "th", zh: "泰语" },
-    { code: "vi", zh: "越南语" },
-    { code: "id", zh: "印尼语" },
-    { code: "ms", zh: "马来语" },
-    { code: "tr", zh: "土耳其语" },
-    { code: "pl", zh: "波兰语" },
-    { code: "nl", zh: "荷兰语" },
-    { code: "cs", zh: "捷克语" },
-    { code: "he", zh: "希伯来语" },
-    { code: "uk", zh: "乌克兰语" },
-  ];
-
   const $ = (id) => document.getElementById(id);
-
-  /**
-   * 填「目标语言」下拉框。
-   *
-   * 优先用框架的 `window.Translate.languages`（活的真相）；拿不到就用
-   * FALLBACK_LANGUAGES。
-   *
-   * ⚠️ 框架脚本是 `defer`，卡片脚本是动态注入的（异步）—— 两者**可能**
-   * 反过来（卡片的 IIFE 先跑）。所以拿不到时要**重试**几次，别让下拉框
-   * 永远是空的。
-   */
-  function fillTargetLanguages(triesLeft) {
-    const sel = $("wt-test-target");
-    if (!sel) return;
-    if (sel.dataset.filled === "1") return;
-
-    const live = (window.Translate && window.Translate.languages) || [];
-    // ⚠️ 框架那份清单**不含** zh-CN —— 右上角面板是**自己**在最前面加的
-    // 「中文(原文)」那一项（translate.js 的 buildUI）。所以这里也得自己补，
-    // 直接用 live 会漏掉中文（2026-11-17 踩过）。
-    const sourceItem = { code: SOURCE_LANG, zh: "中文(原文)" };
-    const list = live.length
-      ? [sourceItem].concat(live)
-      : FALLBACK_LANGUAGES;
-
-    sel.innerHTML = "";
-    list.forEach((lang) => {
-      const opt = document.createElement("option");
-      opt.value = lang.code;
-      // 中文(原文) 是「还原成原文」，其余是目标语言
-      opt.textContent = lang.code === SOURCE_LANG ? "中文(原文)" : (lang.zh || lang.code);
-      sel.appendChild(opt);
-    });
-    sel.dataset.filled = "1";
-    // 框架那份比兜底多的时候，以框架为准（上面已经这么做了）；
-    // 这里只在**确实没拿到框架清单**时重试。
-    if (!live.length && (triesLeft || 0) > 0) {
-      setTimeout(() => {
-        sel.dataset.filled = "";
-        fillTargetLanguages((triesLeft || 0) - 1);
-      }, 150);
-    }
-  }
 
   const WebTranslate = {
     status: null,
@@ -129,8 +45,6 @@
       $("wt-disable-btn")?.addEventListener("click", () => this.disable());
       $("wt-test-btn")?.addEventListener("click", () => this.test());
       $("wt-copy-url")?.addEventListener("click", () => this.copyUrl());
-      // 目标语言下拉框：内容由框架的 window.Translate.languages 填（见上面的说明）
-      fillTargetLanguages(20);
       $("wt-test-input")?.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
