@@ -313,6 +313,9 @@
       if (badge) { badge.textContent = "审查中…"; badge.dataset.state = "busy"; }
       const btn = $("cr-run-btn");
       if (btn) btn.disabled = true;
+      // ⚠️ 上一轮的数字要**先清掉** —— 不然「审查中…」的时候上一轮的
+      // 「9.10 s · 320 tok/s」还挂在那儿，看着像这一轮的结果。
+      clearPerf($("cr-perf"));
 
       try {
         const r = await fetch(API + "/review", {
@@ -332,9 +335,12 @@
         this.renderResults(data);
         this.setRunNote("完成", "ok");
         if (badge) { badge.textContent = "完成"; badge.dataset.state = "ok"; }
+        // ---- 推理性能：总耗时 + tokens/s（数字都是后端算好的） ----
+        renderPerf($("cr-perf"), data);
       } catch (err) {
         this.setRunNote(errText(err), "error");
         if (badge) { badge.textContent = "失败"; badge.dataset.state = "error"; }
+        clearPerf($("cr-perf"));
       } finally {
         this._busy = false;
         if (btn) btn.disabled = false;
@@ -596,6 +602,60 @@
         known: DEFAULT_ITEMS.map((x) => x.name),
       }));
     } catch (_) { /* 配额满了就算了 */ }
+  }
+
+  // ------------------------------------------------------------------ //
+  // 推理性能显示（总耗时 + tokens/s）
+  //
+  // ⚠️ **前端一个数都不算**（用户明确要求：不要在 JS 端计时）。
+  //
+  //   · ``elapsed_sec``       —— 后端算好的端到端耗时（秒）
+  //   · ``tokens_per_second`` —— 后端算好的主吞吐（tokens/s）
+  //
+  // ⚠️ 决策模型是 **prefill-only**（每个字段跑一次 max_new_tokens=1 的
+  // 推理）⇒ 解码 token 恒为 0 ⇒ 那个 tokens/s 是**预填充速率**（提示词
+  // 处理速度），不是生成速度。
+  //
+  // 这里只做**显示格式化**，不做任何计时或换算。
+  // ------------------------------------------------------------------ //
+  function renderPerf(el, data) {
+    if (!el) return;
+    const src = data || {};
+    const elapsed = Number(src.elapsed_sec);
+    const tps = Number(src.tokens_per_second);
+    const perf = src.perf || {};
+
+    const bits = [];
+    if (Number.isFinite(elapsed)) bits.push(elapsed.toFixed(2) + " s");
+    if (tps > 0) bits.push(tps.toFixed(1) + " tok/s");
+    if (!bits.length) {
+      clearPerf(el);
+      return;
+    }
+    el.textContent = "总耗时 " + bits.join(" · ");
+    el.hidden = false;
+    // 悬停给细账：token 数与两段耗时（也是后端给的原始数）
+    const detail = [];
+    if (perf.prefill_tokens) {
+      detail.push("预填充 " + perf.prefill_tokens + " token");
+    }
+    if (perf.decode_tokens) {
+      detail.push("解码 " + perf.decode_tokens + " token");
+    }
+    if (perf.prefill_ms) {
+      detail.push("预填充耗时 " + Number(perf.prefill_ms).toFixed(0) + " ms");
+    }
+    if (perf.llm_latency_ms) {
+      detail.push("LLM 延迟 " + Number(perf.llm_latency_ms).toFixed(0) + " ms");
+    }
+    el.title = detail.join(" · ");
+  }
+
+  function clearPerf(el) {
+    if (!el) return;
+    el.textContent = "";
+    el.title = "";
+    el.hidden = true;
   }
 
   function errText(err) {

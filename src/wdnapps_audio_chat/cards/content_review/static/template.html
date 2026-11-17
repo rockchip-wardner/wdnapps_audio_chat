@@ -103,6 +103,19 @@
 
               <div class="cr-run-row">
                 <button class="vd-btn vd-btn-primary" id="cr-run-btn">开始审查</button>
+                <!--
+                  推理性能 —— **「开始审查」按钮右侧**显示「总耗时 + tokens/s」。
+
+                  ⚠️ **数字全是后端算好的，前端一个都不算**（用户要求：
+                  不要在 JS 端计时）。后端给的是：
+                    · ``elapsed_sec``        —— 端到端耗时（秒）
+                    · ``tokens_per_second``  —— SDK 算好的**主吞吐**
+                      （决策模型是 prefill-only ⇒ 那是**预填充速率**，
+                      即提示词处理速度）
+
+                  ⚠️ 模型出问题时没有 perf ⇒ 只显示总耗时。
+                -->
+                <span class="cr-perf" id="cr-perf" hidden></span>
                 <span class="cr-run-note" id="cr-run-note"></span>
               </div>
             </div>

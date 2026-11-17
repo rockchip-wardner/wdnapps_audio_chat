@@ -193,6 +193,16 @@
   font-size: 0.8rem;
   color: var(--muted, #6b7280);
 }
+
+/* 推理性能（总耗时 + tokens/s）—— 紧跟在「开始审查」按钮右边。 */
+.cr-perf {
+  font-size: 0.78rem;
+  color: var(--muted, #6b7280);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.cr-perf[hidden] { display: none; }
+
 .cr-run-note[data-kind="error"] { color: #b91c1c; }
 .cr-run-note[data-kind="ok"] { color: #15803d; }
 .cr-run-note[data-kind="busy"] { color: #1d4ed8; }

@@ -69,6 +69,53 @@ _FIELD_BAD_CHARS = re.compile(r"[\r\n\t]+")
 
 
 # --------------------------------------------------------------------------- #
+# 推理性能表（tokens/s 的原料）
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **数字只在 worker 进程里**：SDK 把它们记在 backend 上（决策模型是
+# ``backend.perf``，通用 LLM 是 ``backend.sink.perf``），worker 显式带过
+# wire，client 侧收在 ``session.last_perf``（见 ``wdndds/ai_session.py``）。
+#
+# ⇒ 这里**只是取出来 + 用 SDK 的公式算派生量**，前端一个数都不用自己算。
+def _session_perf(session: Any) -> Dict[str, float]:
+    """从 session 上读最近一次推理的性能表（读不到就空字典）。"""
+    if session is None:
+        return {}
+    perf = getattr(session, "last_perf", None)
+    if not isinstance(perf, dict) or not perf:
+        # 退路：本地 session（没走 RPC）—— 直接读 SDK 的 sink
+        sink = getattr(getattr(session, "_backend", None), "sink", None)
+        perf = getattr(sink, "perf", None)
+    if not isinstance(perf, dict):
+        return {}
+    return {
+        str(k): float(v) for k, v in perf.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+
+
+def _perf_table(session: Any) -> Dict[str, float]:
+    """性能表 + 派生量（tokens/s 等）。
+
+    ⚠️ 派生量用 **SDK 自己的** :func:`wdnai.perf_table` 算 —— 和 SDK 打印的
+    那张 perf 表**同一份公式**，不会两边漂。
+
+    ⚠️ **决策模型是 prefill-only**：每个字段跑一次 ``max_new_tokens=1``
+    的推理 ⇒ 解码 token 恒为 0 ⇒ 它的吞吐是**预填充速率**
+    （提示词处理速度），``perf_table`` 的 ``tokens_per_second`` 正是按这个
+    口径给的（有解码 token 用解码速率，没有就用预填充速率）。
+    """
+    raw = _session_perf(session)
+    if not raw:
+        return {}
+    from wdnai import perf_table
+
+    out = dict(raw)
+    out.update(perf_table(out))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
 def _run_coro(coro):
@@ -293,8 +340,13 @@ class ContentReviewManager:
                  "logits": [...]}
               ],
               "temperature": 1.9924, "elapsed_sec": 9.1,
+              "tokens_per_second": 320.5, "perf": {...},
               "has_image": true, "raw_answer": "{...}"
             }
+
+        ⚠️ **性能字段全部在端算好**（``elapsed_sec`` /
+        ``tokens_per_second`` / ``perf``）—— 前端只负责显示，一个数都不用
+        自己算。
         """
         text = (text or "").strip()
         if len(text) > MAX_TEXT_CHARS:
@@ -339,6 +391,9 @@ class ContentReviewManager:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"决策推理失败: {exc}") from exc
         elapsed = time.perf_counter() - t0
+        # ⚠️ **性能表必须在推理返回的当下取** —— ``last_perf`` 是「最近一次
+        # 推理」的单槽位，晚了就被别的请求覆盖了。
+        perf = _perf_table(session)
 
         detail = self._parse_detail(atts)
         decisions = detail.get("decisions") or {}
@@ -365,6 +420,14 @@ class ContentReviewManager:
             "results": results,
             "temperature": detail.get("temperature"),
             "elapsed_sec": round(elapsed, 2),
+            # ⚠️ **性能**：全部在**后端**算好再发给前端 —— 前端只负责
+            # 显示，一个数都不自己算（用户明确要求：不要在 JS 端计时）。
+            #
+            # ``tokens_per_second`` 是 SDK 算好的**主吞吐**（决策模型是
+            # prefill-only ⇒ 那是预填充速率）。
+            "tokens_per_second": round(
+                float(perf.get("tokens_per_second") or 0.0), 1),
+            "perf": perf,
             "model_id": DEFAULT_MODEL,
             "model_label": DEFAULT_MODEL_LABEL,
             "has_image": bool(image_b64),
