@@ -265,3 +265,122 @@
   color: var(--muted, #6b7280);
   word-break: break-word;
 }
+
+/* ------------------------------------------------------------------ *
+ * 紧凑布局（2026-11-17）
+ *
+ * ⚠️ **作用域**：下面所有规则都限定在 `#page-content-review` 下。
+ * 所有卡片的 app.css 都拼进同一个页面，不限定作用域就会改到别的卡。
+ *
+ * 为什么需要紧凑 —— 框架的 `.imb-card` 带
+ *   `height: calc(100vh - 220px); min-height: 480px`
+ * 那是给「**并排两列的网格页**」准备的（比如登录页）。这张卡原本是
+ * **单列堆叠三个大卡** ⇒ 光卡片就 ≥1440px，审查结果被顶到 ~1165px 处
+ * ⇒ 屏幕根本看不见 ⇒ 用户反馈「留白太多，审查结果看不到」。
+ *
+ * 四步：
+ *   1. 卡片高度改回「按内容自适应」（`height:auto; min-height:0`）
+ *   2. 卡头 / 卡身 / 间距整体收紧
+ *   3. 维度列表改**多列网格**（7 项排 2 行，而不是 7 行）
+ *   4. 「审查维度」和「待审查内容」**并排**（.cr-grid，见 template.html）
+ * ------------------------------------------------------------------ */
+
+/* 上面两张卡并排；维度列宽一点（列表要放得下），窄屏回落成上下堆叠 */
+#page-content-review .cr-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 1080px) {
+  #page-content-review .cr-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 卡片按内容高度自适应，不再撑满一屏 */
+#page-content-review .imb-card {
+  height: auto;
+  min-height: 0;
+}
+
+/* 卡头 / 卡身收紧 */
+#page-content-review .imb-card-head {
+  padding: 7px 12px;
+}
+#page-content-review .imb-card-body {
+  padding: 10px 12px;
+  gap: 8px;
+}
+
+/* 页头 */
+#page-content-review .page-header {
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.45rem;
+}
+
+/* 服务状态条 */
+#page-content-review .cr-service {
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+#page-content-review .cr-service-detail {
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+#page-content-review .cr-service-actions {
+  margin-top: 8px;
+}
+
+/* 维度列表：多列网格（7 项排 2 行，不是 7 行） */
+#page-content-review .cr-items {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 4px 10px;
+}
+#page-content-review .cr-item-name {
+  flex: 0 0 7.5rem;
+}
+#page-content-review .cr-item-desc {
+  flex: 1 1 6rem;
+  min-width: 5rem;
+}
+#page-content-review .cr-item-name,
+#page-content-review .cr-item-desc {
+  padding: 0.26rem 0.45rem;
+}
+#page-content-review .cr-items-actions {
+  margin-top: 8px;
+}
+#page-content-review .cr-hint {
+  margin: 6px 0 0;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+/* 待审查内容 */
+#page-content-review .cr-input-row {
+  margin-bottom: 6px;
+}
+#page-content-review .cr-run-row {
+  margin-top: 8px;
+}
+
+/* 结果 */
+#page-content-review .cr-results {
+  gap: 6px;
+}
+#page-content-review .cr-result-row {
+  padding: 0.36rem 0.6rem;
+}
+#page-content-review .cr-result-head {
+  margin-bottom: 4px;
+}
+#page-content-review .cr-result-desc {
+  margin-top: 4px;
+}
+
+/* 原始 JSON 折叠块 */
+#page-content-review .raw-output {
+  margin-top: 0.6rem;
+}

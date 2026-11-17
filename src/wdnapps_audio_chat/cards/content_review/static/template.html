@@ -36,66 +36,75 @@
           </div>
         </div>
 
-        <div class="imb-card">
-          <div class="imb-card-head">
-            <div class="imb-card-head-title">
-              <h3>审查维度</h3>
-              <span class="imb-status" id="cr-items-badge" data-state="idle">0 项</span>
+        <!--
+          ⚠️ 紧凑布局：上面两张卡**并排**（窄屏自动回落成上下堆叠）。
+
+          为什么并排 —— 框架的 `.imb-card` 带 `min-height: 480px`（那是给
+          「并排两列的网格页」准备的，比如登录页）。这张卡原本是**单列堆叠
+          三个大卡** ⇒ 光卡片就 ≥1440px，审查结果被顶到屏幕外看不见。
+          现在上面两张卡并排、下面结果卡全宽 ⇒ 结果区能落在首屏里。
+        -->
+        <div class="cr-grid">
+          <div class="imb-card">
+            <div class="imb-card-head">
+              <div class="imb-card-head-title">
+                <h3>审查维度</h3>
+                <span class="imb-status" id="cr-items-badge" data-state="idle">0 项</span>
+              </div>
+              <span class="vd-spacer"></span>
+              <span class="imb-meta-inline" id="cr-items-limit"></span>
             </div>
-            <span class="vd-spacer"></span>
-            <span class="imb-meta-inline" id="cr-items-limit"></span>
+            <div class="imb-card-body">
+              <!--
+                可增删的列表 —— 每项是一个审查维度。
+
+                ⚠️ 「名称」会**直接进模型的 prompt**（决策任务的字段名），所以
+                它就是模型看到的语义：「广告」「诈骗」比 item_0 有用得多。
+                「说明」是给模型的补充判定口径（可选）。
+
+                每个维度跑出来的是**独立的**概率（0~1），各项之间不归一化 ——
+                一条内容可以同时命中多个维度。
+              -->
+              <div class="cr-items" id="cr-items"></div>
+
+              <div class="cr-items-actions">
+                <button class="vd-btn" id="cr-add-item" type="button">+ 添加一项</button>
+                <button class="vd-btn" id="cr-reset-items" type="button">恢复默认</button>
+              </div>
+
+              <p class="cr-hint">
+                每个维度独立判定，输出 0~100% 概率，同一条内容可命中多项。
+              </p>
+            </div>
           </div>
-          <div class="imb-card-body">
-            <!--
-              可增删的列表 —— 每项是一个审查维度。
 
-              ⚠️ 「名称」会**直接进模型的 prompt**（决策任务的字段名），所以
-              它就是模型看到的语义：「广告」「诈骗」比 item_0 有用得多。
-              「说明」是给模型的补充判定口径（可选）。
-
-              每个维度跑出来的是**独立的**概率（0~1），各项之间不归一化 ——
-              一条内容可以同时命中多个维度。
-            -->
-            <div class="cr-items" id="cr-items"></div>
-
-            <div class="cr-items-actions">
-              <button class="vd-btn" id="cr-add-item" type="button">+ 添加一项</button>
-              <button class="vd-btn" id="cr-reset-items" type="button">恢复默认</button>
+          <div class="imb-card">
+            <div class="imb-card-head">
+              <div class="imb-card-head-title">
+                <h3>待审查内容</h3>
+                <span class="imb-status" id="cr-review-badge" data-state="idle">就绪</span>
+              </div>
+              <span class="vd-spacer"></span>
+              <span class="imb-meta-inline" id="cr-review-meta"></span>
             </div>
+            <div class="imb-card-body">
+              <div class="cr-input-row">
+                <textarea id="cr-text" class="imb-textarea" rows="3"
+                          placeholder="输入待审查的文字（可留空 —— 只给图也行）"></textarea>
+              </div>
 
-            <p class="cr-hint">
-              每个维度会被问一次「待审查内容里有没有它」，并给出 0~100% 的
-              概率。维度之间相互独立，同一条内容可以命中多个。
-            </p>
-          </div>
-        </div>
+              <div class="cr-image-row">
+                <input type="file" id="cr-image-input" accept="image/*" hidden>
+                <button class="vd-btn" id="cr-image-btn" type="button">选择图片…</button>
+                <span class="cr-image-hint" id="cr-image-hint">可不选 —— 纯文字也能审查</span>
+                <button class="vd-btn" id="cr-image-clear" type="button" hidden>移除图片</button>
+                <img id="cr-image-preview" class="cr-image-preview" alt="待审查图片预览" hidden>
+              </div>
 
-        <div class="imb-card">
-          <div class="imb-card-head">
-            <div class="imb-card-head-title">
-              <h3>待审查内容</h3>
-              <span class="imb-status" id="cr-review-badge" data-state="idle">就绪</span>
-            </div>
-            <span class="vd-spacer"></span>
-            <span class="imb-meta-inline" id="cr-review-meta"></span>
-          </div>
-          <div class="imb-card-body">
-            <div class="cr-input-row">
-              <textarea id="cr-text" class="imb-textarea" rows="4"
-                        placeholder="输入待审查的文字（可留空 —— 只给图也行）"></textarea>
-            </div>
-
-            <div class="cr-image-row">
-              <input type="file" id="cr-image-input" accept="image/*" hidden>
-              <button class="vd-btn" id="cr-image-btn" type="button">选择图片…</button>
-              <span class="cr-image-hint" id="cr-image-hint">可不选 —— 纯文字也能审查</span>
-              <button class="vd-btn" id="cr-image-clear" type="button" hidden>移除图片</button>
-              <img id="cr-image-preview" class="cr-image-preview" alt="待审查图片预览" hidden>
-            </div>
-
-            <div class="cr-run-row">
-              <button class="vd-btn vd-btn-primary" id="cr-run-btn">开始审查</button>
-              <span class="cr-run-note" id="cr-run-note"></span>
+              <div class="cr-run-row">
+                <button class="vd-btn vd-btn-primary" id="cr-run-btn">开始审查</button>
+                <span class="cr-run-note" id="cr-run-note"></span>
+              </div>
             </div>
           </div>
         </div>
