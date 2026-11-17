@@ -31,6 +31,54 @@
 
   const $ = (id) => document.getElementById(id);
 
+  // ------------------------------------------------------------------ //
+  // 源语言自动检测
+  //
+  // ⚠️ 为什么卡片要自己猜源语言：原来 source 被**写死成 "zh-CN"**，于是这张
+  // 卡只能做「中文→X」。喂非中文内容时前提是假的 ⇒ 模型行为不可预测：
+  //   · 目标 == 源（都 zh-CN）⇒ 恒等翻译 ⇒ 原样返回
+  //   · 目标 ≠ 源 ⇒ 模型被告知「源是中文」却拿到英文 ⇒ 短句原样返回、
+  //     **长句被翻成中文**（实测 3/3）
+  //
+  // 检测按**字符集**做 —— 这是唯一不依赖网络、也不会错的信号：
+  //   假名 → ja，谚文 → ko，天城文 → hi，阿拉伯文 → ar，泰文 → th，
+  //   希伯来文 → he，西里尔文 → ru，汉字 → zh-CN。
+  // 拉丁字母那一片（英/法/德/西/葡/意/印尼/马来/土/波/荷/捷/越）**分不出来**
+  //   ⇒ 一律当 en —— 模型对源语言标签不敏感（它真正在做的是「把这段文字翻成
+  //   目标语言」），而真要精确可以在下拉框里手动选。
+  // ------------------------------------------------------------------ //
+  const SOURCE_RULES = [
+    ["ja", /[\u3040-\u309f\u30a0-\u30ff]/],       // 假名
+    ["ko", /[\uac00-\ud7af\u1100-\u11ff]/],       // 谚文
+    ["hi", /[\u0900-\u097f]/],                    // 天城文
+    ["ar", /[\u0600-\u06ff\u0750-\u077f]/],       // 阿拉伯文
+    ["th", /[\u0e00-\u0e7f]/],                    // 泰文
+    ["he", /[\u0590-\u05ff]/],                    // 希伯来文
+    ["ru", /[\u0400-\u04ff]/],                    // 西里尔文
+    ["zh-CN", /[\u4e00-\u9fff\u3400-\u4dbf]/],    // 汉字
+  ];
+
+  function detectSource(text) {
+    const t = String(text || "");
+    for (const [code, re] of SOURCE_RULES) {
+      if (re.test(t)) return code;
+    }
+    return "en";   // 拉丁字母：分不出一律当英语
+  }
+
+  /** 语言码 → 中文名（给「源：英语」那句提示用）。 */
+  function langLabel(code) {
+    const names = {
+      "zh-CN": "中文", "en": "英语", "ja": "日语", "ko": "韩语", "fr": "法语",
+      "de": "德语", "es": "西班牙语", "pt": "葡萄牙语", "it": "意大利语",
+      "ru": "俄语", "ar": "阿拉伯语", "hi": "印地语", "th": "泰语",
+      "vi": "越南语", "id": "印尼语", "ms": "马来语", "tr": "土耳其语",
+      "pl": "波兰语", "nl": "荷兰语", "cs": "捷克语", "he": "希伯来语",
+      "uk": "乌克兰语",
+    };
+    return names[code] || code || "";
+  }
+
   const WebTranslate = {
     status: null,
     _busy: false,      // 启停进行中 —— 轮询让位，别把用户的状态覆盖回去
@@ -270,6 +318,14 @@
       const text = (input && input.value || "").trim();
       if (!text) return;
 
+      // ⚠️ **源语言不能写死成 zh-CN**（2026-11-17 用户报）。
+      // 写死 ⇒ 这张卡只能做「中文→X」：喂英文进来、选「翻译成中文」时
+      // source == target ⇒ **恒等翻译** ⇒ 原样返回英文；选「翻译成英语」时
+      // 模型被告知「源是中文」却拿到英文 ⇒ 前提是假的 ⇒ 短句原样返回、
+      // 长句被翻成中文（实测 3/3）。
+      const srcPick = ($("wt-test-source") || {}).value || "auto";
+      const source = srcPick === "auto" ? detectSource(text) : srcPick;
+
       if (btn) btn.disabled = true;
       if (badge) { badge.textContent = "翻译中…"; badge.dataset.state = "busy"; }
       if (out) { out.textContent = ""; out.dataset.state = "busy"; }
@@ -277,7 +333,7 @@
         const r = await fetch(API + "/translate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ segments: [text], source: "zh-CN", target: target }),
+          body: JSON.stringify({ segments: [text], source: source, target: target }),
         });
         const data = await r.json().catch(() => null);
         if (!r.ok) {
@@ -292,9 +348,11 @@
         if (badge) { badge.textContent = "完成"; badge.dataset.state = "ok"; }
         if (providerEl) {
           const npu = (data.providers || []).indexOf("npu") >= 0;
-          providerEl.textContent = npu
-            ? "由本板 NPU 翻译"
-            : ("由外网翻译站提供");
+          // 顺带把「用的哪个源语言」说出来 —— 自动检测是猜的，用户得看得见
+          const srcLabel = langLabel(source);
+          const autoMark = srcPick === "auto" ? "（自动检测）" : "";
+          providerEl.textContent = (srcLabel ? ("源：" + srcLabel + autoMark + " · ") : "")
+            + (npu ? "由本板 NPU 翻译" : "由外网翻译站提供");
         }
       } catch (err) {
         if (out) {
