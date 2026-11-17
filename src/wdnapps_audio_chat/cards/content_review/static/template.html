@@ -119,7 +119,17 @@
             <span class="imb-meta-inline" id="cr-result-meta"></span>
           </div>
           <div class="imb-card-body">
-            <div class="cr-results" id="cr-results">
+            <!--
+              ⚠️ `translate="no"` —— **结果区里的维度名/说明是数据，不是界面文案**。
+
+              框架的 `translate.js` 会把页面上所有中文文本节点当界面文案翻一遍。
+              不加这个属性的话：界面语言是英语时，结果里的维度名会被翻成英文，
+              而**上面输入框里的维度名不动**（INPUT 在跳过名单里）⇒ 两边对不上，
+              用户认不出哪条结果对应哪个维度。
+
+              框架的 SKIP_SELECTOR 第一项就是 `[translate='no']` ⇒ 加了就跳过。
+            -->
+            <div class="cr-results" id="cr-results" translate="no">
               <p class="cr-empty">还没有结果 —— 填好上面的维度和内容，点「开始审查」。</p>
             </div>
           </div>

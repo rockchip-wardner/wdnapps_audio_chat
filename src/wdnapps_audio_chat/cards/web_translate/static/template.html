@@ -167,7 +167,18 @@
                 </select>
               </div>
             </div>
-            <div class="wt-test-output" id="wt-test-output"></div>
+            <!--
+              ⚠️ `translate="no"` —— **译文框的内容是数据，不是界面文案**。
+
+              框架的 `translate.js` 会把页面上所有中文文本节点当界面文案翻一遍
+              （SKIP_SELECTOR 只排除了日志正文 / JSON 原文）。不加这个属性的话：
+              选「翻译成 ▾中文」拿回中文原文 ⇒ 界面语言是英语时，它**立刻被
+              界面翻译又翻成英语** ⇒ 用户看到「翻译成中文，出来还是英语」
+              （2026-11-17 用户报的就是这个）。
+
+              框架的 SKIP_SELECTOR 第一项就是 `[translate='no']` ⇒ 加了就跳过。
+            -->
+            <div class="wt-test-output" id="wt-test-output" translate="no"></div>
           </div>
         </div>
 
