@@ -357,7 +357,10 @@ class WebTranslateManager:
         「启动失败」发呆，不如提前说清楚。
         """
         try:
-            cards = {int(c["npu_index"]) for c in reg.model_cards()}
+            # ⚠️ ``model_cards()`` 返回 **List[int]**（卡号列表），不是 dict
+            # 列表 —— 写成 ``c["npu_index"]`` 会 TypeError，被 except 吞掉 ⇒
+            # 冲突检测**永远返回空**（卡位冲突的提示从来没生效过）。
+            cards = set(int(c) for c in reg.model_cards())
         except Exception:  # noqa: BLE001
             return ""
         for i in self._instances(reg):

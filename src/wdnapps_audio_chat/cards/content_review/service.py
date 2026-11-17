@@ -529,10 +529,15 @@ class ContentReviewManager:
         if card is None:
             return ""
         try:
-            cards = {int(c["npu_index"]) for c in reg.model_cards()}
+            # ⚠️ ``model_cards()`` 返回的是 **List[int]**（卡号列表），不是
+            # dict 列表 —— 写成 ``c["npu_index"]`` 会 TypeError，被 except
+            # 吞掉 ⇒ 冲突检测**永远返回空**（症状：明明卡上有别的模型，
+            # 点启用却一句提示都没有）。
+            cards = set(int(c) for c in reg.model_cards())
         except Exception:  # noqa: BLE001
-            return ""
-        if int(card) not in cards:
+            cards = set()
+        # 取不到卡位就**不**据此判定冲突（宁可少提示，也别把检测整段跳过）
+        if cards and int(card) not in cards:
             return ""
         for i in ContentReviewManager._instances(reg):
             if i.get("model_id") == DEFAULT_MODEL:
