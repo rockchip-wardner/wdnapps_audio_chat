@@ -236,3 +236,85 @@
   background: #fef2f2;
   color: #b91c1c;
 }
+
+/* ------------------------------------------------------------------ *
+ * 紧凑布局（2026-11-17）
+ *
+ * ⚠️ **作用域**：下面所有规则都限定在 `#page-web-translate` 下。
+ * 所有卡片的 app.css 都拼进同一个页面，不限定作用域就会改到别的卡。
+ *
+ * 为什么需要紧凑 —— 框架的 `.imb-card` 带
+ *   `height: calc(100vh - 220px); min-height: 480px`
+ * 那是给「**并排两列的网格页**」准备的。这张卡原本是**单列堆叠两个大卡**
+ * ⇒ 「服务详情」内容只 ~370px 却占 480px（底下空 ~110px），「试一下」
+ * 内容只 ~150px 却占 480px ⇒ 整页大半是空白。
+ * ------------------------------------------------------------------ */
+
+/* 下面两张卡并排；窄屏回落成上下堆叠 */
+#page-web-translate .wt-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (max-width: 1080px) {
+  #page-web-translate .wt-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 卡片按内容高度自适应，不再撑满一屏 */
+#page-web-translate .imb-card {
+  height: auto;
+  min-height: 0;
+}
+
+/* 卡头 / 卡身收紧 */
+#page-web-translate .imb-card-head {
+  padding: 7px 12px;
+}
+#page-web-translate .imb-card-body {
+  padding: 10px 12px;
+  gap: 8px;
+}
+
+/* 页头 */
+#page-web-translate .page-header {
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.45rem;
+}
+
+/* 服务状态条 */
+#page-web-translate .wt-service {
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+#page-web-translate .wt-service-detail {
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+#page-web-translate .wt-service-actions {
+  margin-top: 8px;
+}
+
+/* 服务详情表 */
+#page-web-translate .wt-info-row {
+  padding: 0.3rem 0;
+}
+#page-web-translate .wt-hint {
+  margin: 8px 0 0;
+  line-height: 1.45;
+}
+
+/* 试一下 */
+#page-web-translate .wt-test-row {
+  gap: 8px;
+}
+#page-web-translate .wt-test-output {
+  margin-top: 8px;
+}
+
+/* 原始 JSON 折叠块 */
+#page-web-translate .raw-output {
+  margin-top: 0.6rem;
+}

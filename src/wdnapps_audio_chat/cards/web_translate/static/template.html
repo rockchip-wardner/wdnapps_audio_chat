@@ -35,98 +35,112 @@
           </div>
         </div>
 
-        <div class="imb-card">
-          <div class="imb-card-head">
-            <div class="imb-card-head-title">
-              <h3>服务详情</h3>
-              <span class="imb-status" id="wt-service-badge-inline" data-state="idle">未启用</span>
+        <!--
+          ⚠️ 紧凑布局：下面两张卡**并排**（窄屏自动回落成上下堆叠）。
+
+          为什么并排 —— 框架的 `.imb-card` 带 `min-height: 480px`（那是给
+          「并排两列的网格页」准备的）。这张卡原本是**单列堆叠两个大卡** ⇒
+          「服务详情」内容只有 ~370px，底下空 ~110px；「试一下」更夸张，
+          内容 ~150px 却占 480px ⇒ 整页大半是空白。
+        -->
+        <div class="wt-grid">
+          <div class="imb-card">
+            <div class="imb-card-head">
+              <div class="imb-card-head-title">
+                <h3>服务详情</h3>
+                <span class="imb-status" id="wt-service-badge-inline" data-state="idle">未启用</span>
+              </div>
+              <span class="vd-spacer"></span>
+              <span class="imb-meta-inline" id="wt-chain-note"></span>
             </div>
-            <span class="vd-spacer"></span>
-            <span class="imb-meta-inline" id="wt-chain-note"></span>
-          </div>
-          <div class="imb-card-body">
-            <dl class="wt-info">
-              <div class="wt-info-row">
-                <dt class="wt-info-key">翻译模型</dt>
-                <dd class="wt-info-val" id="wt-model">—</dd>
-              </div>
-              <div class="wt-info-row">
-                <dt class="wt-info-key">计算卡</dt>
-                <dd class="wt-info-val" id="wt-card">—</dd>
-              </div>
-              <div class="wt-info-row">
-                <dt class="wt-info-key">模型实例</dt>
-                <dd class="wt-info-val" id="wt-instance">—</dd>
-              </div>
-              <div class="wt-info-row">
-                <dt class="wt-info-key">并行实例</dt>
-                <dd class="wt-info-val" id="wt-slots">—</dd>
-              </div>
-              <div class="wt-info-row">
-                <dt class="wt-info-key">provider 链</dt>
-                <dd class="wt-info-val" id="wt-chain">—</dd>
-              </div>
-              <!--
-                服务地址 —— 走完向导后给用户的「这个服务在哪儿」。
+            <div class="imb-card-body">
+              <dl class="wt-info">
+                <div class="wt-info-row">
+                  <dt class="wt-info-key">翻译模型</dt>
+                  <dd class="wt-info-val" id="wt-model">—</dd>
+                </div>
+                <div class="wt-info-row">
+                  <dt class="wt-info-key">计算卡</dt>
+                  <dd class="wt-info-val" id="wt-card">—</dd>
+                </div>
+                <div class="wt-info-row">
+                  <dt class="wt-info-key">模型实例</dt>
+                  <dd class="wt-info-val" id="wt-instance">—</dd>
+                </div>
+                <div class="wt-info-row">
+                  <dt class="wt-info-key">并行实例</dt>
+                  <dd class="wt-info-val" id="wt-slots">—</dd>
+                </div>
+                <div class="wt-info-row">
+                  <dt class="wt-info-key">provider 链</dt>
+                  <dd class="wt-info-val" id="wt-chain">—</dd>
+                </div>
+                <!--
+                  服务地址 —— 走完向导后给用户的「这个服务在哪儿」。
 
-                指向**宿主板端**的翻译接口 POST /api/translate（不是卡片自己的
-                /api/web-translate/*）：卡片那两个端点是给界面用的，对外
-                暴露的翻译服务是前者，别的程序照这个地址调即可。
+                  指向**宿主板端**的翻译接口 POST /api/translate（不是卡片自己的
+                  /api/web-translate/*）：卡片那两个端点是给界面用的，对外
+                  暴露的翻译服务是前者，别的程序照这个地址调即可。
 
-                URL 由前端用 location.origin 拼 —— 板子前面有 TLS relay，
-                用户可能是 http://板子IP:8000 也可能是 https://板子IP:8443，
-                后端不知道也不该猜端口。
-              -->
-              <div class="wt-info-row">
-                <dt class="wt-info-key">服务地址</dt>
-                <dd class="wt-info-val wt-info-val-url">
-                  <code id="wt-service-url">—</code>
-                  <button type="button" class="vd-btn wt-copy-btn"
-                          id="wt-copy-url">复制</button>
-                </dd>
-              </div>
-            </dl>
+                  URL 由前端用 location.origin 拼 —— 板子前面有 TLS relay，
+                  用户可能是 http://板子IP:8000 也可能是 https://板子IP:8443，
+                  后端不知道也不该猜端口。
+                -->
+                <div class="wt-info-row">
+                  <dt class="wt-info-key">服务地址</dt>
+                  <dd class="wt-info-val wt-info-val-url">
+                    <code id="wt-service-url">—</code>
+                    <button type="button" class="vd-btn wt-copy-btn"
+                            id="wt-copy-url">复制</button>
+                  </dd>
+                </div>
+              </dl>
 
-            <p class="wt-hint wt-hint-code">
-              外部程序直接 POST 这个地址即可（JSON body）：
-              <code id="wt-service-curl">—</code>
-            </p>
+              <p class="wt-hint wt-hint-code">
+                外部程序直接 POST 这个地址即可（JSON body）：
+                <code id="wt-service-curl">—</code>
+              </p>
 
-            <p class="wt-hint">
-              启用后，网页右上角「界面语言」切换会走本板 NPU（RK1828）翻译，
-              不消耗外网翻译站的免费额度；NPU 翻译不出来时会自动回退到外网，
-              界面翻译永远有结果。
-            </p>
-          </div>
-        </div>
-
-        <div class="imb-card">
-          <div class="imb-card-head">
-            <div class="imb-card-head-title">
-              <h3>试一下</h3>
-              <span class="imb-status" id="wt-test-badge" data-state="idle">就绪</span>
+              <p class="wt-hint">
+                启用后，网页右上角「界面语言」切换会走本板 NPU（RK1828）翻译，
+                不消耗外网翻译站的免费额度；NPU 翻译不出来时会自动回退到外网，
+                界面翻译永远有结果。
+              </p>
             </div>
-            <span class="vd-spacer"></span>
-            <span class="imb-meta-inline" id="wt-test-provider"></span>
           </div>
-          <div class="imb-card-body">
-            <div class="wt-test-row">
-              <textarea id="wt-test-input" class="imb-textarea" rows="2"
-                        placeholder="输入一句中文，回车或点「翻译」试试"></textarea>
-              <div class="wt-test-actions">
-                <select id="wt-test-target" class="wt-select" aria-label="目标语言">
-                  <option value="en">英语</option>
-                  <option value="ja">日语</option>
-                  <option value="ko">韩语</option>
-                  <option value="fr">法语</option>
-                  <option value="de">德语</option>
-                  <option value="es">西班牙语</option>
-                  <option value="ru">俄语</option>
-                </select>
-                <button class="vd-btn vd-btn-primary" id="wt-test-btn">翻译</button>
+
+          <div class="imb-card">
+            <div class="imb-card-head">
+              <div class="imb-card-head-title">
+                <h3>试一下</h3>
+                <span class="imb-status" id="wt-test-badge" data-state="idle">就绪</span>
               </div>
+              <span class="vd-spacer"></span>
+              <span class="imb-meta-inline" id="wt-test-provider"></span>
             </div>
-            <div class="wt-test-output" id="wt-test-output"></div>
+            <div class="imb-card-body">
+              <div class="wt-test-row">
+                <textarea id="wt-test-input" class="imb-textarea" rows="2"
+                          placeholder="输入一句中文，回车或点「翻译」试试"></textarea>
+                <div class="wt-test-actions">
+                  <!--
+                    ⚠️ 这是**目标语言**（源语言固定中文，见 app.js 发的
+                    `source: "zh-CN"`）。别改成源语言选择器。
+                  -->
+                  <select id="wt-test-target" class="wt-select" aria-label="目标语言">
+                    <option value="en">英语</option>
+                    <option value="ja">日语</option>
+                    <option value="ko">韩语</option>
+                    <option value="fr">法语</option>
+                    <option value="de">德语</option>
+                    <option value="es">西班牙语</option>
+                    <option value="ru">俄语</option>
+                  </select>
+                  <button class="vd-btn vd-btn-primary" id="wt-test-btn">翻译</button>
+                </div>
+              </div>
+              <div class="wt-test-output" id="wt-test-output"></div>
+            </div>
           </div>
         </div>
 
