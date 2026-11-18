@@ -127,31 +127,80 @@ def _slots(reg=None) -> List[tuple]:
         )
     skipped = sorted({n for (n, _r) in out} - free)
     if skipped:
-        LOG.info("web_translate: 卡 %s 放不下翻译模型（被别的模型占着），"
-                 "只在卡 %s 上起", skipped, sorted({n for (n, _r) in kept}))
+        # ⚠️ 把**占着它的本机模型**说出来 —— 「被别的模型占着」太笼统，
+        # 用户会以为卡上真跑着东西（本板 3 张卡全空时这句话最误导）。
+        blockers = _local_blockers(reg)
+        who = ("（%s）" % blockers) if blockers else ""
+        LOG.info("web_translate: 卡 %s 放不下翻译模型%s（被本机模型占着），"
+                 "只在卡 %s 上起", skipped, who,
+                 sorted({n for (n, _r) in kept}))
     return kept
 
 
-def _cards_with_room_for_one_copy(reg) -> set:
-    """还能再塞**一份**翻译模型的卡号集合。
+def _local_blockers(reg) -> str:
+    """本机占着卡的那些模型名（给日志/人话用）。
 
-    按实例的 ``memory_estimate_mb`` 估算每张卡的占用 —— 决策模型那个
-    3200 MB 就是「LLM + 视觉常驻」的峰值估算，正好表达了「它要独占一卡」。
+    只列**本机**实例（远端 peer 不占本板卡位）；同卡多份会合并。
     """
+    names: List[str] = []
     try:
-        all_cards = set(int(c) for c in reg.model_cards())
+        snap = reg.snapshot()
     except Exception:  # noqa: BLE001
-        return set()
-    if not all_cards:
-        return set()
+        return ""
+    for inst in snap.get("instances") or []:
+        if inst.get("model_id") == DEFAULT_MODEL:
+            continue
+        if (inst.get("_source") or "spawned") not in LOCAL_SOURCES:
+            continue
+        if inst.get("status") not in ("running", "loading"):
+            continue
+        label = inst.get("label") or inst.get("model_id")
+        if label and label not in names:
+            names.append(str(label))
+    return "、".join(names)
+
+
+#: **本机**实例的来源标记 —— 只有这两种真的吃本板的 NPU 显存。
+#:
+#: ``spawned``        = 本进程 spawn 出来的 worker；
+#: ``adopted_local``  = 本机的孤儿 worker（上一次 uvicorn 重载留下的），
+#:                       本板 /proc 里能看到它的进程 ⇒ 它的显存吃在**本板**。
+#:
+#: ⚠️ ``adopted`` **不算** —— 那是**别的板子**通过 DDS 暴露的 service。
+LOCAL_SOURCES = ("spawned", "adopted_local")
+
+
+def _local_card_occupancy(reg) -> dict:
+    """每张**本板**协卡当前被本地模型占了多少 MB。
+
+    ⚠️ **只统计本机实例** —— 这是本模块最容易踩的坑（2026-11-18 实测）：
+
+    ``_source == "adopted"`` 是**另一块板子**通过 DDS 暴露的 service：
+
+    * 它的 ``npu_index`` 是**对端板自己的卡号**，不是本板的；
+    * 它的显存吃在**对端板**上，本板一字节都没用。
+
+    把它算进本板卡位 ⇒ 一张**空卡**被判成「放不下翻译模型」。
+    真机现场（2026-11-18）：peer 板 ``172.16.9.147`` 的
+    ``LocateAnything-3b`` 报 ``npu=1 / 5500MB`` ⇒ 本板卡 1 被误判占满
+    （5500 + 2200 > 5120）⇒ 翻译模型只起卡 0 的 2 份（而不是 4 份），
+    日志还打「卡 [1] 放不下翻译模型（被别的模型占着）」—— 而本板
+    **3 张 1828 全空**、一个本地 worker 都没有。
+
+    ⇒ 同一份数据在 ``registry.snapshot()`` 的 ``per_card_memory_mb``
+    里也有同样的毛病（peer 的 5500MB 被记到本板卡 1），那边要一起修。
+    """
     used: dict = {}
     try:
         snap = reg.snapshot()
     except Exception:  # noqa: BLE001
-        return set()
+        return used
     for inst in snap.get("instances") or []:
         # 翻译模型自己的实例不算 —— 我们问的是「还能不能再加一份」
         if inst.get("model_id") == DEFAULT_MODEL:
+            continue
+        # ⚠️ 远端 peer 的实例**不占本板显存**，一律跳过（见上面注释）
+        if (inst.get("_source") or "spawned") not in LOCAL_SOURCES:
             continue
         if inst.get("status") not in ("running", "loading"):
             continue
@@ -163,6 +212,25 @@ def _cards_with_room_for_one_copy(reg) -> set:
             if c is None:
                 continue
             used[int(c)] = used.get(int(c), 0) + mem
+    return used
+
+
+def _cards_with_room_for_one_copy(reg) -> set:
+    """还能再塞**一份**翻译模型的卡号集合。
+
+    按实例的 ``memory_estimate_mb`` 估算每张卡的占用 —— 决策模型那个
+    3200 MB 就是「LLM + 视觉常驻」的峰值估算，正好表达了「它要独占一卡」。
+
+    ⚠️ **只算本机实例**（远端 peer 不占本板显存）—— 见
+    :func:`_local_card_occupancy` 的注释。
+    """
+    try:
+        all_cards = set(int(c) for c in reg.model_cards())
+    except Exception:  # noqa: BLE001
+        return set()
+    if not all_cards:
+        return set()
+    used = _local_card_occupancy(reg)
     return {
         c for c in all_cards
         if used.get(c, 0) + TRANSLATE_MEMORY_MB <= CARD_MEMORY_MB
@@ -436,6 +504,9 @@ class WebTranslateManager:
         图像生成（``qwenimage21``）要**两张**协卡，和翻译模型同占 0 号卡
         会抢显存 —— 实测起不来时报 ``MODEL_SETUP fail``。与其让用户对着
         「启动失败」发呆，不如提前说清楚。
+
+        ⚠️ **只查本机实例** —— 远端 peer 的 ``npu_index`` 是**对端板**的
+        卡号，拿它判本板冲突 ⇒ 一张空卡被误报成「卡位冲突」。
         """
         try:
             # ⚠️ ``model_cards()`` 返回 **List[int]**（卡号列表），不是 dict
@@ -446,6 +517,9 @@ class WebTranslateManager:
             return ""
         for i in self._instances(reg):
             if i.get("model_id") == model_id:
+                continue
+            # ⚠️ 远端 peer 不占本板卡位（见 _local_card_occupancy 的注释）
+            if (i.get("_source") or "spawned") not in LOCAL_SOURCES:
                 continue
             if i.get("status") not in ("running", "loading"):
                 continue
