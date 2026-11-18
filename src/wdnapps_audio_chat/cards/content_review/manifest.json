@@ -2,7 +2,7 @@
   "id": "content-review",
   "title": "图文内容审查",
   "category": "chat",
-  "description": "用本板决策模型（RK1828）对一张图 + 一段文字，按你维护的审查维度列表逐项给出概率估计。",
+  "description": "使用图文JEV决策模型对自定义的条目做概率估计",
   "version": "0.1.0",
   "preview_video": "/static/apps/content-review/preview.mp4",
   "preview_image": "",
