@@ -394,3 +394,21 @@
 #page-content-review .raw-output {
   margin-top: 0.6rem;
 }
+
+/* 审查徽章的状态色 —— 只给「待审查内容」「审查结果」这两个卡的抬头徽章上色。
+ *
+ * ⚠️ 框架的 `.imb-status[data-state=...]` 只认 awaiting_scan / scanned /
+ * confirmed / running / expired / error / cancelled —— 这张卡用的
+ * idle / busy / ok 是**没有配色的**（一律落回灰色底）。
+ * ⇒ 「完成」在界面上跟「未审查」长得一模一样，看不出做完没做。
+ */
+#page-content-review #cr-review-badge[data-state="ok"],
+#page-content-review #cr-result-badge[data-state="ok"] {
+  background: #d1fae5;
+  color: #047857;
+}
+#page-content-review #cr-review-badge[data-state="busy"],
+#page-content-review #cr-result-badge[data-state="busy"] {
+  background: #fef3c7;
+  color: #92400e;
+}

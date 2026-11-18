@@ -312,6 +312,14 @@
       this.setRunNote("审查中…", "busy");
       const badge = $("cr-review-badge");
       if (badge) { badge.textContent = "审查中…"; badge.dataset.state = "busy"; }
+      // ⚠️ **结果卡抬头那个徽章也要一起走** —— 它跟「待审查内容」卡的那个
+      // 是**两个不同的元素**。以前只动了后者，结果卡抬头就永远停在模板里
+      // 写死的「未审查」（结果其实渲染出来了，只有徽章不跟）。
+      const resultBadge = $("cr-result-badge");
+      if (resultBadge) {
+        resultBadge.textContent = "审查中…";
+        resultBadge.dataset.state = "busy";
+      }
       const btn = $("cr-run-btn");
       if (btn) btn.disabled = true;
       // ⚠️ 上一轮的数字要**先清掉** —— 不然「审查中…」的时候上一轮的
@@ -336,11 +344,19 @@
         this.renderResults(data);
         this.setRunNote("完成", "ok");
         if (badge) { badge.textContent = "完成"; badge.dataset.state = "ok"; }
+        if (resultBadge) {
+          resultBadge.textContent = "完成";
+          resultBadge.dataset.state = "ok";
+        }
         // ---- 推理性能：总耗时 + tokens/s（数字都是后端算好的） ----
         renderPerf($("cr-perf"), data);
       } catch (err) {
         this.setRunNote(errText(err), "error");
         if (badge) { badge.textContent = "失败"; badge.dataset.state = "error"; }
+        if (resultBadge) {
+          resultBadge.textContent = "失败";
+          resultBadge.dataset.state = "error";
+        }
         clearPerf($("cr-perf"));
       } finally {
         this._busy = false;
@@ -687,6 +703,10 @@
   // 的重试入口），而不是「向导显示完成、功能页却没生效」。
   // ------------------------------------------------------------------ *
   window.ImApp_content_review = window.ImApp_content_review || {};
+  // ⚠️ **暴露实例是为了自检**（``scripts/verify_content_review_card.py`` 用
+  // dukpy 真跑 app.js 时要能调 ``run()``，好断言「结果卡徽章会跟着走」）。
+  // 框架只用 ``applyWizardSnapshot``，不会遍历这个命名空间里的其它属性。
+  window.ImApp_content_review.app = ContentReview;
   window.ImApp_content_review.applyWizardSnapshot = async function () {
     try {
       const st = await ContentReview.enable();
