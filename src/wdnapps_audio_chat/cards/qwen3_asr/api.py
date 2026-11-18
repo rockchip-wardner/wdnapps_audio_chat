@@ -37,6 +37,14 @@
 这四个端点由 **feature flag** ``asr.live.enabled`` 门控 —— 关掉时一律
 **404**，前端隐藏实时区块，**文件 / 视频路径完全不受影响**。
 
+实时翻译（流式同传，**第一期：实时路径**）端点：
+
+* ``GET    /api/qwen3-asr/translate/status``     — 开关 / 目标语言 / 模型状态 / 统计。
+* ``GET    /api/qwen3-asr/translate/languages`` — 可选的目标语言。
+* ``POST   /api/qwen3-asr/translate/settings``  — 改开关 / 目标语言。
+* ``POST   /api/qwen3-asr/translate/enable``    — 起翻译模型（**慢端点**，~30 s）。
+* ``POST   /api/qwen3-asr/translate/disable``   — 停翻译模型。
+
 WS 帧类型
 =========
 
@@ -50,6 +58,10 @@ WS 帧类型
 * ``gap``     —— **新增**：音频有丢失，识别结果可能有缺口。
 * ``endpoint``—— **新增**：一句话结束（端点检测命中）。
 * ``live_done`` —— **新增**：实时会话结束。
+* ``translation`` —— **新增**：一句译文：
+  ``{stream_id, index, source, text, status, reason, latency_ms}``。
+  ``status`` ∈ ``done`` / ``failed`` / ``skipped`` / ``unavailable``；
+  失败时 ``text`` 是**原文**（前端显示原文 + 标「未翻译」）。
 """
 from __future__ import annotations
 
@@ -63,6 +75,7 @@ from typing import Any, List, Optional
 from fastapi import (APIRouter, Body, File, Form, Header, HTTPException,
                      Query, Request, UploadFile, WebSocket, WebSocketDisconnect)
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from wdnapps_audio_chat.cards.qwen3_asr.board_mic import (DEFAULT_DEVICE,
                                                           BoardMicError,
@@ -670,6 +683,97 @@ async def get_board_status() -> dict:
     """板载麦克风采集进程的状态。"""
     ctl = get_board_mic()
     return {"ok": True, **ctl.status()}
+
+
+# --------------------------------------------------------------------------- #
+# 实时翻译（流式同传，第一期：实时路径）
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ **端点是同步 ``def``，不是 ``async def``** —— 起/停翻译模型是**阻塞**
+# 操作：启用要等模型加载完（约 30 s），禁用要等 unload + shutdown +
+# SIGTERM 宽限（约 3~5 s）。
+#
+# FastAPI 只把 ``async def`` 端点跑在事件循环里，``def`` 端点丢线程池 ——
+# 写成 ``async def`` 的话，这 30 秒里**整个 Web UI 都没响应**。
+#
+class TranslateSettingsPayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    #: 开关；不传 = 不改
+    enabled: Optional[bool] = None
+    #: 目标语言（provider 的语言 key，如 ``en``）；不传 = 不改
+    target_lang: Optional[str] = None
+
+
+class TranslateEnablePayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    #: 卡位；不传 = 自动挑一张放得下的卡
+    npu_index: Optional[int] = Field(default=None, ge=0, le=15)
+
+
+@router.get("/translate/status")
+def get_translate_status() -> dict:
+    """译文状态：开关 / 目标语言 / 模型就绪情况 / 统计。"""
+    from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        get_translation_service,
+    )
+    return get_translation_service().status()
+
+
+@router.get("/translate/languages")
+def get_translate_languages() -> dict:
+    """可选的目标语言（HY-MT1.5 的词表）。
+
+    ⚠️ ``zh-TW`` **不在列表里** —— 模型词表里简繁**共用一个码**，它根本
+    分不出来（真机实测：转出来是「半繁体半简体」，比不转更糟）。
+    """
+    from app.core.translate.npu_provider import LANG_CODES, LANG_NAMES
+    items = []
+    for key in LANG_CODES:
+        if key == "zh-TW":
+            continue
+        items.append({"id": key, "name": LANG_NAMES.get(key, key)})
+    return {"items": items}
+
+
+@router.post("/translate/settings")
+def post_translate_settings(payload: TranslateSettingsPayload) -> dict:
+    """改开关 / 目标语言。
+
+    关掉开关会**丢掉排队待译的句子**（别让它们在后台接着烧 NPU）。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        get_translation_service,
+    )
+    svc = get_translation_service()
+    svc.configure(enabled=payload.enabled, target_lang=payload.target_lang)
+    return svc.status()
+
+
+@router.post("/translate/enable")
+def post_translate_enable(payload: TranslateEnablePayload) -> dict:
+    """起翻译模型（**慢端点**：要等模型加载完，约 30 s）。
+
+    ⚠️ 起的是**本机** worker —— 「每块板子只管自己的算力」。
+    """
+    try:
+        from app.core.translate.npu_manager import (
+            get_npu_translate_instances,
+        )
+        return get_npu_translate_instances().ensure(payload.npu_index)
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.post("/translate/disable")
+def post_translate_disable() -> dict:
+    """停掉本板的翻译模型（**慢端点**：unload + shutdown，约 3~5 s）。"""
+    try:
+        from app.core.translate.npu_manager import (
+            get_npu_translate_instances,
+        )
+        return get_npu_translate_instances().disable()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # --------------------------------------------------------------------------- #

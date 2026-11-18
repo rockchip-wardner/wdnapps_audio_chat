@@ -221,6 +221,31 @@ _FILE_SESSION_MIN_SEC = 40.0
 _ASR_RPC_LOCK = threading.RLock()
 
 
+def _drain_translation() -> None:
+    """丢掉排队待译的句子（识别停了 ⇒ 别在后台接着烧 NPU）。
+
+    ⚠️ **best-effort**：翻译模块没加载 / 抛异常都不许影响识别。
+    """
+    try:
+        from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+            get_translation_service,
+        )
+        get_translation_service().drain()
+    except Exception as e:  # noqa: BLE001
+        _LOG.debug("drain translation failed (best-effort): %s", e)
+
+
+def _clear_translation() -> None:
+    """清空译文统计与队列（「清空」按钮）。"""
+    try:
+        from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+            get_translation_service,
+        )
+        get_translation_service().clear()
+    except Exception as e:  # noqa: BLE001
+        _LOG.debug("clear translation failed (best-effort): %s", e)
+
+
 class _AsrManager:
     """流式 ASR 服务；单例（:func:`get_asr_service`）。"""
 
@@ -483,6 +508,8 @@ class _AsrManager:
                 session.stop()
             except Exception as e:  # noqa: BLE001 — cancel is best-effort
                 _LOG.debug("session.stop() failed (best-effort): %s", e)
+        # 识别停了 ⇒ 别在后台接着烧 NPU（丢掉排队待译的句子）
+        _drain_translation()
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     def _stopped(self, rid: int, *, text: str = "", language: str = "",
@@ -561,6 +588,8 @@ class _AsrManager:
                 session.stop()
             except Exception as e:  # noqa: BLE001 — cancel is best-effort
                 _LOG.debug("session.stop() failed (best-effort): %s", e)
+        # 「清空」⇒ 译文也一起清（统计 + 队列）
+        _clear_translation()
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     def _superseded(self, rid: int) -> bool:
@@ -1825,10 +1854,17 @@ class _LiveAsrSession:
                 "index": self._endpoint_index,
                 "elapsed_sec": round(self._timeline_sec, 3),
             })
+            # 译文（流式同传，第一期）—— 送去做翻译，**不阻塞**这里。
+            self._submit_translation()
             self._rotate()
             self._finished = False
         else:
             self._closed = True
+            # ⚠️ **最后一句也要翻** —— 端点（=句子结束）只在**静音停顿**时
+            # 触发；用户「说完就停」时最后一句没有端点，不补这一下它就永远
+            # 拿不到译文（``_rotate()`` 会把上一句的文本清掉，所以这里不会
+            # 和端点分支重复提交）。
+            self._submit_translation()
             self._publish({
                 "type": "live_done",
                 "stream_id": self.stream_id,
@@ -1838,6 +1874,29 @@ class _LiveAsrSession:
                 "elapsed_sec": round(self._timeline_sec, 3),
                 "dropped_chunks": self._dropped_chunks,
             })
+
+    def _submit_translation(self) -> None:
+        """把刚结束的这一句送去翻译（流式同传）。
+
+        ⚠️ **翻译出问题不许影响识别** —— 这里吞掉所有异常，翻译链路
+        自己的降级（显示原文 + 标「未翻译」）在 ``translation.py`` 里做。
+        """
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+                get_translation_service,
+            )
+            text = (self._final_text or "").strip()
+            if not text:
+                return
+            get_translation_service().submit(
+                index=self._endpoint_index,
+                text=text,
+                lang=self._language,
+                stream_id=self.stream_id,
+                loop=self._loop,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("live %s: 送去翻译失败: %s", self.stream_id, exc)
 
     def transcript(self) -> str:
         """**累积**的转写文本（端点切出的各句 + 当前句）。
@@ -2013,6 +2072,8 @@ class _LiveAsrManager:
                 pass
         with self._lock:
             self._sessions.clear()
+        # 实时会话全停了 ⇒ 别在后台接着烧 NPU 翻译
+        _drain_translation()
 
     def _reap(self) -> None:
         """回收空闲超时的会话（采集端崩了也不会永远占着）。"""

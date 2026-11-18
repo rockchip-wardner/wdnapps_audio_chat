@@ -1,0 +1,361 @@
+"""流式同传的**译文**（第一期：实时路径）。
+
+这条链路挂在 ASR 卡已有的「一句话结束」（``endpoint``）帧上：
+ASR 端点检测切出一句 → 本模块把这一句送去翻译 → 译文沿**同一条 WS**
+推回浏览器。
+
+为什么挂在 ASR 卡里而不是另开一张卡
+----------------------------------
+实时 ASR 流是**单例**的：所有 live 会话绑的是 registry 里**同一个** ASR
+worker 的 session（``service.py::select_session``）。另开一张卡要么跨卡
+HTTP 调这里的端点，要么自己开一条流（两条流会搅坏同一个增量解码器）。
+
+为什么不写进 ``service.py``
+---------------------------
+``service.py`` 已经 2000 行，且它只管「音频 → 文本」。翻译是**另一段**
+生命周期（有队列、有线程、有自己的开关与状态），单独成文件更清楚 ——
+跟 ``board_mic.py`` 是同一个理由。
+
+⚠️ **只做实时路径**（麦克风 / 板载麦克风）：文件 / 视频路径**没有句级
+信号**（它的 ``round`` 帧只有 committed/unfixed，收尾只有一个 ``done``），
+要出双语字幕得自己按标点断句 —— 那是第二期的事。
+
+降级语义（一律**不**让翻译把识别带崩）
+------------------------------------
+=====================  ==========================================
+情况                   前端看到什么
+=====================  ==========================================
+翻译成功               译文（status=done）
+模型没启用             原文 + 「翻译模型未启用」（status=unavailable）
+这句翻不出来           原文 + 「未翻译」（status=failed）
+源语 == 目标语         原文（status=skipped，不浪费推理）
+认不出源/目标语言      原文 + 「未翻译」（status=failed）
+=====================  ==========================================
+"""
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+LOG = logging.getLogger("qwen3_asr.translation")
+
+#: 译文队列长度（有界）。满了**丢最旧**的 —— 同传场景下「丢掉 10 秒前
+#: 的译文」比「延迟 10 秒」可接受。
+QUEUE_MAX = 32
+
+#: 翻译线程数。
+#:
+#: ⚠️ **并发单位是 MT 实例，不是线程** —— 一个 ``LLMRPCSession`` 的 RPC
+#: 执行器是 ``ThreadPoolExecutor(max_workers=1)`` ⇒ 同一个 session 同时
+#: 只能一个推理在飞。这里起 2 个线程是为了**两份实例**能并行；只有一份
+#: 实例时它们会自动排队（不会出错，只是并发度是 1）。
+WORKERS = 2
+
+#: 单句翻译的超时（秒）。超时按「翻不出来」处理，不阻塞整条队列。
+SENTENCE_TIMEOUT_S = 20.0
+
+
+class _Item:
+    """队列里的一项：一句待译的话。"""
+
+    __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at")
+
+    def __init__(self, index: int, text: str, lang: str, stream_id: str,
+                 loop: Any, enqueued_at: float):
+        self.index = index
+        self.text = text
+        self.lang = lang
+        self.stream_id = stream_id
+        self.loop = loop
+        self.enqueued_at = enqueued_at
+
+
+class TranslationService:
+    """把 ASR 的「一句话完成」变成「一句译文」。线程安全。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        #: 总开关（页面上那个「实时翻译」勾选）。
+        self._enabled = False
+        #: 目标语言（provider 的语言 key，如 ``en``）。
+        self._target_lang = "en"
+        self._queue: "queue.Queue[_Item]" = queue.Queue(maxsize=QUEUE_MAX)
+        self._workers: List[threading.Thread] = []
+        self._stopping = threading.Event()
+        #: 统计（给界面看）
+        self._submitted = 0
+        self._translated = 0
+        self._failed = 0
+        self._skipped = 0
+        self._dropped = 0
+        self._latency_ms = 0.0
+
+    # ------------------------------------------------------------------ #
+    # 设置 / 状态
+    # ------------------------------------------------------------------ #
+    def settings(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"enabled": self._enabled, "target_lang": self._target_lang}
+
+    def configure(self, *, enabled: Optional[bool] = None,
+                  target_lang: Optional[str] = None) -> Dict[str, Any]:
+        """改设置（页面上那个开关 + 目标语言下拉）。"""
+        with self._lock:
+            if enabled is not None:
+                self._enabled = bool(enabled)
+                if not self._enabled:
+                    # 关掉 ⇒ 把排队中的句子丢掉（别让它们在后台接着烧 NPU）
+                    self._drain()
+            if target_lang is not None:
+                tgt = (target_lang or "").strip()
+                if tgt:
+                    self._target_lang = tgt
+            return self.settings()
+
+    def status(self) -> Dict[str, Any]:
+        """界面用的状态快照。"""
+        with self._lock:
+            base = {
+                "enabled": self._enabled,
+                "target_lang": self._target_lang,
+                "queue_depth": self._queue.qsize(),
+                "submitted": self._submitted,
+                "translated": self._translated,
+                "failed": self._failed,
+                "skipped": self._skipped,
+                "dropped": self._dropped,
+                "avg_latency_ms": (round(self._latency_ms / self._translated, 1)
+                                   if self._translated else 0.0),
+            }
+        # 模型状态走宿主模块（**不**在这里碰 registry —— 查询不该拉起它）
+        try:
+            from app.core.translate.npu_manager import (
+                get_npu_translate_instances,
+            )
+            base["model"] = get_npu_translate_instances().status()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("translation: 读模型状态失败: %s", exc)
+            base["model"] = {}
+        return base
+
+    # ------------------------------------------------------------------ #
+    # 生产（ASR 的 endpoint 帧调它）
+    # ------------------------------------------------------------------ #
+    def submit(self, *, index: int, text: str, lang: str, stream_id: str,
+               loop: Any) -> None:
+        """送来一句待译的话。
+
+        ⚠️ **绝不抛异常** —— 翻译出问题不许影响识别。
+        """
+        text = (text or "").strip()
+        with self._lock:
+            if not self._enabled or not text:
+                return
+            self._submitted += 1
+        item = _Item(index, text, lang, stream_id, loop, time.monotonic())
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            # 丢**最旧**的（同传场景下保实时性优先）
+            try:
+                old = self._queue.get_nowait()
+                with self._lock:
+                    self._dropped += 1
+                LOG.warning("translation: 队列满，丢掉第 %s 句", old.index)
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                with self._lock:
+                    self._dropped += 1
+        self._ensure_workers()
+
+    # ------------------------------------------------------------------ #
+    # 消费
+    # ------------------------------------------------------------------ #
+    def _ensure_workers(self) -> None:
+        with self._lock:
+            if self._workers and any(w.is_alive() for w in self._workers):
+                return
+            self._workers = []
+        for i in range(WORKERS):
+            th = threading.Thread(target=self._loop, name=f"asr-translate-{i}",
+                                  daemon=True)
+            th.start()
+            with self._lock:
+                self._workers.append(th)
+
+    def _loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._handle(item)
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning("translation: 处理第 %s 句失败: %s", item.index, exc)
+            finally:
+                self._queue.task_done()
+
+    def _handle(self, item: _Item) -> None:
+        t0 = time.monotonic()
+        target = self.settings()["target_lang"]
+        status = "failed"
+        text = ""
+        reason = ""
+
+        # 源语 == 目标语 ⇒ 透传（不浪费一次推理）
+        try:
+            from app.core.translate.npu_provider import normalize_language
+            src = normalize_language(item.lang)
+            tgt = normalize_language(target)
+        except Exception:  # noqa: BLE001
+            src, tgt = item.lang, target
+
+        if src and tgt and src == tgt:
+            status = "skipped"
+            text = item.text
+            reason = "源语与目标语相同"
+        else:
+            try:
+                from app.core.translate.npu_manager import (
+                    get_npu_translate_instances,
+                )
+                mgr = get_npu_translate_instances()
+                out, _perf = mgr.translate_sentence(item.text, item.lang, target)
+                text = out
+                status = "done"
+            except Exception as exc:  # noqa: BLE001
+                name = type(exc).__name__
+                if name == "UnsupportedLanguageError":
+                    status = "failed"
+                    reason = str(exc)
+                elif name == "NpuQualityError":
+                    status = "failed"
+                    reason = "这句没翻出来（显示原文）"
+                elif isinstance(exc, RuntimeError):
+                    status = "unavailable"
+                    reason = "翻译模型未启用"
+                else:
+                    status = "failed"
+                    reason = "翻译失败: %s" % exc
+                text = item.text
+                LOG.info("translation: 第 %s 句 %s（%s）", item.index, status,
+                         reason or exc)
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        with self._lock:
+            if status == "done":
+                self._translated += 1
+                self._latency_ms += latency_ms
+            elif status == "skipped":
+                self._skipped += 1
+            else:
+                self._failed += 1
+
+        self._broadcast(item, status, text, reason, latency_ms)
+
+    # ------------------------------------------------------------------ #
+    # 广播
+    # ------------------------------------------------------------------ #
+    def _broadcast(self, item: _Item, status: str, text: str, reason: str,
+                   latency_ms: int) -> None:
+        """把译文推给浏览器（**与 ASR 的帧同一条 WS**）。
+
+        ⚠️ ``asyncio.Queue.put_nowait`` **不是线程安全的** ⇒ 必须切回
+        事件循环线程再广播（与 ASR 的 delta 回调同一个道理）。
+        """
+        payload = {
+            "type": "translation",
+            "stream_id": item.stream_id,
+            "index": item.index,
+            "source": item.text,
+            "text": text,
+            "status": status,
+            "reason": reason,
+            "latency_ms": latency_ms,
+        }
+
+        def _emit() -> None:
+            try:
+                from wdnapps_audio_chat.cards.qwen3_asr.service import (
+                    get_asr_service,
+                )
+                get_asr_service().broadcast(payload)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("translation: 广播失败: %s", exc)
+
+        loop = item.loop
+        if loop is None:
+            _emit()
+            return
+        try:
+            if loop.is_closed():
+                return
+            loop.call_soon_threadsafe(_emit)
+        except RuntimeError:
+            # 循环已经关了（服务在退出）—— 丢掉这一帧
+            pass
+
+    # ------------------------------------------------------------------ #
+    # 清理
+    # ------------------------------------------------------------------ #
+    def _drain(self) -> None:
+        """丢掉队列里排着的句子。"""
+        while True:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                return
+
+    def drain(self) -> None:
+        """丢掉队列里排着的句子（**公开**接口）。
+
+        识别停了就别在后台接着烧 NPU —— 调用方（ASR 的 stop / 离开页面）
+        调它。⚠️ **不动开关**：用户下次还要用，只是别让旧句子接着翻。
+        """
+        self._drain()
+
+    def clear(self) -> None:
+        """清空统计与队列（页面上的「清空」）。"""
+        with self._lock:
+            self._submitted = 0
+            self._translated = 0
+            self._failed = 0
+            self._skipped = 0
+            self._dropped = 0
+            self._latency_ms = 0.0
+        self._drain()
+
+    def close(self) -> None:
+        """停线程（服务退出时）。"""
+        self._stopping.set()
+        self._drain()
+        with self._lock:
+            workers = list(self._workers)
+            self._workers = []
+        for w in workers:
+            try:
+                w.join(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+#: 进程内单例。
+_SERVICE: Optional[TranslationService] = None
+_SERVICE_LOCK = threading.Lock()
+
+
+def get_translation_service() -> TranslationService:
+    """译文服务单例（懒创建）。"""
+    global _SERVICE
+    with _SERVICE_LOCK:
+        if _SERVICE is None:
+            _SERVICE = TranslationService()
+        return _SERVICE

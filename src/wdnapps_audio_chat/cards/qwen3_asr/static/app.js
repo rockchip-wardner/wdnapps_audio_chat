@@ -289,6 +289,17 @@ const Qwen3Asr = {
     language: "",
   },
 
+  /* ---------------- 实时翻译状态（流式同传，第一期） ---------------- */
+  _tr: {
+    enabled: false,      // 「实时翻译」开关
+    targetLang: "en",    // 目标语言（provider 的语言 key）
+    modelReady: false,   // 翻译模型在不在跑
+    modelStatus: "",     // 人类可读的模型状态
+    items: [],           // 已收到的译文 [{index, source, text, status, ...}]
+    busy: false,         // 「启用翻译模型」进行中
+    loaded: false,       // 语言列表拉过了
+  },
+
   init() {
     if (this._inited) return;
     this._inited = true;
@@ -342,6 +353,15 @@ const Qwen3Asr = {
     $("asr-mic-stop-btn")?.addEventListener("click", () => this._liveAbort());
     $("asr-board-start")?.addEventListener("click", () => this._boardStart());
     $("asr-board-stop")?.addEventListener("click", () => this._boardStop());
+
+    // 实时翻译（流式同传）—— 开关 / 目标语言 / 启用翻译模型
+    $("asr-tr-enabled")?.addEventListener("change", (e) => {
+      this._trSet({ enabled: !!e.target.checked });
+    });
+    $("asr-tr-target")?.addEventListener("change", (e) => {
+      this._trSet({ target_lang: e.target.value });
+    });
+    $("asr-tr-model-btn")?.addEventListener("click", () => this._trEnableModel());
     // 预览播放器的收尾守卫（向导卸载 / 离开卡片时停掉播放）
     this._bindPreviewGuards();
 
@@ -385,10 +405,14 @@ const Qwen3Asr = {
     // 来源页签）。**异步** —— 不阻塞首屏，WS 照常先连上。
     this._restoreFromServer();
     this._probeCap().catch(() => {});
+    // 实时翻译：语言列表 + 状态（异步，不阻塞首屏）
+    this._trLoadLanguages();
+    this._trRefresh();
     if (!this._capTimer) {
       this._capTimer = setInterval(() => {
         if (document.visibilityState !== "visible") return;
         this._probeCap().catch(() => {});
+        this._trRefresh();
       }, 5000);
     }
     this._installLiveHooks();
@@ -1867,6 +1891,158 @@ const Qwen3Asr = {
     if (u) u.textContent = L.unfixed || "";
   },
 
+  // ------------------------------------------------------------------ //
+  // 实时翻译（流式同传，第一期）
+  //
+  // ⚠️ 译文**沿同一条 WS** 过来（服务端 ``broadcast()``）—— 不开第二条
+  // 连接，也不做「两个 WS 的帧合并」。
+  //
+  // ⚠️ 板端**没有 emoji / 符号字体** ⇒ 这里只用普通文字，不用 ⚠ 之类
+  // 的符号（会渲染成豆腐块）。
+  // ------------------------------------------------------------------ //
+  async _trLoadLanguages() {
+    const sel = document.getElementById("asr-tr-target");
+    if (!sel || this._tr.loaded) return;
+    try {
+      const r = await fetch("/api/qwen3-asr/translate/languages",
+        { cache: "no-store" });
+      if (!r.ok) return;
+      const data = await r.json();
+      const items = Array.isArray(data.items) ? data.items : [];
+      sel.innerHTML = "";
+      items.forEach((it) => {
+        const opt = document.createElement("option");
+        opt.value = it.id || "";
+        opt.textContent = it.name || it.id || "";
+        sel.appendChild(opt);
+      });
+      sel.value = this._tr.targetLang;
+      this._tr.loaded = true;
+    } catch (e) {
+      console.warn("[qwen3-asr] 拉翻译语言列表失败:", e);
+    }
+  },
+
+  async _trRefresh() {
+    try {
+      const r = await fetch("/api/qwen3-asr/translate/status",
+        { cache: "no-store" });
+      if (!r.ok) return;
+      const st = await r.json();
+      const model = st.model || {};
+      this._tr.enabled = !!st.enabled;
+      this._tr.targetLang = st.target_lang || this._tr.targetLang;
+      this._tr.modelReady = !!model.running;
+      this._tr.modelStatus = model.running
+        ? "翻译模型就绪"
+        : (model.installed ? "翻译模型未启动" : "本机没装翻译模型");
+      this._trSyncUi();
+    } catch (e) {
+      /* 网络问题不打扰用户 */
+    }
+  },
+
+  _trSyncUi() {
+    const cb = document.getElementById("asr-tr-enabled");
+    if (cb && cb.checked !== this._tr.enabled) cb.checked = this._tr.enabled;
+    const sel = document.getElementById("asr-tr-target");
+    if (sel && sel.value !== this._tr.targetLang) sel.value = this._tr.targetLang;
+    const btn = document.getElementById("asr-tr-model-btn");
+    if (btn) {
+      btn.disabled = this._tr.busy || this._tr.modelReady;
+      btn.textContent = this._tr.busy
+        ? "正在启动翻译模型…"
+        : (this._tr.modelReady ? "翻译模型已启用" : "启用翻译模型");
+    }
+    const el = document.getElementById("asr-tr-status");
+    if (el) el.textContent = this._trStatusText();
+  },
+
+  _trStatusText() {
+    const bits = [this._tr.modelStatus || "翻译未启用"];
+    if (this._tr.enabled) {
+      bits.push("实时翻译已开启");
+      const n = this._tr.items.length;
+      if (n) bits.push(`已译 ${n} 句`);
+    }
+    return bits.join(" · ");
+  },
+
+  async _trSet(patch) {
+    try {
+      const r = await fetch("/api/qwen3-asr/translate/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch || {}),
+      });
+      if (!r.ok) {
+        console.warn("[qwen3-asr] 设置翻译失败:", r.status);
+      }
+    } catch (e) {
+      console.warn("[qwen3-asr] 设置翻译失败:", e);
+    }
+    await this._trRefresh();
+  },
+
+  async _trEnableModel() {
+    this._tr.busy = true;
+    this._trSyncUi();
+    try {
+      // ⚠️ **慢端点** —— 起模型要等 ~30 s（模型加载完才返回）。
+      const r = await fetch("/api/qwen3-asr/translate/enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        this._tr.modelStatus = "启动失败：" + (data.detail || `HTTP ${r.status}`);
+      }
+    } catch (e) {
+      this._tr.modelStatus = "启动失败：" + (e && e.message ? e.message : e);
+    } finally {
+      this._tr.busy = false;
+      await this._trRefresh();
+    }
+  },
+
+  _trRender() {
+    const box = document.getElementById("asr-rt-translated");
+    if (!box) return;
+    const items = this._tr.items;
+    const empty = document.getElementById("asr-tr-empty");
+    // 句子不多（几十条以内）⇒ 直接重建，别搞增量 diff
+    box.innerHTML = "";
+    if (!items.length) {
+      if (empty) empty.classList.remove("hidden");
+      return;
+    }
+    if (empty) empty.classList.add("hidden");
+    items.forEach((it) => {
+      const row = document.createElement("div");
+      row.className = "asr-tr-item";
+      if (it.status && it.status !== "done") row.classList.add("is-" + it.status);
+      const src = document.createElement("div");
+      src.className = "asr-tr-src";
+      src.textContent = it.source || "";
+      const dst = document.createElement("div");
+      dst.className = "asr-tr-dst";
+      if (it.status === "done") {
+        dst.textContent = it.text || "";
+      } else if (it.status === "skipped") {
+        // 源语 == 目标语 ⇒ 原文就是译文（不浪费一次推理）
+        dst.textContent = it.text || it.source || "";
+        dst.classList.add("is-muted");
+      } else {
+        dst.textContent = "（未翻译）" + (it.reason || "");
+        dst.classList.add("is-muted");
+      }
+      row.appendChild(src);
+      row.appendChild(dst);
+      box.appendChild(row);
+    });
+  },
+
   _updateHint() {
     const hint = document.getElementById("asr-hint");
     if (!hint) return;
@@ -1965,6 +2141,9 @@ const Qwen3Asr = {
       L.unfixed = "";
       L.buf = null;
       L.resampler = null;
+      // 新会话 ⇒ 上一轮的译文也清掉（句序号会从头数）
+      this._tr.items = [];
+      this._trRender();
       this._liveClearGap();
       this._liveRender();
       await this._liveOpenMic();
@@ -2634,6 +2813,10 @@ const Qwen3Asr = {
     this._ignoreRounds = true;
     this._renderRounds();
     this._renderLive("", "");
+    // 译文也一起清（服务端 /reset 也会清统计）
+    this._tr.items = [];
+    this._trRender();
+    this._trSyncUi();
     this._audioOriginSec = 0;
     this._subInvalidate();
     const sub = document.getElementById("asr-video-sub");
@@ -2851,6 +3034,27 @@ const Qwen3Asr = {
         if (!msg.stream_id) break;
         this._liveStatus(
           `实时会话结束（${msg.reason || "done"}）· 丢块 ${msg.dropped_chunks || 0}`);
+        break;
+      }
+      case "translation": {
+        // 一句译文（流式同传）—— 与识别帧**同一条 WS**。
+        if (!msg.stream_id) break;
+        const it = {
+          index: Number(msg.index) || 0,
+          source: msg.source || "",
+          text: msg.text || "",
+          status: msg.status || "failed",
+          reason: msg.reason || "",
+          latency_ms: Number(msg.latency_ms) || 0,
+        };
+        // ⚠️ **按句序号覆盖**，不是 append —— 翻译是**乱序完成**的
+        //（多实例并行），append 会让字幕顺序乱掉。
+        const pos = this._tr.items.findIndex((x) => x.index === it.index);
+        if (pos >= 0) this._tr.items[pos] = it;
+        else this._tr.items.push(it);
+        this._tr.items.sort((a, b) => a.index - b.index);
+        this._trRender();
+        this._trSyncUi();
         break;
       }
       case "done": {

@@ -12,6 +12,7 @@ Backend layout (per card)::
     ├── api.py             # FastAPI router (mounted at /api/qwen3-asr)
     ├── service.py         # business logic (singleton + WS broadcast)
     ├── board_mic.py       # 板载麦克风采集子进程管理
+    ├── translation.py     # 流式同传的译文（第一期：实时路径）
     ├── static/            # template.html + app.js + app.css + wizard.json
     │                      # + capture-worklet.js + preview.mp4
     └── __init__.py        # this file — register_api / register_shutdown
@@ -44,7 +45,7 @@ def register_shutdown() -> None:
     import traceback
 
     cleanup_targets = []
-    for subname in ("service", "board_mic"):
+    for subname in ("service", "board_mic", "translation"):
         try:
             cleanup_targets.append(importlib.import_module(
                 "wdnapps_audio_chat.cards.qwen3_asr." + subname))

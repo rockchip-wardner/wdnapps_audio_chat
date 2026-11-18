@@ -534,3 +534,66 @@
   color: #1d4ed8;
   white-space: pre-wrap;
 }
+
+/* ---------------- 实时翻译（流式同传，第一期） ----------------
+   译文区与识别结果区**上下分开**：上面是原文（``#asr-rt-text``），
+   下面是译文。译文按句成对（原文一行 + 译文一行）。
+
+   ⚠️ 板端**没有 emoji / 符号字体** ⇒ 这里只用文字与颜色区分状态，
+   不用 ⚠ / ✓ 之类的符号（会渲染成豆腐块 □）。 */
+.asr-tr-block {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  background: #f5f9ff;
+}
+
+.asr-tr-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.asr-tr-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.9rem;
+  color: #374151;
+}
+
+.asr-tr-out {
+  max-height: 16rem;
+  overflow-y: auto;
+  padding-top: 8px;
+  border-top: 1px dashed #bfdbfe;
+}
+
+.asr-tr-item {
+  margin-bottom: 10px;
+}
+
+.asr-tr-src {
+  font-size: 0.85rem;
+  color: #6b7280;
+  line-height: 1.35;
+}
+
+.asr-tr-dst {
+  font-size: 1rem;
+  color: #111827;
+  line-height: 1.45;
+}
+
+.asr-tr-dst.is-muted {
+  color: #9ca3af;
+  font-size: 0.9rem;
+}
+
+.asr-tr-empty {
+  font-size: 0.85rem;
+  color: #9ca3af;
+}

@@ -175,6 +175,35 @@
                   <span class="asr-live-committed" id="asr-rt-committed"></span><span
                         class="asr-live-unfixed" id="asr-rt-unfixed"></span>
                 </div>
+
+                <!--
+                  实时翻译（流式同传，第一期：实时路径）。
+
+                  ⚠️ **只在实时路径可用** —— 文件 / 视频路径没有句级信号
+                  （``round`` 帧只有 committed/unfixed，收尾只有一个 done），
+                  要出双语字幕得自己断句，那是第二期的事。
+
+                  ⚠️ 板端**没有 emoji / 符号字体** ⇒ 图标一律用内联 SVG，
+                  文字只用普通汉字。
+                -->
+                <div class="asr-tr-block" id="asr-tr-block">
+                  <div class="asr-tr-head">
+                    <label class="asr-file-label" for="asr-tr-target">目标语言</label>
+                    <select id="asr-tr-target" class="tts-select"></select>
+                    <label class="asr-tr-switch" for="asr-tr-enabled">
+                      <input type="checkbox" id="asr-tr-enabled" />
+                      <span>实时翻译</span>
+                    </label>
+                    <button type="button" class="vd-btn" id="asr-tr-model-btn">启用翻译模型</button>
+                    <span class="asr-live-status" id="asr-tr-status">翻译未启用</span>
+                  </div>
+                  <div class="asr-tr-out" id="asr-rt-translated">
+                    <div class="asr-tr-empty" id="asr-tr-empty">
+                      开启「实时翻译」后，每识别完一句，这里会显示译文。
+                    </div>
+                  </div>
+                </div>
+
                 <div class="asr-live-gap hidden" id="asr-live-gap">⚠ 有音频丢失，识别结果可能有缺口</div>
               </section>
             </section>
