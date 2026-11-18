@@ -1,10 +1,11 @@
 /* content-review 卡片前端 —— 决策模型的启停 + 审查维度列表 + 概率结果。
  *
  * 这张卡的核心不是聊天，而是一张**可增删的列表**：用户维护一组审查维度，
- * 输入一张图 + 一段文字后，后端把每一项翻译成一个决策字段（是否），模型
- * 逐项给出概率（0~100%）。各项**互相独立**（一条内容可命中多项）。
+ * 输入一张图 + 一段文字后，后端把整张列表翻译成**一个**决策字段（单选），
+ * 列表里的每一项是它的一个选项 —— 模型**一次**给出每个维度在这份分布里
+ * 的占比（0~100%，各项合计为 1），其中占比最高的就是模型选中的那一类。
  *
- * 维度名会直接进模型 prompt（决策任务的字段名），所以「广告」「诈骗」这种
+ * 维度名会直接进模型 prompt（决策任务的选项键），所以「广告」「诈骗」这种
  * 带语义的写法比 item_0 准得多 —— 这也是默认维度用中文名的原因。
  */
 (function () {
@@ -390,6 +391,7 @@
         const desc = document.createElement("div");
         desc.className = "cr-result-desc";
         const bits = [];
+        if (r.selected) bits.push("最符合");
         if (r.description) bits.push(r.description);
         if (r.symbol) bits.push("符号 " + r.symbol + (r.label ? "（" + r.label + "）" : ""));
         desc.textContent = bits.join(" · ");
@@ -403,6 +405,9 @@
       const meta = $("cr-result-meta");
       if (meta) {
         const bits = [];
+        // ⚠️ choice 只能选一个 —— 把模型实际选中的那一类摆在最前面，
+        // 否则用户只看到一排占比，得自己找最大的那条。
+        if (data.selected) bits.push("判定 " + data.selected);
         if (data.elapsed_sec != null) bits.push(data.elapsed_sec + " 秒");
         if (data.has_image) bits.push("图文");
         else bits.push("纯文本");

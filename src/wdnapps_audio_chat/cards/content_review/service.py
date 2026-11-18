@@ -3,14 +3,36 @@
 这个模型（Intern-Decision-4B）**不是对话模型**：它不生成文本，而是对任务里
 的每个「决策字段」输出 62 个候选符号的 logits，由 CPU 侧换算成选项概率。
 所以本卡的「概率估计」= 把用户维护的那张**可增删列表**翻译成一组
-``noul``（是否）字段，每项各出一个 0~1 的肯定概率。
+``choice``（单选）字段 —— 列表里的每一项是它的一个选项。
 
-为什么用 ``noul`` 而不是 ``choice``
-------------------------------------
-``choice`` 的选项概率是**归一化**的（合计为 1）—— 那适合「只能选一个」的
-分流（客服分类）。内容审查的多个维度**可以同时命中**（一条内容既是广告
-又是低俗），要的是每一维**各自独立**的置信度 ⇒ 用 ``noul``（肯定概率），
-各项互不归一化。
+为什么是**一个** choice 字段而不是 N 个 noul 字段（2026-11-18 改）
+--------------------------------------------------
+Intern-Decision 在 RKNN 上是 **prefill-only** 模型 —— 一次前向只在**一个**
+位置输出那 62 维符号 logits。官方 C++ 参考实现（``rknn3_model_zoo/
+examples/Intern_Decision/cpp/main.cpp``）对**每个字段**各跑一次 prefill，
+输入是「在该字段 ``<decision>`` 标记处截断的前缀」。
+
+⇒ **N 个字段 = N 次前向**；而且每个字段的前缀里已经含有**全部**字段的
+定义（字段定义在 user 块、``<decision>`` 骨架在 assistant 块，后者总在
+后面）⇒ 总 prefill token ∝ *N*²。真机实测（图文，RK1828 单卡）：
+
+    ==========  ==========  ==========
+    维度数       N 个 noul   1 个 choice
+    ==========  ==========  ==========
+    1             0.89 s      1.0 s
+    7             8.0 s       1.0 s
+    16            26.4 s      1.0 s
+    ==========  ==========  ==========
+
+（官方原始权重在 NVIDIA 卡上其实是**一次前向**出全部字段 —— 上游
+``inference.py`` 用 ``logits_to_keep=positions`` 一次取所有 ``<decision>``
+位置的 logits。RKNN 这条路做不到，是因为导出时 LM head 被裁成 62 个候选
+符号，且 rknn3 的 LLM 输出回调只给 prefill **最后一个**位置的 logits。）
+
+⚠️ **语义变了**：``choice`` 的选项概率是**归一化**的（合计为 1）——
+表达的是「最像哪一类」，而**不是**每维独立的肯定概率。一条内容同时命中
+多个维度时，只有模型选中的那一类拿得到高概率（实测 top1 与 top2 差距
+通常很明显，如 广告 68% vs 垃圾信息 9%）。
 
 三条链路（别搞混）
 ------------------
@@ -59,6 +81,12 @@ DEFAULT_NPU_INDEX = 0
 #: （``wdnai.decision.MAX_FIELDS``，参考实现里也是 16）。超了要在界面上
 #: 拦下来，不能等模型报错。
 MAX_ITEMS = 16
+
+#: 用户维护的那张列表被压成**这一个**决策字段（列表项 = 它的选项）。
+#:
+#: ⚠️ 它会直接进 prompt（``{字段名}: {instructions}``），所以要短、要像
+#: 一个类别名，不能是「item_0」那种占位符。
+CHOICE_FIELD = "内容类型"
 
 #: 文字与图片的护栏（对外端点，防止把板子当通用 OCR 机使）。
 MAX_TEXT_CHARS = 4000
@@ -329,20 +357,25 @@ class ContentReviewManager:
     def review(self, text: str = "",
                items: Optional[Sequence[Dict[str, Any]]] = None,
                image_b64: Optional[str] = None) -> Dict[str, Any]:
-        """对一张图 + 一段文字，按用户维护的列表逐项做概率估计。
+        """对一张图 + 一段文字，按用户维护的列表给出**各维度的占比**。
 
         返回::
 
             {
               "results": [
-                {"name": "广告", "probability": 0.98, "symbol": "B",
-                 "label": "yes", "probabilities": {"no": .., "yes": ..},
-                 "logits": [...]}
+                {"name": "广告", "probability": 0.68, "symbol": "A",
+                 "label": "广告", "probabilities": {"广告": 0.68},
+                 "logits": [12.3], "selected": true}
               ],
-              "temperature": 1.9924, "elapsed_sec": 9.1,
+              "selected": "广告", "selected_symbol": "A",
+              "temperature": 1.9924, "elapsed_sec": 1.0,
               "tokens_per_second": 320.5, "perf": {...},
               "has_image": true, "raw_answer": "{...}"
             }
+
+        ⚠️ **概率是归一化分布里的占比**（choice 字段，合计为 1）——
+        表达「最像哪一类」，不是每维独立的肯定概率。``selected`` 标出
+        模型实际选中的那一类。
 
         ⚠️ **性能字段全部在端算好**（``elapsed_sec`` /
         ``tokens_per_second`` / ``perf``）—— 前端只负责显示，一个数都不用
@@ -397,27 +430,13 @@ class ContentReviewManager:
 
         detail = self._parse_detail(atts)
         decisions = detail.get("decisions") or {}
-
-        results: List[Dict[str, Any]] = []
-        for item, field in field_map:
-            got = decisions.get(field) or {}
-            probs = got.get("probabilities") or {}
-            try:
-                p_yes = float(probs.get("yes", got.get("noul") or 0.0))
-            except (TypeError, ValueError):
-                p_yes = 0.0
-            results.append({
-                "name": item["name"],
-                "description": item.get("description", ""),
-                "probability": p_yes,
-                "symbol": got.get("symbol", ""),
-                "label": got.get("label", ""),
-                "probabilities": probs,
-                "logits": got.get("logits") or [],
-            })
+        results, picked, picked_symbol = self._split_choice(decisions, field_map)
 
         return {
             "results": results,
+            # 模型选中的那一类（前端在结果区顶部显示）。
+            "selected": picked,
+            "selected_symbol": picked_symbol,
             "temperature": detail.get("temperature"),
             "elapsed_sec": round(elapsed, 2),
             # ⚠️ **性能**：全部在**后端**算好再发给前端 —— 前端只负责
@@ -467,40 +486,85 @@ class ContentReviewManager:
 
     @staticmethod
     def _build_questions(items: Sequence[Dict[str, Any]]):
-        """把列表项翻译成决策任务字段。
+        """把列表项翻译成**一个** ``choice``（单选）决策字段。
 
-        每个项 = 一个 ``noul``（是否）字段，输出「肯定概率」。
-        字段名用**列表项名称**（模型 prompt 里 ``{字段名}: {instructions}``
-        直接可见，语义比 ``item_0`` 强得多）；重名加后缀（JSON key 重复会被
-        静默覆盖）。
+        每个项 = 一个**选项**（选项键 = 列表项名称，选项说明 = 它的判定口径）。
+        整个列表只有**一个**决策字段 ⇒ **1 次前向**就能出全部维度的分布；
+        N 个 ``noul`` 字段则要 N 次前向、总 prefill ∝ N²（见模块 docstring）。
+
+        ⚠️ **选项键 = 列表项名称**：模型的 prompt 是
+        ``{字段名}: {instructions}`` + ``{符号} = {选项键}: {选项说明}``，
+        选项键直接进 prompt，所以用「广告」比 ``item_0`` 有用得多。
+        选项键必须唯一（JSON key 重复会被静默覆盖）—— ``_normalize_items``
+        已经按名称去重了。
         """
-        questions: Dict[str, Any] = {}
+        criteria: Dict[str, str] = {}
         field_map: List[Tuple[Dict[str, Any], str]] = []
-        used = set()
         for item in items:
             name = item["name"]
-            field = name[:40]
-            if field in used:
-                n = 2
-                while "%s_%d" % (field, n) in used:
-                    n += 1
-                field = "%s_%d" % (field, n)
-            used.add(field)
-
-            desc = item.get("description") or ""
-            questions[field] = {
-                "type": "noul",
-                "instructions": (
-                    "判断待审查的图片与文字中是否出现「%s」。%s"
-                    % (name, desc)
-                ).strip(),
-                "criteria": {
-                    "no": "待审查内容中没有出现「%s」" % name,
-                    "yes": "待审查内容中出现了「%s」" % name,
-                },
+            desc = (item.get("description") or "").strip()
+            criteria[name] = desc or ("属于「%s」这一类" % name)
+            field_map.append((item, name))
+        questions: Dict[str, Any] = {
+            CHOICE_FIELD: {
+                "type": "choice",
+                "instructions": "判断待审查的图片与文字属于以下哪一类",
+                "criteria": criteria,
             }
-            field_map.append((item, field))
+        }
         return questions, field_map
+
+    @staticmethod
+    def _split_choice(decisions: Dict[str, Any],
+                      field_map: Sequence[Tuple[Dict[str, Any], str]]):
+        """把**一个** choice 字段的归一化分布拆回每个维度。
+
+        ⚠️ **整张列表 = 一个 choice 字段** ⇒ 模型返回的是**一份**归一化
+        分布（``{选项键: 概率}``），这里按选项键拆回每个维度。
+
+        返回 ``(results, picked, picked_symbol)``：
+        * ``results`` —— 每个维度一行（前端直接渲染）；
+        * ``picked`` —— 模型实际选中的那一类（choice 只能选一个）。
+
+        单独抽出来是为了**不碰 NPU 就能测**（见
+        ``scripts/verify_content_review_card.py``）。
+        """
+        choice = decisions.get(CHOICE_FIELD) or {}
+        probs = choice.get("probabilities") or {}
+        field_logits = choice.get("logits") or []
+        picked = str(choice.get("label") or "")
+        # 选项符号：按 criteria 顺序 A、B、C…（与模型 prompt 里写的一致）
+        try:
+            from wdnai.decision import DECISION_SYMBOLS
+        except Exception:  # noqa: BLE001 — 协议层是纯 CPU，理论上不会失败
+            DECISION_SYMBOLS = (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+
+        results: List[Dict[str, Any]] = []
+        for index, (item, key) in enumerate(field_map):
+            try:
+                p = float(probs.get(key, 0.0))
+            except (TypeError, ValueError):
+                p = 0.0
+            try:
+                logit = float(field_logits[index])
+            except (IndexError, TypeError, ValueError):
+                logit = None
+            results.append({
+                "name": item["name"],
+                "description": item.get("description", ""),
+                # ⚠️ choice 的概率是**归一化**的（合计为 1）—— 这里是
+                # 「该维度在这份分布里的占比」，不是独立的肯定概率。
+                "probability": p,
+                "symbol": (DECISION_SYMBOLS[index]
+                           if index < len(DECISION_SYMBOLS) else ""),
+                "label": key,
+                "probabilities": {key: p},
+                "logits": [logit] if logit is not None else [],
+                # 模型实际选中的是哪一个（choice 只能选一个）。
+                "selected": bool(picked) and key == picked,
+            })
+        return results, picked, str(choice.get("symbol") or "")
 
     @staticmethod
     def _parse_detail(atts) -> Dict[str, Any]:
