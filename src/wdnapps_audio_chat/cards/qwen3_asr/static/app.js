@@ -309,6 +309,7 @@ const Qwen3Asr = {
     loaded: false,       // 语言列表拉过了
     langItems: null,     // 语言清单（运行时才有的，缓存一份）
     wizardTarget: "",    // 向导里选的目标语言（换步会重建 body，得记住）
+    modelId: "",         // 翻译模型的 model_id（后端定的，进度条要用）
   },
 
   init() {
@@ -1958,6 +1959,7 @@ const Qwen3Asr = {
       this._tr.enabled = !!st.enabled;
       this._tr.targetLang = st.target_lang || this._tr.targetLang;
       this._tr.modelReady = !!model.running;
+      this._tr.modelId = model.model_id || this._tr.modelId || "";
       this._tr.modelStatus = model.running
         ? "翻译模型就绪"
         : (model.installed ? "翻译模型未启动" : "本机没装翻译模型");
@@ -2100,6 +2102,23 @@ const Qwen3Asr = {
    */
   async _trEnableForWizard(lang) {
     const hint = this._trWizardHint("正在启动翻译模型（通常 30 秒左右）…");
+
+    // 翻译模型的加载进度条 —— 和 finish 步等 ASR 模型用的是**同一套**
+    // 渲染（宿主 window.WizardProgress，进度行/百分比算法只有一份）。
+    //
+    // 为什么必须并行：``POST /translate/enable`` 是**慢端点**（服务端要等
+    // 模型加载完才返回，~30 s）。串行 await 的话这 30 秒里屏幕上什么
+    // 都没有 —— 用户只看到「卡住了」。并行之后，worker 一 spawn 就能在
+    // ``/api/compute`` 快照里看到（status=loading + started_at）⇒ 进度条
+    // 立刻有数据。
+    //
+    // npu_index 传 null：翻译模型落在哪张卡由后端的卡位策略决定（跟随
+    // ASR 所在的卡），前端事先不知道 ⇒ 「任意一张卡起来即可」。
+    //
+    // 进度条要按 model_id 找实例 ⇒ 先确保知道它（后端 status 里带）。
+    if (!this._tr.modelId) await this._trRefresh();
+    const watch = this._trWatchProgress();
+
     let ok = false;
     try {
       // ⚠️ 慢端点：服务端要等模型加载完才返回（LOAD_TIMEOUT_S = 120 s）。
@@ -2125,6 +2144,15 @@ const Qwen3Asr = {
       const msg = (e && (e.message || e)) || "未知原因";
       this._tr.modelStatus = "翻译模型启动失败：" + msg;
       console.warn("[qwen3-asr] 向导里启动翻译模型失败（继续启动识别）:", e);
+    } finally {
+      if (watch) {
+        if (ok) {
+          // 模型已就绪（enable 同步等过）⇒ 让进度条走到 100% 再收。
+          try { await watch.settle(); } catch (_) { /* 进度条自己收尾 */ }
+        } else {
+          watch.cancel("翻译模型加载失败 —— 识别照常启动（本次没有译文）");
+        }
+      }
     }
     if (hint && hint.parentNode) hint.parentNode.removeChild(hint);
     if (ok) {
@@ -2132,6 +2160,26 @@ const Qwen3Asr = {
     }
     await this._trRefresh();
     return ok;
+  },
+
+  /**
+   * 开一个「翻译模型加载中」的进度条（宿主框架的通用进度条）。
+   *
+   * 拿不到翻译模型 id（后端还没报上来）或宿主没有 WizardProgress 时
+   * 返回 null —— 那是「没有进度条但照常加载」的降级，不该因此失败。
+   */
+  _trWatchProgress() {
+    try {
+      const WP = window.WizardProgress;
+      if (!WP || typeof WP.watch !== "function") return null;
+      const modelId = this._tr.modelId;
+      if (!modelId) return null;
+      return WP.watch(
+        [{ model_id: modelId, npu_index: null }],
+        { headerText: "翻译模型加载中", timeoutMs: 150000 });
+    } catch (e) {
+      return null;
+    }
   },
 
   /** 在向导「完成配置」的摘要里加一行提示（卡片页在向导背后，看不到）。 */

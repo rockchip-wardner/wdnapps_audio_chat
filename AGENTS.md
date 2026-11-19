@@ -36,6 +36,7 @@ the host UI: `qwen3-asr`（流式语音识别）、`tts`（语音生成）、`te
 | 默认值 | **「不翻译」**。⚠️ 不能拿卡片页的 `targetLang`（默认 `"en"`）当默认 —— 用户没碰过下拉也会被当成「选了英语」⇒ 白白加载一个 2.2 GB 的模型 |
 | 「不翻译」是显式选择 | 用哨兵值 `"off"`，**不能**被卡片当前状态盖掉（卡片翻译开着时也不能把用户的「不翻译」改回去） |
 | 加载 | 走 `POST /api/qwen3-asr/translate/enable`（后端算卡位 + 幂等 + 写 `compute.autostart`），**前端不自己拼** `POST /api/compute/instances` |
+| **加载进度** | 跟 ASR 模型**同一套**进度条（宿主 `window.WizardProgress`）⇒ 翻译模型加载时向导 finish 框里也有一行 `hy-mt-1-5` + 百分比。⚠️ 必须与 `POST /translate/enable` **并行** —— 那是慢端点（服务端等模型加载完才返回，~30 s），串行 await 的话那 30 秒屏幕上什么都没有。`npu_index` 传 `null`（落哪张卡由后端卡位策略定，前端事先不知道） |
 | 开关时机 | **模型就绪之后**才开实时翻译开关。顺序反了的话，模型没起来的那些句子会被标成「翻译模型未启用」（`status=unavailable`），白噪音 |
 | **失败降级** | 翻译是**旁路**，识别才是主链路 ⇒ 模型起不来 / 超时**只记警告，识别照常启动** |
 
@@ -45,6 +46,8 @@ the host UI: `qwen3-asr`（流式语音识别）、`tts`（语音生成）、`te
 
 回归（宿主仓）：`.venv/bin/python scripts/verify_asr_wizard_translate.py`
 —— 断言向导有这一步、默认「不翻译」、选了语言真的调 `translate/enable`、
+**翻译模型加载时出现了进度条**（用例 1 会先 `POST /translate/disable` 把
+模型停掉，否则 enable 直接复用 ⇒ 没有 loading 进度可看）、
 以及**翻译模型启用失败时识别照常启动**。
 
 ## `web-translate` 卡（网页翻译）
