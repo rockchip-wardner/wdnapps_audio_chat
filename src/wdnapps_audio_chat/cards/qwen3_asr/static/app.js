@@ -2101,58 +2101,22 @@ const Qwen3Asr = {
    * 返回 true = 翻译已就绪。
    */
   async _trEnableForWizard(lang) {
-    const hint = this._trWizardHint("正在启动翻译模型（通常 30 秒左右）…");
+    const hint = this._trWizardHint("翻译模型与识别模型同时加载（通常 30 秒左右）…");
 
-    // 翻译模型的加载进度条 —— 和 finish 步等 ASR 模型用的是**同一套**
-    // 渲染（宿主 window.WizardProgress，进度行/百分比算法只有一份）。
-    //
-    // 为什么必须并行：``POST /translate/enable`` 是**慢端点**（服务端要等
-    // 模型加载完才返回，~30 s）。串行 await 的话这 30 秒里屏幕上什么
-    // 都没有 —— 用户只看到「卡住了」。并行之后，worker 一 spawn 就能在
-    // ``/api/compute`` 快照里看到（status=loading + started_at）⇒ 进度条
-    // 立刻有数据。
-    //
-    // npu_index 传 null：翻译模型落在哪张卡由后端的卡位策略决定（跟随
-    // ASR 所在的卡），前端事先不知道 ⇒ 「任意一张卡起来即可」。
-    //
-    // 进度条要按 model_id 找实例 ⇒ 先确保知道它（后端 status 里带）。
-    if (!this._tr.modelId) await this._trRefresh();
-    const watch = this._trWatchProgress();
+    // 优先用 preloadExtraModels 已经**发起**的那次 —— 框架等的就是它
+    // （并行：两个模型同时加载、同一块进度条里两行）。
+    const pending = this._trEnablePromise;
+    this._trEnablePromise = null;
 
     let ok = false;
     try {
-      // ⚠️ 慢端点：服务端要等模型加载完才返回（LOAD_TIMEOUT_S = 120 s）。
-      //    这里给 150 s 的上限兜底；超时也不抛 —— 翻译失败不该让向导失败。
-      const ctl = (typeof AbortController !== "undefined")
-        ? new AbortController() : null;
-      const timer = ctl ? setTimeout(() => ctl.abort(), 150000) : null;
-      let r;
-      try {
-        r = await fetch("/api/qwen3-asr/translate/enable", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-          signal: ctl ? ctl.signal : undefined,
-        });
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+      const p = pending || this._trStartModel(lang);
+      await p;
       ok = true;
     } catch (e) {
       const msg = (e && (e.message || e)) || "未知原因";
       this._tr.modelStatus = "翻译模型启动失败：" + msg;
       console.warn("[qwen3-asr] 向导里启动翻译模型失败（继续启动识别）:", e);
-    } finally {
-      if (watch) {
-        if (ok) {
-          // 模型已就绪（enable 同步等过）⇒ 让进度条走到 100% 再收。
-          try { await watch.settle(); } catch (_) { /* 进度条自己收尾 */ }
-        } else {
-          watch.cancel("翻译模型加载失败 —— 识别照常启动（本次没有译文）");
-        }
-      }
     }
     if (hint && hint.parentNode) hint.parentNode.removeChild(hint);
     if (ok) {
@@ -2163,23 +2127,30 @@ const Qwen3Asr = {
   },
 
   /**
-   * 开一个「翻译模型加载中」的进度条（宿主框架的通用进度条）。
+   * **发起**翻译模型的加载 —— **不等**它加载完。
    *
-   * 拿不到翻译模型 id（后端还没报上来）或宿主没有 WizardProgress 时
-   * 返回 null —— 那是「没有进度条但照常加载」的降级，不该因此失败。
+   *  返回 promise：resolve = 模型就绪，reject = 起不来。
+   *
+   *  ⚠️ 为什么不等：`POST /translate/enable` 是慢端点（服务端要等模型
+   *  加载完才返回，~30 s）。这里 await 它的话，框架的等待就被推迟 30 s
+   *  ⇒ 变回「先等 ASR、再加载翻译」的串行。
    */
-  _trWatchProgress() {
-    try {
-      const WP = window.WizardProgress;
-      if (!WP || typeof WP.watch !== "function") return null;
-      const modelId = this._tr.modelId;
-      if (!modelId) return null;
-      return WP.watch(
-        [{ model_id: modelId, npu_index: null }],
-        { headerText: "翻译模型加载中", timeoutMs: 150000 });
-    } catch (e) {
-      return null;
-    }
+  _trStartModel(lang) {
+    const ctl = (typeof AbortController !== "undefined")
+      ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), 150000) : null;
+    return fetch("/api/qwen3-asr/translate/enable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal: ctl ? ctl.signal : undefined,
+    }).then(async (r) => {
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+      return data;
+    }).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
   },
 
   /** 在向导「完成配置」的摘要里加一行提示（卡片页在向导背后，看不到）。 */
@@ -3339,6 +3310,53 @@ const Qwen3Asr = {
  * 而不是「向导完成了但还得自己去页面点开始」。
  */
 window.ImApp_qwen3_asr = window.ImApp_qwen3_asr || {};
+
+/**
+ * 向导 finish 前的钩子：**提前发起**翻译模型的加载。
+ *
+ *  框架（`wizard/state.js::_finish`）会问卡片要「额外要加载的模型」，
+ *  拿到后把它们**并进** finish 步的等待 ⇒ 翻译模型与 ASR 模型
+ *  **并行加载**、**同一块进度条**里两行。
+ *
+ *  ⚠️ 以前是串行：先等 ASR 模型加载完（进度条走完），再由
+ *  `applyWizardSnapshot` 单独加载翻译模型（另一条进度条）—— 用户要
+ *  等两轮。
+ *
+ *  ⚠️ 这里**只发起**、不 await —— await 的话框架的等待被推迟 30 s，
+ *  变回串行。失败时 `notifyFailed` ⇒ 框架那一行标 error（软失败），
+ *  识别照常启动。
+ */
+window.ImApp_qwen3_asr.preloadExtraModels = async function (opts) {
+  const o = opts || {};
+  const lang = String(o.trTarget || "").trim();
+  if (!lang || lang === "off") return { targets: [] };
+  // 没有源就别白加载一个 2.2 GB 的模型（与 applyWizardSnapshot 的判断一致）
+  if (!String(o.source || "").trim()) return { targets: [] };
+
+  // 进度条要按 model_id 找实例 ⇒ 先确保知道它（后端 status 里带）
+  if (!Qwen3Asr._tr.modelId) await Qwen3Asr._trRefresh();
+  const modelId = Qwen3Asr._tr.modelId;
+  if (!modelId) return { targets: [] };
+
+  // 发起加载（**不等**）—— 框架的进度条会并行追踪它
+  Qwen3Asr._trEnablePromise = Qwen3Asr._trStartModel(lang);
+  Qwen3Asr._trEnablePromise.catch((e) => {
+    const msg = (e && (e.message || e)) || "启动失败";
+    try {
+      if (window.WizardProgress && window.WizardProgress.notifyFailed) {
+        window.WizardProgress.notifyFailed(modelId, msg);
+      }
+    } catch (_) { /* 忽略 */ }
+  });
+
+  return {
+    // npu_index: null = 任意一张卡起来即可（落哪张卡由后端卡位策略定）
+    targets: [{ model_id: modelId, npu_index: null }],
+    // 软失败：翻译模型起不来只把这行标 error，**不**让整个向导失败
+    soft: [modelId + "@null"],
+  };
+};
+
 window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
   Qwen3Asr.init();
   const o = opts || {};
