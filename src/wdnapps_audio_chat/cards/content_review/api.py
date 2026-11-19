@@ -8,10 +8,14 @@
 * ``POST   /api/content-review/disable``  — 禁用（停决策模型实例）。
 * ``POST   /api/content-review/review``   — 审一次（图文 + 列表 → 概率）。
 
+⚠️ **模型可切换**（2026-11-19）：0.8B 与 4B 同规格同协议，界面上拉选。
+⇒ 每个端点都接受 ``model_id``（``status`` 是 query，其余在 body 里），
+不传 = 默认模型。
+
 错误码
 ======
 
-* 400 —— 参数不合法 / 模型没装 / 卡位冲突 / 模型未启用。
+* 400 —— 参数不合法 / 模型没装 / 模型未启用。
 * 502 —— 推理本身失败。
 """
 from __future__ import annotations
@@ -49,6 +53,14 @@ class EnablePayload(BaseModel):
     model_config = {"extra": "ignore"}
     #: 卡位；不传 = 默认第一张 1828 协卡（0 号）
     npu_index: Optional[int] = Field(default=None, ge=0, le=15)
+    #: 用哪个决策模型；不传 = 默认（4B）。见 ``service.MODEL_IDS``。
+    model_id: Optional[str] = Field(default=None, max_length=64)
+
+
+class DisablePayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    #: 停哪个决策模型；不传 = 默认（4B）。
+    model_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class ReviewPayload(BaseModel):
@@ -59,6 +71,8 @@ class ReviewPayload(BaseModel):
     items: List[ItemPayload] = Field(default_factory=list)
     #: 图片（base64，可带 data URL 前缀）。空 = 纯文本审查。
     image_b64: str = Field(default="", max_length=16 * 1024 * 1024)
+    #: 用哪个决策模型；不传 = 默认（4B）。
+    model_id: Optional[str] = Field(default=None, max_length=64)
 
 
 # --------------------------------------------------------------------------- #
@@ -72,28 +86,33 @@ class ReviewPayload(BaseModel):
 # 算力页不刷新、WS 推送全停）。
 #
 @router.get("/status")
-def get_content_review_status() -> Dict[str, Any]:
-    """当前状态快照；界面每次刷新拉一次。"""
-    return get_service().status()
+def get_content_review_status(model_id: Optional[str] = None) -> Dict[str, Any]:
+    """当前状态快照；界面每次刷新拉一次。
+
+    ``model_id`` = 看**哪个**模型的状态（界面上拉选中的那个）；不传 = 默认。
+    响应里的 ``models`` 是全部候选模型，界面用它渲染下拉。
+    """
+    return get_service().status(model_id)
 
 
 @router.post("/enable")
 def post_content_review_enable(payload: EnablePayload) -> Dict[str, Any]:
     """启用：起决策模型的一个实例（默认第一张 1828 协卡）。
 
-    这一步要等模型加载完（约 40 秒），所以是**慢端点** —— 界面上按钮会转圈。
+    这一步要等模型加载完（约 30~60 秒），所以是**慢端点** —— 界面上按钮会转圈。
     """
     try:
-        return get_service().enable(payload.npu_index)
+        return get_service().enable(payload.npu_index, payload.model_id)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/disable")
-def post_content_review_disable() -> Dict[str, Any]:
+def post_content_review_disable(
+        payload: Optional[DisablePayload] = None) -> Dict[str, Any]:
     """禁用：停掉决策模型实例。"""
     try:
-        return get_service().disable()
+        return get_service().disable(payload.model_id if payload else None)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -116,6 +135,7 @@ def post_content_review_review(payload: ReviewPayload) -> Dict[str, Any]:
             text=payload.text,
             items=[i.model_dump() for i in payload.items],
             image_b64=payload.image_b64 or None,
+            model_id=payload.model_id,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

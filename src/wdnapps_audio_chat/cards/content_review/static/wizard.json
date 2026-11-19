@@ -4,7 +4,7 @@
   "swcap_to_model": {
     "swcap_decision": {
       "model_id": "intern-decision-4b",
-      "models": ["intern-decision-4b"],
+      "models": ["intern-decision-4b", "intern-decision-0.8b"],
       "npu_index": [0]
     }
   },
