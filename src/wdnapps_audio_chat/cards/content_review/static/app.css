@@ -96,6 +96,42 @@
 .cr-service-note[data-kind="error"] { color: #b91c1c; }
 .cr-service-note[data-kind="ok"] { color: #15803d; }
 .cr-service-note[data-kind="busy"] { color: #1d4ed8; }
+/* ⚠️ 余量告警（2026-11-19）—— 决策模型不再独占整卡，卡上挤时只提示
+   一句「可能放不下」，不拦停 ⇒ 用**琥珀色**（不是红的「出错」）。 */
+.cr-service-note[data-kind="warn"] { color: #b45309; }
+
+/* ------------------------------------------------------------------ *
+ * 模型选择器（0.8B / 4B）
+ * ------------------------------------------------------------------ */
+.cr-model-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.cr-model-label {
+  font-size: 0.82rem;
+  color: var(--muted, #6b7280);
+  white-space: nowrap;
+}
+
+.cr-model-select {
+  font-size: 0.86rem;
+  color: #111827;
+  background: #fff;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  padding: 4px 8px;
+  max-width: 320px;
+}
+.cr-model-select:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.cr-model-hint {
+  font-size: 0.78rem;
+  color: var(--muted, #6b7280);
+}
 
 /* ------------------------------------------------------------------ *
  * 审查维度列表（可增删）

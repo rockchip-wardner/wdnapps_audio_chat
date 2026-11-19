@@ -14,6 +14,8 @@
   const API = "/api/content-review";
   const POLL_MS = 3000;
   const LS_KEY = "wdnwebui.content_review.items";
+  /** 选了哪个决策模型（0.8B / 4B）。 */
+  const LS_MODEL_KEY = "wdnwebui.content_review.model";
   /** 本地存储格式版本（结构变了才 +1）。 */
   const STORE_VERSION = 2;
   /** 模型硬上限（决策任务最多 16 个字段）。 */
@@ -56,6 +58,12 @@
     _items: [],
     _imageB64: "",
     _imageName: "",
+    /**
+     * 当前选中的决策模型 id（空 = 还没拉到列表，先用后端的默认）。
+     *
+     * 下拉里的选项来自后端（``GET /status`` 的 ``models``）。
+     */
+    _modelId: "",
 
     init() {
       if (this._inited) return;
@@ -66,8 +74,16 @@
       this.renderItems();
       if (loaded.notice) this.setRunNote(loaded.notice, "ok");
 
+      this._modelId = loadModelId();
+
       $("cr-enable-btn")?.addEventListener("click", () => this.enable());
       $("cr-disable-btn")?.addEventListener("click", () => this.disable());
+      $("cr-model-select")?.addEventListener("change", (e) => {
+        this._modelId = e.target.value || "";
+        saveModelId(this._modelId);
+        // 换模型 ⇒ 状态（就绪没 / 卡位 / 告警）全变了，重拉一次。
+        this.refresh().catch(() => {});
+      });
       $("cr-add-item")?.addEventListener("click", () => this.addItem());
       $("cr-reset-items")?.addEventListener("click", () => {
         this._items = DEFAULT_ITEMS.map((x) => ({ ...x }));
@@ -95,19 +111,28 @@
     async refresh() {
       let st;
       try {
-        const r = await fetch(API + "/status", { cache: "no-store" });
-        if (!r.ok) return;
+        // ⚠️ **带上 model_id** —— 状态是**按模型**的（哪个模型在跑、在哪张
+        // 卡、余量够不够）。没带时后端用默认模型。
+        const url = this._modelId
+          ? API + "/status?model_id=" + encodeURIComponent(this._modelId)
+          : API + "/status";
+        const r = await fetch(url, { cache: "no-store" });
+        if (!r.ok) return null;
         st = await r.json();
       } catch (_) {
-        return;
+        return null;
       }
       this.status = st;
       this.render(st);
+      return st;
     },
 
     render(st) {
       const enabled = !!st.enabled;
       const pending = st.instance_status === "loading" || this._busy;
+
+      // ---- 模型下拉（选项来自后端，别在前端写死标签） ----
+      this.renderModelSelect(st);
 
       const box = $("cr-service");
       if (box) box.dataset.state = enabled ? "on" : (pending ? "pending" : "off");
@@ -142,21 +167,19 @@
 
       const note = $("cr-service-note");
       if (note) {
-        if (st.conflict) {
-          note.textContent = st.conflict;
-          note.dataset.kind = "error";
-        } else if (st.instance_error) {
+        if (st.instance_error) {
           note.textContent = st.instance_error;
           note.dataset.kind = "error";
+        } else if (st.warning) {
+          // ⚠️ 余量告警 —— **不是错误**：决策模型不再独占整卡，卡上挤只
+          // 提示一句，让用户自己去算力页腾地方（估算是估算值，拦死反而不准）。
+          note.textContent = st.warning;
+          note.dataset.kind = "warn";
         } else {
           note.textContent = "";
           note.dataset.kind = "";
         }
       }
-
-      // 模型信息（算力页那张卡的模型 id / 标签）
-      const modelLabel = $("cr-model-label");
-      if (modelLabel) modelLabel.textContent = st.model_label || st.model_id || "—";
 
       const line = $("cr-status-line");
       if (line) line.textContent = enabled ? "已就绪" : (pending ? "处理中" : "未启用");
@@ -168,6 +191,58 @@
 
       const raw = $("data-content-review");
       if (raw) raw.textContent = JSON.stringify(st, null, 2);
+    },
+
+    // ------------------------------------------------------------------ //
+    // 模型下拉
+    // ------------------------------------------------------------------ //
+    /**
+     * 渲染决策模型下拉（0.8B / 4B）。
+     *
+     * 选项来自后端 ``status.models`` ⇒ **前端不写死任何标签**，标签的真源是
+     * 模型目录里的 manifest（算力页上显示的那一份）。
+     */
+    renderModelSelect(st) {
+      const sel = $("cr-model-select");
+      if (!sel) return;
+      const models = (st && st.models) || [];
+      sel.innerHTML = "";
+      if (!models.length) {
+        sel.disabled = true;
+        return;
+      }
+      // 当前选中项：优先用本地记住的；没有就用后端返回的那个（默认模型）。
+      if (!models.some((m) => m.id === this._modelId)) {
+        this._modelId = (st && st.model_id) || models[0].id;
+      }
+      models.forEach((m) => {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        // 没装的标出来 —— 选了也没用（后端会拒绝启用）。
+        const bits = [m.label || m.id];
+        if (!m.installed) bits.push("（未安装）");
+        else if (m.memory_mb) bits.push("（约 " + m.memory_mb + " MB）");
+        if (m.running) bits.push("· 运行中");
+        opt.textContent = bits.join(" ");
+        opt.disabled = !m.installed;
+        if (m.id === this._modelId) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.disabled = models.every((m) => !m.installed);
+
+      const hint = $("cr-model-hint");
+      if (hint) {
+        const cur = models.find((m) => m.id === this._modelId);
+        if (!cur) {
+          hint.textContent = "";
+        } else if (!cur.installed) {
+          hint.textContent = "本机没装这个模型";
+        } else if (cur.memory_mb) {
+          hint.textContent = "每份约 " + cur.memory_mb + " MB";
+        } else {
+          hint.textContent = "";
+        }
+      }
     },
 
     // ------------------------------------------------------------------ //
@@ -334,6 +409,7 @@
             text: text,
             items: items,
             image_b64: this._imageB64 || "",
+            model_id: this._modelId || "",
           }),
         });
         const data = await r.json().catch(() => null);
@@ -442,20 +518,23 @@
     async enable() {
       if (this._busy) return null;
       this._busy = true;
-      this.setNote("正在启动决策模型（约 40 秒）…", "busy");
+      // ⚠️ 不写死秒数 —— 4B 约 60 秒、0.8B 约 30 秒，写死一个数对另一个
+      // 型号就是错的。
+      this.setNote("正在启动决策模型（几十秒，请稍候）…", "busy");
       this.render(this.status || {});
       try {
-        const st = await this._post(API + "/enable", {});
+        const st = await this._post(API + "/enable", { model_id: this._modelId });
         this.status = st;
-        // 后端为了腾出这张卡，可能**自动停掉了**别的模型（决策模型要独占
-        // 一整张卡）—— 必须告诉用户，否则他会发现翻译服务莫名停了。
-        const stopped = (st && st.stopped) || [];
+        this._modelId = st.model_id || this._modelId;
+        saveModelId(this._modelId);
+        // ⚠️ 决策模型**不再独占整卡**（2026-11-19）⇒ 后端不再替用户停掉
+        // 卡上的其它模型，只在显存可能不够时给一条 warning。
+        const warning = (st && st.warning) || "";
         this.setNote(
-          stopped.length
-            ? "已就绪 —— 为腾出这张卡，已自动停掉：" +
-              stopped.map((s) => s.label || s.model_id).join("、")
+          warning
+            ? "决策模型已就绪 —— " + warning
             : "决策模型已就绪 —— 可以提交图文审查。",
-          "ok");
+          warning ? "warn" : "ok");
         return st;
       } catch (err) {
         this.setNote(errText(err), "error");
@@ -473,7 +552,7 @@
       this.setNote("正在停止决策模型…", "busy");
       this.render(this.status || {});
       try {
-        const st = await this._post(API + "/disable", {});
+        const st = await this._post(API + "/disable", { model_id: this._modelId });
         this.status = st;
         this.setNote("决策模型已禁用。", "ok");
         return st;
@@ -546,6 +625,28 @@
       };
       reader.readAsDataURL(file);
     });
+  }
+
+  /**
+   * 读上次选的决策模型 id。
+   *
+   * ⚠️ **读到的不一定还在**（模型被卸载了 / 后端换了默认）⇒ 不在这里校验，
+   * 交给 :meth:`renderModelSelect` 对着后端给的列表校正。
+   */
+  function loadModelId() {
+    try {
+      return localStorage.getItem(LS_MODEL_KEY) || "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  /** 记住选中的决策模型 id。 */
+  function saveModelId(id) {
+    try {
+      if (id) localStorage.setItem(LS_MODEL_KEY, id);
+      else localStorage.removeItem(LS_MODEL_KEY);
+    } catch (_) { /* 存不了就算了，不影响功能 */ }
   }
 
   /**
@@ -709,8 +810,21 @@
   window.ImApp_content_review.app = ContentReview;
   window.ImApp_content_review.applyWizardSnapshot = async function () {
     try {
-      const st = await ContentReview.enable();
-      return { enabled: !!(st && st.enabled) };
+      // ⚠️ **向导可能刚启了另一个型号**（向导按 wizard.json 的候选列表挑
+      // 「第一个已装的」，未必是用户在下拉里选的那个）⇒ 先认下来：哪个决策
+      // 模型正在跑就用哪个，**不要**再起一个 —— 两个型号各占一份显存，
+      // 用户以为只开了一个。
+      const st = await ContentReview.refresh();
+      const running = ((st && st.models) || []).find((m) => m.running);
+      if (running) {
+        ContentReview._modelId = running.id;
+        saveModelId(running.id);
+        ContentReview.render(st);
+        return { enabled: true, model_id: running.id };
+      }
+      // 一个都没跑 ⇒ 起用户选的那个（没选过就是默认）。
+      const out = await ContentReview.enable();
+      return { enabled: !!(out && out.enabled) };
     } catch (err) {
       throw new Error("start_failed:启用决策模型失败 —— " + errText(err));
     }

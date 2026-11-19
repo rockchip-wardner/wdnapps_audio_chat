@@ -10,14 +10,18 @@
         <!--
           服务启停条 —— 这张卡的主控件。
 
-          决策模型（Intern-Decision-4B）不是对话模型：它不生成文本，而是对
-          任务里的每个「决策字段」输出候选符号的 logits，由 CPU 侧换算成
-          概率。所以这张卡做的事 = 把用户维护的审查维度列表翻译成**一个**
+          决策模型（Intern-Decision 家族：4B / 0.8B）不是对话模型：它不生成
+          文本，而是对任务里的每个「决策字段」输出候选符号的 logits，由 CPU 侧
+          换算成概率。所以这张卡做的事 = 把用户维护的审查维度列表翻译成**一个**
           「单选」字段 —— 列表里的每一项是它的一个选项。
 
           ⚠️ 整个列表只有**一个**决策字段 ⇒ **一次推理**出全部维度。
           之前是「每项一个是否字段」，那样每项都要单独跑一次推理，维度一多
           慢得离谱（16 项要 26 秒）；现在 1~16 项都是约 1 秒。
+
+          ⚠️ 0.8B 与 4B **同规格同协议**（同一个 tokenizer、同样的控制
+          token id），换模型只是换一份权重 —— 差别在参数量：0.8B 更快更省
+          显存（能和其它模型同卡共居），4B 判别力更强。
 
           data-state 有三态：
             off     —— 未启用（审查不可用）
@@ -33,6 +37,16 @@
           <p class="cr-service-detail" id="cr-service-detail">
             正在读取状态…
           </p>
+          <!--
+            模型选择器 —— 选项由后端 ``GET /status`` 的 ``models`` 数组渲染
+            （标签 / 显存估算的真源是模型目录里的 manifest）⇒ 前端不写死
+            任何标签。
+          -->
+          <div class="cr-model-row">
+            <label class="cr-model-label" for="cr-model-select">决策模型</label>
+            <select id="cr-model-select" class="cr-model-select"></select>
+            <span class="cr-model-hint" id="cr-model-hint"></span>
+          </div>
           <div class="cr-service-actions">
             <button class="vd-btn vd-btn-primary" id="cr-enable-btn">启用决策模型</button>
             <button class="vd-btn" id="cr-disable-btn" disabled>禁用决策模型</button>
