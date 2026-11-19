@@ -1465,6 +1465,18 @@ class _LiveAsrSession:
         self._consecutive_drops = 0
         self._duplicate_chunks = 0
         self._expected_seq = 0
+        #: **正在处理**的那一块（已出队、还在等推理）。
+        #:
+        #: ⚠️ 它**不在队列里** ⇒ :meth:`stop` 扫队列时扫不到它 ⇒ 它的
+        #: ``future`` 永远没人 resolve ⇒ 那个 ``POST /live/chunk`` 请求
+        #: **挂死**（实测 15 s 超时才断）。
+        #:
+        #: ⇒ 浏览器的那个 ``fetch`` 永不返回 ⇒ 客户端的 ``sending`` 标志
+        #: 永远为 true ⇒ 下一轮「开始实时识别」的 ``_livePump()`` 直接
+        #: return（没人上行）⇒ 队列（只容 2 块）溢出 ⇒ **「有音频丢失」**。
+        #:
+        #: ⇒ :meth:`stop` 必须**单独**把它捞出来 resolve 掉。
+        self._inflight: Optional[_LiveItem] = None
         self._endpoint_index = 0
         self._endpoint_hit = False
         self._closed = False
@@ -1584,6 +1596,12 @@ class _LiveAsrSession:
     async def stop(self) -> dict:
         """立即中止：停掉 worker、丢掉队列、释放 SDK 会话。"""
         self._closed = True
+        # ⚠️ **先抓住在途的那一块** —— 它已经出队了，扫队列扫不到。
+        #    worker 被 cancel 时它的 ``future`` 没人 resolve ⇒ 那个
+        #    ``POST /live/chunk`` 请求会**永久挂死**（实测 15 s 才超时）。
+        #    ⇒ 浏览器那个 fetch 永不返回 ⇒ 客户端 ``sending`` 永远为
+        #    true ⇒ 下一轮「开始实时识别」没人上行 ⇒ 「有音频丢失」。
+        inflight = self._inflight
         await self._stop_worker()
         while True:
             try:
@@ -1592,6 +1610,8 @@ class _LiveAsrSession:
                 break
             if not item.future.done():
                 item.future.set_result(self._result_payload(item.seq))
+        if inflight is not None and not inflight.future.done():
+            inflight.future.set_result(self._result_payload(inflight.seq))
         self._feed.reset()
         _LOG.info("live session %s stopped (dropped=%s)",
                   self.stream_id, self._dropped_chunks)
@@ -1683,6 +1703,9 @@ class _LiveAsrSession:
             try:
                 if item is None:
                     return
+                # ⚠️ **记住「正在处理的那一块」** —— :meth:`stop` 要靠它
+                #    给这个请求一个回应（否则它永久挂死，见 ``_inflight``）。
+                self._inflight = item
                 await self._handle(item)
             except asyncio.CancelledError:
                 raise
@@ -1693,10 +1716,19 @@ class _LiveAsrSession:
                     item.future.set_result(self._result_payload(item.seq))
                 return
             finally:
+                self._inflight = None
                 self._queue.task_done()
 
     async def _handle(self, item: _LiveItem) -> None:
         """处理一块 PCM（丢包判定已经在入队时做完了）。"""
+        # ⚠️ 会话已经被中止 ⇒ 别再喂模型、别再广播。
+        #    推理是**不可中断**的（在途那次 RPC 跑完才回来）⇒ 中止之后
+        #    这一块还会「晚到」；不挡住的话，它会把已死的会话又播一帧
+        #    endpoint 出去（前端会以为又识别了一句）。
+        if self._closed:
+            if not item.future.done():
+                item.future.set_result(self._result_payload(item.seq))
+            return
         pcm = item.pcm
         dur = len(pcm) / float(
             self.sample_rate * self.n_channels * self.sample_width or 1)
@@ -1829,6 +1861,11 @@ class _LiveAsrSession:
     async def _finalize(self, *, reason: str) -> None:
         """收尾：尾巴喂给 SDK（final=True）→ 关会话 → 广播。"""
         if self._finished:
+            return
+        # ⚠️ 会话已被 :meth:`stop` 中止 ⇒ **不要再收尾、不要再广播**。
+        #    推理不可中断 ⇒ 中止后那次推理还会「晚到」；不挡住的话它会把
+        #    已死的会话又播一帧 endpoint 出去。
+        if self._closed:
             return
         tail = self._feed.flush()
         try:

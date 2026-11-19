@@ -279,6 +279,15 @@ const Qwen3Asr = {
     seq: 0,
     queue: [],
     sending: false,
+    /**
+     * 会话代号 —— 每次「开始」/「中止」+1。
+     *
+     * 用来分辨「这个响应属于哪一轮」：上一轮的在途请求返回时（哪怕是
+     * 404/409），**不许**再去中止当前这一轮 —— 否则一次「中止 → 重开」
+     * 就会把刚开好的新会话杀掉（实测：按钮卡在「结束实时识别」且禁用，
+     * 再也点不动）。
+     */
+    gen: 0,
     dropped: 0,        // 客户端丢掉的块（L1）
     serverDropped: 0,  // 服务端丢掉的块（L3）
     buf: null,         // 攒块缓冲（Uint8Array）
@@ -2136,6 +2145,12 @@ const Qwen3Asr = {
       L.queue.length = 0;
       L.dropped = 0;
       L.serverDropped = 0;
+      // ⚠️ **新一轮** —— 代号 +1、复位 ``sending``。
+      //    上一轮的在途请求（如果还有）回来时看到代号变了就知道自己过期了；
+      //    ``sending`` 必须复位，否则本轮的 ``_livePump()`` 会直接 return
+      //    —— 没人上行 ⇒ 队列溢出 ⇒ 「有音频丢失」。
+      L.gen = (L.gen || 0) + 1;
+      L.sending = false;
       L.segments = [];
       L.committed = "";
       L.unfixed = "";
@@ -2452,10 +2467,15 @@ const Qwen3Asr = {
   /** L2 传输层：串行 ``await`` 响应 → 发送速率被推理速率钳住。 */
   async _livePump() {
     const L = this._live;
+    // ⚠️ **记住本轮代号** —— 下面的每个 ``await`` 之后都可能已经换轮了
+    //    （用户在推理途中点了「中止」）。过期的这一轮**不许**再动队列、
+    //    **不许**再中止当前会话。
+    const gen = L.gen;
     if (L.sending) return;
     L.sending = true;
     try {
       while (L.queue.length) {
+        if (gen !== L.gen) return;   // 过期了 → 别再碰队列
         const item = L.queue.shift();
         try {
           const r = await fetch(API_PREFIX + "/qwen3-asr/live/chunk", {
@@ -2467,6 +2487,7 @@ const Qwen3Asr = {
             },
             body: item.bytes,
           });
+          if (gen !== L.gen) return;   // 过期响应 → 丢掉，不碰当前会话
           const data = await r.json().catch(() => ({}));
           if (!r.ok) {
             this._liveStatus("上行失败：" + (data.detail || `HTTP ${r.status}`));
@@ -2483,11 +2504,15 @@ const Qwen3Asr = {
           this._liveStatus(
             `识别中 · 丢块 ${L.dropped} · 延迟 ${data.lag_ms || 0} ms`);
         } catch (e) {
+          if (gen !== L.gen) return;   // 过期轮次的错误 → 静默
           this._liveStatus("上行失败：" + e);
         }
       }
     } finally {
-      L.sending = false;
+      // ⚠️ **只有当前这一轮**才允许复位 ``sending`` —— 过期的那一轮如果
+      //    也去复位，会把新一轮的「正在上行」状态抹掉（两个泵同时跑 ⇒
+      //    音频块乱序）。
+      if (gen === L.gen) L.sending = false;
     }
   },
 
@@ -2563,6 +2588,10 @@ const Qwen3Asr = {
       this._liveStatus("结束失败：" + e);
     }
     L.streamId = "";
+    // ⚠️ **收尾之后再作废这一轮** —— 不能提前：提前作废会让在途的那次
+    //    请求被当成「过期」而丢弃，队列排不空（``_liveDrain`` 会白等 10 s）。
+    L.gen = (L.gen || 0) + 1;
+    L.sending = false;
     this._syncLiveUi();
   },
 
@@ -2570,6 +2599,15 @@ const Qwen3Asr = {
   async _liveAbort(status) {
     const L = this._live;
     const streamId = L.streamId;
+    // ⚠️ **先作废上一轮**（代号 +1）—— 在途请求回来时看到代号变了，
+    //    就不会再去中止当前会话、也不会再碰队列。
+    L.gen = (L.gen || 0) + 1;
+    // ⚠️ **复位 ``sending``** —— 它要等在途的 ``fetch`` 返回才归零，而
+    //    服务端要等推理跑完才回（几百 ms～2 s）。不复位的话，下一轮
+    //    「开始实时识别」的 ``_livePump()`` 会看到 ``sending`` 还是 true
+    //    就直接 return —— **没人上行** ⇒ 队列（只容 2 块）溢出 ⇒
+    //    「有音频丢失，识别结果可能有缺口」。
+    L.sending = false;
     await this._liveStopCapture();
     L.queue.length = 0;         // 硬中止 → 队列里的块直接丢
     if (streamId) {
