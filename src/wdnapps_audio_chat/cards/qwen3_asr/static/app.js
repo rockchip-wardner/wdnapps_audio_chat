@@ -307,6 +307,8 @@ const Qwen3Asr = {
     items: [],           // 已收到的译文 [{index, source, text, status, ...}]
     busy: false,         // 「启用翻译模型」进行中
     loaded: false,       // 语言列表拉过了
+    langItems: null,     // 语言清单（运行时才有的，缓存一份）
+    wizardTarget: "",    // 向导里选的目标语言（换步会重建 body，得记住）
   },
 
   init() {
@@ -1909,27 +1911,41 @@ const Qwen3Asr = {
   // ⚠️ 板端**没有 emoji / 符号字体** ⇒ 这里只用普通文字，不用 ⚠ 之类
   // 的符号（会渲染成豆腐块）。
   // ------------------------------------------------------------------ //
-  async _trLoadLanguages() {
-    const sel = document.getElementById("asr-tr-target");
-    if (!sel || this._tr.loaded) return;
+  /**
+   * 拉目标语言清单（运行时才知道 ⇒ 不能写死在 wizard.json / template.html）。
+   *
+   * 向导里的下拉和功能页的下拉共用这一份 —— 两处必须同源，否则用户在
+   * 向导里选了功能页没有的语言，翻译会静默失败。
+   */
+  async _trFetchLanguages() {
+    if (this._tr.langItems) return this._tr.langItems;
     try {
       const r = await fetch("/api/qwen3-asr/translate/languages",
         { cache: "no-store" });
-      if (!r.ok) return;
+      if (!r.ok) return [];
       const data = await r.json();
       const items = Array.isArray(data.items) ? data.items : [];
-      sel.innerHTML = "";
-      items.forEach((it) => {
-        const opt = document.createElement("option");
-        opt.value = it.id || "";
-        opt.textContent = it.name || it.id || "";
-        sel.appendChild(opt);
-      });
-      sel.value = this._tr.targetLang;
-      this._tr.loaded = true;
+      this._tr.langItems = items;
+      return items;
     } catch (e) {
       console.warn("[qwen3-asr] 拉翻译语言列表失败:", e);
+      return [];
     }
+  },
+
+  async _trLoadLanguages() {
+    const sel = document.getElementById("asr-tr-target");
+    if (!sel || this._tr.loaded) return;
+    const items = await this._trFetchLanguages();
+    sel.innerHTML = "";
+    items.forEach((it) => {
+      const opt = document.createElement("option");
+      opt.value = it.id || "";
+      opt.textContent = it.name || it.id || "";
+      sel.appendChild(opt);
+    });
+    sel.value = this._tr.targetLang;
+    this._tr.loaded = true;
   },
 
   async _trRefresh() {
@@ -1977,13 +1993,16 @@ const Qwen3Asr = {
     return bits.join(" · ");
   },
 
+  /** 改翻译设置。返回 true = 改成功。 */
   async _trSet(patch) {
+    let ok = false;
     try {
       const r = await fetch("/api/qwen3-asr/translate/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch || {}),
       });
+      ok = !!r.ok;
       if (!r.ok) {
         console.warn("[qwen3-asr] 设置翻译失败:", r.status);
       }
@@ -1991,6 +2010,7 @@ const Qwen3Asr = {
       console.warn("[qwen3-asr] 设置翻译失败:", e);
     }
     await this._trRefresh();
+    return ok;
   },
 
   async _trEnableModel() {
@@ -2013,6 +2033,123 @@ const Qwen3Asr = {
       this._tr.busy = false;
       await this._trRefresh();
     }
+  },
+
+  // ------------------------------------------------------------------ //
+  // 向导里的「翻译目标语言」
+  //
+  // 目标语言清单是**运行时**才有的（后端 provider 的语言表）⇒ wizard.json
+  // 是静态的写不了，走宿主框架的通用机制：字段渲染完框架发
+  // ``wizard:step-rendered``，卡片往自己的字段里塞选项（和 TTS 卡的音色
+  // 下拉同一个套路，见 tts/static/app.js::onWizardStepRendered）。
+  // ------------------------------------------------------------------ //
+  async onWizardStepRendered(appId) {
+    if (appId !== "qwen3-asr") return;
+    const sel = document.querySelector(
+      '#wd-wizard-root-qwen3-asr [data-field-id="asr-tr-target"]');
+    if (!sel) return;
+    const items = await this._trFetchLanguages();
+    const ids = items.map((it) => it.id);
+
+    sel.innerHTML = "";
+    const off = document.createElement("option");
+    off.value = "off";
+    off.textContent = "不翻译";
+    sel.appendChild(off);
+    items.forEach((it) => {
+      const opt = document.createElement("option");
+      opt.value = it.id || "";
+      opt.textContent = it.name || it.id || "";
+      sel.appendChild(opt);
+    });
+
+    // 选谁：向导里之前选的 > 卡片当前真实状态 > 「不翻译」
+    //
+    // ⚠️ 回落**不能**用 ``this._tr.targetLang`` —— 那是卡片页的默认值
+    // （"en"），跟「用户要不要翻译」无关。拿它当默认 ⇒ 用户根本没碰过
+    // 下拉，也会被当成「选了英语」⇒ 白白加载一个 2.2 GB 的翻译模型。
+    // 只有「实时翻译当前是开着的」才用当前目标语言当默认。
+    //
+    // ⚠️ 「不翻译」是一个**显式选择**，不能被卡片当前状态盖掉：
+    //   wizardTarget === "off" ⇒ 一律保持 "off"（用户明确不要翻译）。
+    const remembered = this._tr.wizardTarget;   // "" = 没记过；"off" = 明确不要
+    let want;
+    if (remembered) {
+      want = (remembered !== "off" && ids.indexOf(remembered) >= 0)
+        ? remembered : "off";
+    } else {
+      const cur = this._tr.enabled ? this._tr.targetLang : "";
+      want = (cur && ids.indexOf(cur) >= 0) ? cur : "off";
+    }
+    sel.value = want;
+    this._tr.wizardTarget = want;
+    // 派发 change → 向导把值记进 state.values，否则 finish 拿不到。
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+  },
+
+  /**
+   * 向导里选定了目标语言 ⇒ 把翻译模型拉起来 + 开实时翻译。
+   *
+   * ⚠️ **翻译是旁路，识别才是主链路** —— 模型起不来（本机没装 / 显存
+   * 不够 / 卡被占）或加载超时，都**不能**拖垮识别。所以：
+   *   * 失败只记一条警告，识别照常启动；
+   *   * 开关在**模型就绪之后**才打开 —— 顺序反了的话，模型没起来的那些
+   *     句子会被标成「翻译模型未启用」（status=unavailable），白噪音。
+   *
+   * 返回 true = 翻译已就绪。
+   */
+  async _trEnableForWizard(lang) {
+    const hint = this._trWizardHint("正在启动翻译模型（通常 30 秒左右）…");
+    let ok = false;
+    try {
+      // ⚠️ 慢端点：服务端要等模型加载完才返回（LOAD_TIMEOUT_S = 120 s）。
+      //    这里给 150 s 的上限兜底；超时也不抛 —— 翻译失败不该让向导失败。
+      const ctl = (typeof AbortController !== "undefined")
+        ? new AbortController() : null;
+      const timer = ctl ? setTimeout(() => ctl.abort(), 150000) : null;
+      let r;
+      try {
+        r = await fetch("/api/qwen3-asr/translate/enable", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+          signal: ctl ? ctl.signal : undefined,
+        });
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+      ok = true;
+    } catch (e) {
+      const msg = (e && (e.message || e)) || "未知原因";
+      this._tr.modelStatus = "翻译模型启动失败：" + msg;
+      console.warn("[qwen3-asr] 向导里启动翻译模型失败（继续启动识别）:", e);
+    }
+    if (hint && hint.parentNode) hint.parentNode.removeChild(hint);
+    if (ok) {
+      await this._trSet({ enabled: true, target_lang: lang });
+    }
+    await this._trRefresh();
+    return ok;
+  },
+
+  /** 在向导「完成配置」的摘要里加一行提示（卡片页在向导背后，看不到）。 */
+  _trWizardHint(text) {
+    const root = document.getElementById("wd-wizard-root-qwen3-asr");
+    const summary = root && root.querySelector(".wd-wizard-summary");
+    if (!summary) return null;
+    const row = document.createElement("div");
+    row.className = "wd-wizard-summary-row";
+    const k = document.createElement("span");
+    k.textContent = "翻译模型：";
+    const v = document.createElement("span");
+    v.className = "wd-wizard-summary-val";
+    v.textContent = text;
+    row.appendChild(k);
+    row.appendChild(v);
+    summary.appendChild(row);
+    return row;
   },
 
   _trRender() {
@@ -3194,7 +3331,16 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
     throw new Error("WizardSnapshotError:start_failed:没有音频来源，请在向导里填写或上传音频文件");
   }
 
-  // 4) 等能力就绪 → 真启动。
+  // 4) 翻译目标语言 —— 选了非「不翻译」⇒ 把翻译模型拉起来 + 开实时翻译。
+  //    ⚠️ 翻译是**旁路**：模型起不来 / 加载超时都**不能**拖垮识别主链路
+  //    ⇒ _trEnableForWizard 内部软失败，这里照样往下走启动识别。
+  //    放在「有没有源」之后：源都没有就别白加载一个 2.2 GB 的模型了。
+  const trTarget = String(o.trTarget || "").trim();
+  if (trTarget && trTarget !== "off") {
+    await Qwen3Asr._trEnableForWizard(trTarget);
+  }
+
+  // 5) 等能力就绪 → 真启动。
   //    **不能 btn.click()**：启动按钮的 disabled 由快照的 busy 决定，
   //    disabled 按钮的 click() 会被浏览器**静默丢弃** —— 向导显示"完成配置"、
   //    识别却没跑起来（与视频卡同一个坑，见 core/wizard-start.js）。
@@ -3216,6 +3362,24 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
     if (!ok) throw new Error("WizardSnapshotError:start_failed:识别请求没被接受");
   }
 };
+
+// 向导里「翻译目标语言」的选项是**运行时**才有的（语言表在后端 provider
+// 里）⇒ 卡片自己填。框架只负责发事件，不认识任何卡片字段。
+window.addEventListener("wizard:step-rendered", (ev) => {
+  const d = ev && ev.detail;
+  Qwen3Asr.onWizardStepRendered(d && d.appId).catch(() => {});
+});
+// 向导里改了目标语言 → 记住。换步会重建 body，select 会被清空，没有这份
+// 记忆用户在向导里选的语言会被无声地冲回默认值。
+window.addEventListener("wizard:field-change", (ev) => {
+  const d = ev && ev.detail;
+  if (!d || d.appId !== "qwen3-asr") return;
+  const vals = d.values || {};
+  // ⚠️ 用 `!== undefined` 而不是真值判断 —— "off"（用户明确选了「不翻译」）
+  //    也必须记下来，否则「不翻译」会被卡片当前状态盖掉。
+  const v = vals["asr-tr-target"];
+  if (v !== undefined) Qwen3Asr._tr.wizardTarget = v;
+});
 
 // 暴露给控制台 / 回归脚本（别的卡片也这么做，比如 VdFsModal）——
 // 节奏字幕的时间轴在 ``Qwen3Asr._buildSubTimeline()`` 里，回归要直接读它。

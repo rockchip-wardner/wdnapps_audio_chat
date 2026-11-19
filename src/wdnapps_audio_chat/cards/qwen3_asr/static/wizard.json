@@ -27,6 +27,16 @@
             { "value": "rounds", "label": "识别过程（每识别一小段就记一行，能看到文字是怎么一步步成句的）" }
           ] }
       ] },
+    { "id": "translate", "title": "实时翻译（可选）", "kind": "form",
+      "fields": [
+        { "id": "asr-tr-target", "ui_key": "trTarget",
+          "label": "翻译目标语言（选「不翻译」就不加载翻译模型；选了会额外加载翻译模型，与识别模型共用同一张计算卡，约占 2.2 GB）",
+          "summary_label": "翻译目标语言",
+          "type": "select",
+          "options": [
+            { "value": "off", "label": "不翻译", "selected": true }
+          ] }
+      ] },
     { "id": "finish", "title": "完成配置",     "kind": "finish" }
   ]
 }
