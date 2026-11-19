@@ -6,6 +6,25 @@ Plugin package for `wdnwebui`. Installing it makes these cards appear on
 the host UI: `qwen3-asr`（流式语音识别）、`tts`（语音生成）、`text-chat`
 （文本对话 —— **暂存**，见下）、`web-translate`（网页翻译）。
 
+## 算力页的「运行在」：**自动（按卡位策略）**
+
+算力页在**宿主** `app/system/static/system.js` 里（`ComputeConfigPage` ——
+⚠️ 本仓 `cards/tts/static/app.js` 里那份是**早期遗留的死代码**，没有
+人调用，别照着改）。
+
+宿主算力页每个模型卡片的「运行在」多了一个 **「自动（按卡位策略）」**
+选项：勾上它 ⇒ 启用请求**不带** `npu_index` ⇒ 后端按宿主的卡位策略挑卡
+（宿主 `app/core/compute/card_roles.py`，插件**不复制**一份）。
+
+| 模型 | 策略 |
+|---|---|
+| `hy-mt-1-5`（翻译） | **跟随 ASR 所在的卡**（感知链同卡，实测争用 ≈ 0） |
+| `qwen3-tts`（语音合成） | **独占剩下那张卡**（流式生成边生成边播，不能与识别共卡） |
+| 其余 | 挑一张放得下的卡 |
+
+⚠️ **用户显式勾的卡号永远优先于策略** —— 策略只在**一个卡都没勾**（= 自动）
+时生效。
+
 ## `web-translate` 卡（网页翻译）
 
 界面翻译的**服务开关**：启用 = 起本板 NPU 上的翻译模型（HY-MT1.5，默认
