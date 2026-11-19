@@ -288,7 +288,12 @@ class ContentReviewManager:
         preset = presets.get(mid)
         installed = bool(preset) and bool(preset.get("exists"))
         label = self._label(preset, mid)
-        init_s = int(preset.get("estimated_init_seconds") or 40)
+        # ⚠️ **preset 可能是 None** —— 本板没装这个模型时，算力页的清单里
+        # 压根没有这一条（manifest 随模型文件夹分发）。上面 installed /
+        # label 都已经防了（label 走 _FALLBACK_LABELS），这里也要防 ——
+        # 否则「模型没装」会变成 500（状态接口挂掉 ⇒ 前端每 3 s 刷一条
+        # console error，整页日志全红），而正确行为是返回「未安装」。
+        init_s = int((preset or {}).get("estimated_init_seconds") or 40)
 
         detail = "决策模型已就绪 —— 可以提交图文做内容审查。"
         if not installed:
