@@ -1,8 +1,11 @@
-"""流式同传的**译文**（第一期：实时路径）。
+"""流式同传的**译文**（实时路径 + 文件 / 视频路径）。
 
-这条链路挂在 ASR 卡已有的「一句话结束」（``endpoint``）帧上：
-ASR 端点检测切出一句 → 本模块把这一句送去翻译 → 译文沿**同一条 WS**
-推回浏览器。
+这条链路挂在 ASR 卡的「一句话结束」上：
+
+* 实时路径 —— ASR 端点检测切出一句（``endpoint`` 帧）→ 本模块把这一句
+  送去翻译 → 译文沿**同一条 WS** 推回浏览器；
+* 文件 / 视频路径 —— 没有 endpoint，由 ``service.py`` 的
+  :class:`_SentenceSplitter` 自己断句 → 切出完整句再送来这里。
 
 为什么挂在 ASR 卡里而不是另开一张卡
 ----------------------------------
@@ -16,9 +19,18 @@ HTTP 调这里的端点，要么自己开一条流（两条流会搅坏同一个
 生命周期（有队列、有线程、有自己的开关与状态），单独成文件更清楚 ——
 跟 ``board_mic.py`` 是同一个理由。
 
-⚠️ **只做实时路径**（麦克风 / 板载麦克风）：文件 / 视频路径**没有句级
-信号**（它的 ``round`` 帧只有 committed/unfixed，收尾只有一个 ``done``），
-要出双语字幕得自己按标点断句 —— 那是第二期的事。
+⚠️ **两条路径都能用**：
+
+* **实时路径**（麦克风 / 板载麦克风）—— 挂在 ASR 卡的「一句话结束」
+  （``endpoint``）帧上：端点检测命中就是一句结束 ⇒ 直接送去翻译。
+* **文件 / 视频路径** —— 它**没有** endpoint（只有 ``round`` 帧的
+  committed / unfixed，收尾只有一个 ``done``）⇒ 由
+  ``service.py`` 的 :class:`_SentenceSplitter` **自己按标点断句**，
+  切出完整句再送来这里。
+
+两条路径的句序号**不在同一区间**（文件路径用
+``请求号 × 100000 + 句序号``）⇒ 前端「按序号覆盖同一条译文」的逻辑
+不用改，两条路径的译文也不会互相顶掉。
 
 降级语义（一律**不**让翻译把识别带崩）
 ------------------------------------
@@ -61,16 +73,19 @@ SENTENCE_TIMEOUT_S = 20.0
 class _Item:
     """队列里的一项：一句待译的话。"""
 
-    __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at")
+    __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at",
+                 "gen")
 
     def __init__(self, index: int, text: str, lang: str, stream_id: str,
-                 loop: Any, enqueued_at: float):
+                 loop: Any, enqueued_at: float, gen: int = 0):
         self.index = index
         self.text = text
         self.lang = lang
         self.stream_id = stream_id
         self.loop = loop
         self.enqueued_at = enqueued_at
+        #: 入队时的**代数**（见 :attr:`TranslationService._gen`）。
+        self.gen = gen
 
 
 class TranslationService:
@@ -92,6 +107,14 @@ class TranslationService:
         self._skipped = 0
         self._dropped = 0
         self._latency_ms = 0.0
+        #: **代数** —— 「清空」时 +1。
+        #:
+        #: 队列清空只能丢掉**还没开始**的句子；**已经在跑**的那一句
+        #: （正在推理）清不掉 ⇒ 它的译文会在「清空」之后才推回来 ⇒ 页面上
+        #: 又冒出一行（用户明明刚清空）。
+        #:
+        #: ⇒ 每句话记下入队时的代数；处理前对不上就**丢掉**。
+        self._gen = 0
 
     # ------------------------------------------------------------------ #
     # 设置 / 状态
@@ -155,7 +178,8 @@ class TranslationService:
             if not self._enabled or not text:
                 return
             self._submitted += 1
-        item = _Item(index, text, lang, stream_id, loop, time.monotonic())
+            gen = self._gen
+        item = _Item(index, text, lang, stream_id, loop, time.monotonic(), gen)
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -203,6 +227,12 @@ class TranslationService:
                 self._queue.task_done()
 
     def _handle(self, item: _Item) -> None:
+        # ⚠️ **「清空」之后到的旧句子 ⇒ 丢掉**（见 :attr:`_gen`）。
+        # 不丢的话，用户刚点完「清空」，页面上又冒出一行译文。
+        with self._lock:
+            if item.gen != self._gen:
+                self._dropped += 1
+                return
         t0 = time.monotonic()
         target = self.settings()["target_lang"]
         status = "failed"
@@ -249,6 +279,12 @@ class TranslationService:
                          reason or exc)
 
         latency_ms = int((time.monotonic() - t0) * 1000)
+        # ⚠️ **推理期间可能又「清空」了** ⇒ 这条译文作废：不计数、不广播
+        # （不查这一下的话，页面已经清空了、统计里却多了一句「已译」）。
+        with self._lock:
+            if item.gen != self._gen:
+                self._dropped += 1
+                return
         with self._lock:
             if status == "done":
                 self._translated += 1
@@ -269,6 +305,9 @@ class TranslationService:
 
         ⚠️ ``asyncio.Queue.put_nowait`` **不是线程安全的** ⇒ 必须切回
         事件循环线程再广播（与 ASR 的 delta 回调同一个道理）。
+
+        ⚠️ 「清空」期间的作废检查在 :meth:`_handle` 里做（推理前后各一次）
+        —— 那里才是决定「这条还算不算数」的地方。
         """
         payload = {
             "type": "translation",
@@ -325,6 +364,9 @@ class TranslationService:
     def clear(self) -> None:
         """清空统计与队列（页面上的「清空」）。"""
         with self._lock:
+            #: 代数 +1 ⇒ **已经在跑**的那一句的译文回来时会被丢掉
+            #: （否则用户刚点完「清空」，页面上又冒出一行）。
+            self._gen += 1
             self._submitted = 0
             self._translated = 0
             self._failed = 0

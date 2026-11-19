@@ -176,37 +176,42 @@
                         class="asr-live-unfixed" id="asr-rt-unfixed"></span>
                 </div>
 
-                <!--
-                  实时翻译（流式同传，第一期：实时路径）。
-
-                  ⚠️ **只在实时路径可用** —— 文件 / 视频路径没有句级信号
-                  （``round`` 帧只有 committed/unfixed，收尾只有一个 done），
-                  要出双语字幕得自己断句，那是第二期的事。
-
-                  ⚠️ 板端**没有 emoji / 符号字体** ⇒ 图标一律用内联 SVG，
-                  文字只用普通汉字。
-                -->
-                <div class="asr-tr-block" id="asr-tr-block">
-                  <div class="asr-tr-head">
-                    <label class="asr-file-label" for="asr-tr-target">目标语言</label>
-                    <select id="asr-tr-target" class="tts-select"></select>
-                    <label class="asr-tr-switch" for="asr-tr-enabled">
-                      <input type="checkbox" id="asr-tr-enabled" />
-                      <span>实时翻译</span>
-                    </label>
-                    <button type="button" class="vd-btn" id="asr-tr-model-btn">启用翻译模型</button>
-                    <span class="asr-live-status" id="asr-tr-status">翻译未启用</span>
-                  </div>
-                  <div class="asr-tr-out" id="asr-rt-translated">
-                    <div class="asr-tr-empty" id="asr-tr-empty">
-                      开启「实时翻译」后，每识别完一句，这里会显示译文。
-                    </div>
-                  </div>
-                </div>
-
                 <div class="asr-live-gap hidden" id="asr-live-gap">⚠ 有音频丢失，识别结果可能有缺口</div>
               </section>
             </section>
+
+            <!--
+              实时翻译（流式同传）。
+
+              ⚠️ **这一块不在 live 块里** —— 它对**三种来源**都可用：
+              音频文件 / 含音轨的视频 / 麦克风。
+
+              文件 / 视频路径**没有** ``endpoint`` 帧（那是实时路径的端点
+              检测给的句级信号）⇒ 后端改用**自己按标点断句**
+              （``service.py`` 的 ``_SentenceSplitter``）⇒ 一样能一句一句
+              出译文。
+
+              ⚠️ 板端**没有 emoji / 符号字体** ⇒ 图标一律用内联 SVG，
+              文字只用普通汉字。
+            -->
+            <div class="asr-block asr-tr-block" id="asr-tr-block">
+              <div class="asr-tr-title">实时翻译</div>
+              <div class="asr-tr-head">
+                <label class="asr-file-label" for="asr-tr-target">目标语言</label>
+                <select id="asr-tr-target" class="tts-select"></select>
+                <label class="asr-tr-switch" for="asr-tr-enabled">
+                  <input type="checkbox" id="asr-tr-enabled" />
+                  <span>实时翻译</span>
+                </label>
+                <button type="button" class="vd-btn" id="asr-tr-model-btn">启用翻译模型</button>
+                <span class="asr-live-status" id="asr-tr-status">翻译未启用</span>
+              </div>
+              <div class="asr-tr-out" id="asr-rt-translated">
+                <div class="asr-tr-empty" id="asr-tr-empty">
+                  开启「实时翻译」后，每识别完一句，这里会显示译文；文件 / 视频按标点自动断句。
+                </div>
+              </div>
+            </div>
 
             <!--
               提示语（动态：空闲 / 识别中 / 已停止…）挪到操作行**上方**

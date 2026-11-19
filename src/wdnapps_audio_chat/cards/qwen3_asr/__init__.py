@@ -12,7 +12,7 @@ Backend layout (per card)::
     ├── api.py             # FastAPI router (mounted at /api/qwen3-asr)
     ├── service.py         # business logic (singleton + WS broadcast)
     ├── board_mic.py       # 板载麦克风采集子进程管理
-    ├── translation.py     # 流式同传的译文（第一期：实时路径）
+    ├── translation.py     # 流式同传的译文（实时路径 + 文件 / 视频路径）
     ├── static/            # template.html + app.js + app.css + wizard.json
     │                      # + capture-worklet.js + preview.mp4
     └── __init__.py        # this file — register_api / register_shutdown

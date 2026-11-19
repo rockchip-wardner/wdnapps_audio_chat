@@ -2176,8 +2176,12 @@ const Qwen3Asr = {
     if (!box) return;
     const items = this._tr.items;
     const empty = document.getElementById("asr-tr-empty");
-    // 句子不多（几十条以内）⇒ 直接重建，别搞增量 diff
-    box.innerHTML = "";
+    // ⚠️ **只删译文行，别用 ``innerHTML = ""``** —— 那会把
+    // ``#asr-tr-empty``（那句「开启实时翻译后…」的提示）**一起删掉**，
+    // 而后面 ``empty.classList.remove("hidden")`` 操作的是一个**已经脱离
+    // DOM 的节点** ⇒ 清空之后提示再也回不来（译文区一片空白）。
+    // 句子不多（几十条以内）⇒ 直接重建每一行，别搞增量 diff。
+    Array.from(box.querySelectorAll(".asr-tr-item")).forEach((el) => el.remove());
     if (!items.length) {
       if (empty) empty.classList.remove("hidden");
       return;
@@ -2902,6 +2906,13 @@ const Qwen3Asr = {
     this._roundGen++;            // 新的一批轮次 → 作废在途的「刷新恢复」
     this._stopInitiated = false;  // 新的一批 → 「谁停的」重新算
     this._ignoreRounds = false;  // 新的一批 → 轮次帧照收
+    // 新的一批 ⇒ 上一批的译文也清掉。
+    //
+    // ⚠️ **句序号会重新从 1 数**（后端每次识别换一个序号区间，见
+    // ``service.py`` 的 ``_TR_FILE_INDEX_BASE``）⇒ 不清的话上一批的
+    // 译文会**留在列表里**，跟这一批混在一起。
+    this._tr.items = [];
+    this._trRender();
     // 记下这批轮次来自**哪个来源** —— 视频字幕靠它判断「该不该渲染」
     // （否则会拿上一来源的轮次画到当前视频上，见 _onSourceChanged）。
     this._roundsSource = this._source;
@@ -3026,6 +3037,15 @@ const Qwen3Asr = {
     } catch (e) {
       this._showError("清空失败: " + e);
     }
+    // ⚠️ **再清一次译文** —— 「本地先清」与「服务端 /reset 回来」之间
+    // 可能刚好到了一条译文帧（那一句已经在推理）⇒ 不再清一次，页面上
+    // 就留下一行「刚清空却还在」的译文。
+    //
+    // 服务端那边也做了同一件事的另一半：``/reset`` 会把翻译队列的**代数**
+    // +1 ⇒ 之后才回来的译文**根本不会推过来**。
+    this._tr.items = [];
+    this._trRender();
+    this._trSyncUi();
   },
 
   _showError(detail) {

@@ -246,6 +246,190 @@ def _clear_translation() -> None:
         _LOG.debug("clear translation failed (best-effort): %s", e)
 
 
+# --------------------------------------------------------------------------- #
+# 文件 / 视频路径的**自己断句**（实时翻译用）
+# --------------------------------------------------------------------------- #
+#
+#: **句末标点** —— 切句的第一依据。
+#:
+#: ⚠️ 英文句点 ``.`` **单独不算**（小数 3.14、缩写 Mr. 会误切）⇒ 走
+#: :func:`_ascii_sentence_end` 那套带护栏的判定。
+_TR_SENTENCE_END = "。！？!?"
+
+#: **收尾符号** —— 跟在句末标点后面、属于同一句的引号 / 括号。
+#:
+#: 「他说『好。』然后走了」→ 这一句到 ``』`` 才算完。
+_TR_SENTENCE_CLOSE = "」』”’》】）)]}\""
+
+#: **一句至少多少个字符**才算一句（英文句点判定用）。
+#:
+#: 「Mr.」「Dr.」这种缩写只有两三个字符 ⇒ 不够长 ⇒ 不切。
+_TR_MIN_SENTENCE_CHARS = 12
+
+#: **常见英文缩写**（后面跟着 ``.`` 时**不**当句末）。
+_TR_ABBREV = {
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
+    "e.g", "i.e", "fig", "no", "vol", "inc", "ltd", "co", "approx", "dept",
+}
+
+#: **强制切句长度**（字符）。
+#:
+#: 一段话里连一个句末标点都没有时（口语、歌词、字幕）⇒ 攒够这么多字符
+#: 就先切一刀送去翻译 —— 宁可句子短一点，也不能「一直等下去」。
+_TR_MAX_SENTENCE_CHARS = 60
+
+#: **文件 / 视频路径的译文序号基准**。
+#:
+#: 实时路径的句序号是 1、2、3……（每个 live 会话从 1 重新数）；文件路径
+#: 要用**另一个区间**，否则两条路径的序号会撞 —— 前端是**按序号覆盖**
+#: 同一条译文的（见 ``static/app.js`` 的 ``translation`` 帧处理）⇒ 撞了
+#: 就会互相顶掉。
+#:
+#: ⇒ 文件路径用 ``请求号 × 本基准 + 句序号``（请求号每次识别 +1）⇒
+#: 同一路径的多次识别之间也不会撞。
+_TR_FILE_INDEX_BASE = 100000
+
+
+def _ascii_sentence_end(text: str, dot: int) -> int:
+    """英文句点 ``.``（在 ``text[dot]``）算不算句末？算的话返回切点。
+
+    英文句点有两个坑：**小数**（``3.14``）和**缩写**（``Mr.``）⇒ 三道闸：
+
+    * 后面必须是**空白或文本结束**（小数里的点后面是数字）；
+    * 空白之后的第一个字符必须**是大写字母**（句子的开头）；
+    * 这一句（从上一个切点算起）至少 :data:`_TR_MIN_SENTENCE_CHARS`
+      个字符，且点前面那个词**不是常见缩写**。
+
+    ⚠️ 「后面没了」时**不切** —— 还不知道后面是不是有下一个句子 ⇒ 等
+    下一轮文本来了再判断（这就是「实时」：宁可晚半秒，不要切错）。
+    """
+    j = dot + 1
+    if j < len(text) and not text[j].isspace():
+        return -1                     # 小数 / 词中间的点
+    k = j
+    while k < len(text) and text[k].isspace():
+        k += 1
+    if k >= len(text):
+        return -1                     # 后面还没来 ⇒ 先不切
+    if not text[k].isupper():
+        return -1
+    if (dot + 1) < _TR_MIN_SENTENCE_CHARS:
+        return -1                     # 太短 ⇒ 「Mr.」「Dr.」这类缩写
+    words = text[:dot].split()
+    if words and words[-1].lower() in _TR_ABBREV:
+        return -1
+    return dot + 1
+
+
+def _first_sentence_end(text: str) -> int:
+    """``text`` 里**第一处**句末标点之后的切点；没有则返回 -1。
+
+    切点 = 「这一句到这里为止」的下标（**含**标点本身）。
+
+    ⚠️ 为什么取**第一处**而不是最后一处：实时翻译要的是**尽快**把已经
+    完整的那一句送出去 —— 一轮里攒下三句时，按第一处切能一句一句地译，
+    按最后一处切会把三句合成一条（延迟 + 译出来也是一段长文本）。
+    """
+    # ⚠️ **先去掉开头的空白** —— 上一句切完之后剩下的分隔空格。
+    # 不去掉的话，英文句点的「这句有多长」判定会**多算/少算**那几个空格
+    # （「This is a test.」会被当成 11 个字符 → 误判成缩写 → 不切）。
+    lead = len(text) - len(text.lstrip())
+    if lead:
+        text = text[lead:]
+    for i, ch in enumerate(text):
+        if ch in _TR_SENTENCE_END:
+            cut = i + 1
+            # 收尾的引号 / 括号跟着这一句走
+            while cut < len(text) and text[cut] in _TR_SENTENCE_CLOSE:
+                cut += 1
+            return cut + lead
+        if ch == ".":
+            cut = _ascii_sentence_end(text, i)
+            if cut > 0:
+                return cut + lead
+    return -1
+
+
+class _SentenceSplitter:
+    """把「累积的已确认文本」切成句子 —— 文件 / 视频路径的实时翻译。
+
+    为什么要自己断句
+    --------------
+    实时路径（麦克风）有 ``endpoint`` 帧 —— 端点检测命中就是一句结束。
+    文件 / 视频路径**没有** endpoint：只有 ``round`` 帧的
+    ``committed``（当前 epoch 内累积的已确认文本）和 ``unfixed``
+    （还在改写的尾巴）⇒ 要出逐句译文，只能自己断句。
+
+    断句规则
+    --------
+    * **主**：句末标点（:data:`_TR_SENTENCE_END`）—— 标点就是句号，
+      语义最准；
+    * **兜底 1**：epoch 切换（decoder 重置）→ 把上一段剩下的尾巴提交
+      （否则那一段永远不译）；
+    * **兜底 2**：超过 :data:`_TR_MAX_SENTENCE_CHARS` 还没切 → 强制切
+      （一段没标点的长音频也能边播边出译文）；
+    * **收尾**：识别结束时把剩余的提交。
+
+    记账用「已提交的字符数」：``committed`` 是**当前 epoch 内**的累积
+    文本，且是**已确认**部分（不会像 ``unfixed`` 那样回滚）⇒ 按长度
+    记账是安全的。
+    """
+
+    def __init__(self) -> None:
+        self._done = 0        # 当前 epoch 内已提交的字符数
+        self._last = ""       # 上一轮的 committed
+        self._index = 0       # 本次识别的句子序号（1 起，跨 epoch 递增）
+
+    def reset_request(self) -> None:
+        """**新一次识别**开始（句子序号归零）。"""
+        self._done = 0
+        self._last = ""
+        self._index = 0
+
+    def reset_epoch(self) -> None:
+        """**epoch 切换**（decoder 重置）—— 只清文本记账，句子序号继续。"""
+        self._done = 0
+        self._last = ""
+
+    def feed(self, committed: str, emit) -> None:
+        """喂一轮 ``committed``，切出的句子交给 ``emit(text, index)``。
+
+        ⚠️ 一轮里可能攒下**好几句**（模型停顿之后一口气补一大段）⇒
+        这里是个**循环**，不是「一刀切一句」。
+        """
+        committed = committed or ""
+        # epoch 切换的**兜底检测**：decoder 重置后 committed 从头开始
+        # （长度变短）。正常切换由调用方显式 flush，这里只是防止漏掉。
+        if len(committed) < len(self._last):
+            self.flush(emit)
+            self.reset_epoch()
+        self._last = committed
+        while True:
+            rest = committed[self._done:]
+            if not rest:
+                return
+            cut = _first_sentence_end(rest)
+            if cut < 0:
+                if len(rest) < _TR_MAX_SENTENCE_CHARS:
+                    # 还没攒够一个长句 ⇒ 等下一轮
+                    return
+                # 兜底 2：太长还没标点 ⇒ 强制切（保证「实时」）
+                cut = _TR_MAX_SENTENCE_CHARS
+            sentence = rest[:cut].strip()
+            self._done += cut
+            if sentence:
+                self._index += 1
+                emit(sentence, self._index)
+
+    def flush(self, emit) -> None:
+        """收尾 / epoch 切换：把剩下的尾巴提交。"""
+        tail = (self._last or "")[self._done:].strip()
+        if tail:
+            self._index += 1
+            emit(tail, self._index)
+        self._done = len(self._last)
+
+
 class _AsrManager:
     """流式 ASR 服务；单例（:func:`get_asr_service`）。"""
 
@@ -314,6 +498,22 @@ class _AsrManager:
         self._pause_rounds: int = 0
         #: 本轮是否命中停顿（文件主循环消费后即失效）。
         self._pause_hit: bool = False
+
+        #: **切句器**（文件 / 视频路径的实时翻译用，见 :class:`_SentenceSplitter`）。
+        self._splitter = _SentenceSplitter()
+        #: **主事件循环** —— 译文要广播给 WS 订阅者，而订阅队列属于
+        #: **主循环**（WS handler 在那儿）。
+        #:
+        #: ⚠️ 文件路径的识别跑在**另一个线程**的**自己的**事件循环里
+        #: （``asyncio.run``）⇒ 那个循环在识别结束时就被关掉，不能用它
+        #: 广播（``call_soon_threadsafe`` 会抛 / 帧会丢）。
+        #: ⇒ 由 API 层（async 端点）把主循环传进来。
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+        #: 当前这次文件识别的**翻译上下文**；``None`` = 没有文件识别在跑。
+        #:
+        #: ``{"rid", "stream_id", "base", "loop"}`` —— ``base`` 是句序号的
+        #: 基准（见 :data:`_TR_FILE_INDEX_BASE`）。
+        self._tr_ctx: Optional[Dict[str, Any]] = None
 
         self._session = None
         self._model_id: Optional[str] = None
@@ -562,6 +762,52 @@ class _AsrManager:
                 return ""
             return (self._rounds[-1].get("committed") or "").strip()
 
+    # ------------------------------------------------- 实时翻译（文件路径）
+    def _tr_emit(self, text: str, seq: int) -> None:
+        """把切出来的一句送去翻译（文件 / 视频路径）。
+
+        ⚠️ **翻译出问题不许影响识别** —— 这里吞掉所有异常（翻译链路
+        自己的降级在 ``translation.py`` 里做）。
+        """
+        ctx = self._tr_ctx
+        if not ctx:
+            return
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+                get_translation_service,
+            )
+            get_translation_service().submit(
+                index=int(ctx["base"]) + int(seq),
+                text=text,
+                lang=self._language,
+                stream_id=str(ctx["stream_id"]),
+                loop=ctx.get("loop"),
+            )
+        except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
+            _LOG.debug("文件路径送去翻译失败（best-effort）: %s", exc)
+
+    def _tr_flush(self) -> None:
+        """把当前 epoch **剩下的尾巴**切出来送去翻译。
+
+        调用点有两个（都是「这一段不会再有新的已确认文本了」的时刻）：
+        * epoch 切换（``_rotate_epoch``）—— 上一段的尾巴不带标点，
+          不主动提交就永远不译；
+        * 识别收尾（``_stream_main`` 末尾）。
+
+        ⚠️ **「清空」之后不提交** —— ``_drop_frames`` 的语义就是
+        「清空之后迟到的轮次一律丢掉」；尾巴那句译文同理，否则用户刚点完
+        「清空」，页面上又冒出一行。
+        """
+        if not self._tr_ctx:
+            return
+        with self._lock:
+            if self._drop_frames:
+                return
+        try:
+            self._splitter.flush(self._tr_emit)
+        except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
+            _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
+
     def reset(self) -> None:
         """清空本轮结果，回到 idle。
 
@@ -630,6 +876,7 @@ class _AsrManager:
         append: bool = False,
         start_sec: float = 0.0,
         source_info: Optional[Dict[str, Any]] = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> int:
         """发起一次**流式**识别（文件 / 视频）。返回 request_id。
 
@@ -666,6 +913,11 @@ class _AsrManager:
         * **不是 append**（新的一批）→ 记下来（覆盖旧的）；
         * **append**（拖动后重开，还是同一段媒体）→ **保持原来的** ——
           拖动重开的是同一个视频，来源当然不变。
+
+        ``loop`` —— **主事件循环**（由 API 层传进来）。译文要广播给 WS
+        订阅者，而订阅队列属于主循环 ⇒ 译文只能从主循环发出去。
+        ⚠️ 文件识别自己跑在另一个线程的另一个循环里（``asyncio.run``），
+        那个循环识别一结束就关掉 ⇒ 不能拿它广播。
         """
         with self._lock:
             if self._state == self.STATE_RUNNING:
@@ -688,6 +940,20 @@ class _AsrManager:
             self._drop_frames = False  # 新的一批 → 轮次帧照收
             self._audio_origin_sec = 0.0
             self._set_state(self.STATE_RUNNING)
+            # ---- 实时翻译（文件 / 视频路径）上下文 -------------------- #
+            self._main_loop = loop
+            # 新的一次识别 ⇒ 切句器归零（句序号从头数）。
+            #
+            # ⚠️ 句序号**只在请求内**从头数，但**请求号**每次 +1 ⇒ 译文的
+            # 序号落在不同区间（见 :data:`_TR_FILE_INDEX_BASE`）⇒ 不会和
+            # 上一次识别的译文撞车（前端是**按序号覆盖**同一条译文的）。
+            self._splitter.reset_request()
+            self._tr_ctx = {
+                "rid": rid,
+                "stream_id": "file-{}".format(rid),
+                "base": rid * _TR_FILE_INDEX_BASE,
+                "loop": loop,
+            }
 
         self._broadcast({"type": "state", "state": self.snapshot()})
         threading.Thread(
@@ -700,7 +966,21 @@ class _AsrManager:
 
     def _run_stream(self, rid: int, chunk_factory,
                     start_sec: float = 0.0) -> None:
-        """worker 线程：流式解码 → 增量会话 → 逐轮 delta → 收尾。"""
+        """worker 线程：流式解码 → 增量会话 → 逐轮 delta → 收尾。
+
+        收尾统一在 :meth:`_run_stream_inner` 的 ``finally`` 里做 ——
+        这次识别结束 ⇒ **翻译上下文作废**（迟到的 delta 不该再被切句）。
+        """
+        try:
+            self._run_stream_inner(rid, chunk_factory, start_sec)
+        finally:
+            with self._lock:
+                if self._tr_ctx and self._tr_ctx.get("rid") == rid:
+                    self._tr_ctx = None
+
+    def _run_stream_inner(self, rid: int, chunk_factory,
+                          start_sec: float = 0.0) -> None:
+        """真正跑一次流式识别（见 :meth:`_run_stream`）。"""
         # ⚠️ **停滞计数器必须在新请求开始时清零**。
         #
         # 它平时只在 :meth:`_stream_main` 的 ``_rotate_epoch()`` 里重置 ——
@@ -967,6 +1247,19 @@ class _AsrManager:
             """
             nonlocal stream_id, epoch, epoch_sec, epoch_origin, feed
             await _close_epoch(reason)
+            # ⚠️ **这一段到此为止** ⇒ 把剩下的尾巴切出来送去翻译。
+            #
+            # 为什么必须在这里显式提交：``committed`` 是**段内累计**的，
+            # 换段后 decoder 重置、文本从头开始 ⇒ 上一段末尾那半句（通常
+            # 没有标点）**再也不会出现在任何一轮里** ⇒ 不提交就永远不译。
+            #
+            # 放在 ``_close_epoch`` **之后** —— 那次 final 调用会投递最后
+            # 一轮的 delta（``respond()`` 返回前保证投递完），先把新确认的
+            # 文本切完，再把尾巴兜底提交。
+            self._tr_flush()
+            # 换段 ⇒ 切句器的**文本记账**归零（句子序号继续，见
+            # ``_SentenceSplitter.reset_epoch``）。
+            self._splitter.reset_epoch()
             epoch += 1
             stream_id = "file-{}#{}".format(rid, epoch)
             epoch_origin = audio_sec
@@ -1091,6 +1384,9 @@ class _AsrManager:
         # 收尾：末块（``PcmFeedBuffer`` 留住了最后 1 个采样）必须带上 ——
         # 否则最后几个 token 不会被确认（末块要标 is_last）。
         await _close_epoch("final")
+        # ⚠️ **收尾也要切一刀** —— 最后一句通常没有句末标点（说话说到
+        # 一半就停了）⇒ 不主动提交，它就永远拿不到译文。
+        self._tr_flush()
         if epoch_errors and not segments:
             # 一段文本都没产出 → 报错比交一份空结果有用（见 ``_close_epoch``）。
             if last_error is not None:
@@ -1199,6 +1495,22 @@ class _AsrManager:
         if abs(origin) > 1e-6:
             frame["audio_origin_sec"] = origin
         self._broadcast({"type": "round", **frame})
+        # ---- 实时翻译（文件 / 视频路径）：自己断句 -------------------- #
+        #
+        # 文件路径**没有** endpoint 帧（那是实时路径的端点检测）⇒ 只能拿
+        # ``committed``（当前 epoch 内累积的已确认文本）自己切句，切出
+        # 完整句就送去翻译。
+        #
+        # ⚠️ 这一步在 **cshim 读线程**上（delta 是从 DDS 那边过来的），
+        # 而 ``_rotate_epoch`` 的 flush 在**识别线程**上 —— 两者不会撞：
+        # ``respond()`` 返回前保证这一轮的 delta **已经投递完**
+        # （见 ``wdndds/ai_session.py`` 的 ``bridge.done.wait``）⇒
+        # flush 一定发生在本轮 feed 之后。
+        if self._tr_ctx is not None:
+            try:
+                self._splitter.feed(frame["committed"], self._tr_emit)
+            except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
+                _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
 
     def _run(
         self,
@@ -1891,7 +2203,7 @@ class _LiveAsrSession:
                 "index": self._endpoint_index,
                 "elapsed_sec": round(self._timeline_sec, 3),
             })
-            # 译文（流式同传，第一期）—— 送去做翻译，**不阻塞**这里。
+            # 译文（流式同传）—— 送去做翻译，**不阻塞**这里。
             self._submit_translation()
             self._rotate()
             self._finished = False
@@ -1933,7 +2245,10 @@ class _LiveAsrSession:
                 loop=self._loop,
             )
         except Exception as exc:  # noqa: BLE001
-            LOG.debug("live %s: 送去翻译失败: %s", self.stream_id, exc)
+            # ⚠️ 这里是 ``_LOG``（模块 logger）—— 原来写成 ``LOG`` ⇒
+            # 送翻译失败时这行自己先炸（NameError），把「翻译出错」变成
+            # 「识别崩了」。
+            _LOG.debug("live %s: 送去翻译失败: %s", self.stream_id, exc)
 
     def transcript(self) -> str:
         """**累积**的转写文本（端点切出的各句 + 当前句）。

@@ -37,7 +37,7 @@
 这四个端点由 **feature flag** ``asr.live.enabled`` 门控 —— 关掉时一律
 **404**，前端隐藏实时区块，**文件 / 视频路径完全不受影响**。
 
-实时翻译（流式同传，**第一期：实时路径**）端点：
+实时翻译（流式同传，实时路径 + 文件 / 视频路径）端点：
 
 * ``GET    /api/qwen3-asr/translate/status``     — 开关 / 目标语言 / 模型状态 / 统计。
 * ``GET    /api/qwen3-asr/translate/languages`` — 可选的目标语言。
@@ -404,7 +404,12 @@ async def post_asr_transcribe(
     try:
         rid = svc.transcribe_stream(_factory, options=options,
                                      append=bool(append), start_sec=start_at,
-                                     source_info=source_info)
+                                     source_info=source_info,
+                                     # ⚠️ **主循环**：译文要广播给 WS 订阅者，
+                                     # 而订阅队列属于主循环 ⇒ 必须把它传下去
+                                     # （识别自己跑在另一个线程的另一个循环里，
+                                     #  那个循环识别一结束就关掉）。
+                                     loop=asyncio.get_running_loop())
     except ValueError as e:
         msg = str(e)
         if "上一条" in msg:
@@ -686,7 +691,7 @@ async def get_board_status() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 实时翻译（流式同传，第一期：实时路径）
+# 实时翻译（流式同传，实时路径 + 文件 / 视频路径）
 # --------------------------------------------------------------------------- #
 #
 # ⚠️ **端点是同步 ``def``，不是 ``async def``** —— 起/停翻译模型是**阻塞**
