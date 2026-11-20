@@ -107,11 +107,16 @@
    *
    * ⚠️ 不用「量宽度」：豆腐块和正常字符可能同宽（都是方块）⇒ 量宽度
    * 判不出来。**必须比像素**。
+   *
+   * ⚠️ **判据只有一份** —— 宿主框架出了 ``/static/core/font-check.js``
+   * （``window.WdnFontCheck.canRender``），右上角「界面语言」下拉用的
+   * 就是它 ⇒ 同一套判据在两个仓里各写一份的话，迟早漂移 ⇒ 这里**优先用
+   * 框架的**，框架没有（老宿主 / 单测环境）才退回自己这份（``_canRenderLocal``）。
    * ------------------------------------------------------------------ */
   const _renderableCache = new Map();
   let _renderCanvas = null;
 
-  function _canRender(text) {
+  function _canRenderLocal(text) {
     if (!text) return false;
     if (_renderableCache.has(text)) return _renderableCache.get(text);
     let ok = true;
@@ -149,6 +154,20 @@
     }
     _renderableCache.set(text, ok);
     return ok;
+  }
+
+  /**
+   * 优先用**宿主框架**的判据（``/static/core/font-check.js`` 的
+   * ``window.WdnFontCheck.canRender``），没有才退回自己这份。
+   *
+   * ⚠️ **判据只有一份** —— 右上角「界面语言」下拉用的就是框架那份 ⇒
+   * 同一套判据在两个仓里各写一份的话，迟早漂移（板子换板 / 字体装没装
+   * 的结论就不一致了）。
+   */
+  function _canRender(text) {
+    const fc = window.WdnFontCheck;
+    if (fc && typeof fc.canRender === "function") return fc.canRender(text);
+    return _canRenderLocal(text);
   }
 
 
