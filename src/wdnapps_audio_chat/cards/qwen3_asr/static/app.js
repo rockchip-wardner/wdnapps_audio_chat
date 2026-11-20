@@ -2005,6 +2005,23 @@ const Qwen3Asr = {
     this._renderTranscript();
   },
 
+  /**
+   * 后端**不再忙**了 ⇒ 最后一行也定稿了 ⇒ 把它（和还没翻的）要过来。
+   *
+   * ⚠️ 正常流程里「最后一行的定稿」是识别结束的 ``done`` 帧触发的
+   * （见 :meth:`_trRequestLines`）。刷新页面后那个帧**随旧连接一起没了**
+   * ⇒ 最后一行永远等不到译文 ⇒ 靠「后端不忙了」这个信号补上。
+   *
+   * ⚠️ 反复调用**没有副作用** —— :meth:`_trRequestLines` 会跳过「文本没变」
+   * 的行 ⇒ 只有真的有新内容才会再要一次。
+   */
+  _trMaybeFinalizeLines() {
+    if (this._trMode !== "line") return;
+    if (!this.snapshot || this.snapshot.busy) return;
+    if (!this.rounds || !this.rounds.length) return;
+    this._trRequestLines(true);
+  },
+
   async _probeCap() {
     let data;
     try {
@@ -2059,6 +2076,11 @@ const Qwen3Asr = {
     this._updateHint();
     this._syncSourceUi();
     this._syncLiveUi();
+    // ⚠️ **行级翻译**：「最后一行的定稿」正常是靠识别结束的 ``done``
+    // 帧触发的 —— 刷新页面后那个帧**随旧连接一起没了** ⇒ 最后一行永远
+    // 等不到译文 ⇒ 靠「后端已经不忙了」这个信号补上（见
+    // ``_trMaybeFinalizeLines``）。
+    this._trMaybeFinalizeLines();
     if (typeof DemoGuard !== "undefined") {
       // 实时会话在跑时，快照的 busy 必须是 true —— DemoGuard 靠它决定
       // 「离开这张卡要不要拦一下」。
@@ -2273,6 +2295,29 @@ const Qwen3Asr = {
   },
 
   /**
+   * 认领这批轮次的**来源**，并连带认领**翻译的单位**。
+   *
+   * ⚠️ **两者必须一起认领** —— 视频来源的行级翻译是**前端驱动**的
+   * （只有前端知道行是怎么排的，见 :meth:`_trRequestLine`）。
+   *
+   * ⚠️ **为什么不能只看来源**：「刷新页面时识别正在跑」这个场景下，
+   * 本地**没走过** :meth:`start` ⇒ ``_trMode`` 还是默认的 ``"sentence"``
+   * ⇒ 行级翻译**一次都不会发起**；而后端那次识别是按
+   * ``translate_mode=line`` 跑的（**不做**句子级翻译）⇒
+   * **刷新后一句译文都没有**（改行级之前是有的：句子级翻译在后端做，
+   * 刷新后新订阅者照样收得到）。
+   *
+   * ``force`` —— **服务端说了算**时用（刷新恢复：服务端说这是视频就是
+   * 视频，前端猜不得）；否则**只认领一次**（识别中途切来源时，轮次仍
+   * 属于**原来源**，覆盖会把译文挂到错的行上）。
+   */
+  _claimRoundsSource(kind, force) {
+    if (!force && this._roundsSource) return;
+    this._roundsSource = kind;
+    this._trMode = (kind === "video") ? "line" : "sentence";
+  },
+
+  /**
    * 丢掉一条行级译文（模型改词了 ⇒ 旧译文是**旧文本**的）。
    *
    * ⚠️ 不丢的话「译文面板」里会**同时**留着旧版和新版 ⇒ 同一行出现两条
@@ -2341,6 +2386,13 @@ const Qwen3Asr = {
         ? "翻译模型就绪"
         : (model.installed ? "翻译模型未启动" : "本机没装翻译模型");
       this._trSyncUi();
+      // ⚠️ **刚知道「实时翻译开着」⇒ 把还欠着的行补要一次**。
+      //
+      // 刷新恢复时有个竞态：``_restoreFromServer`` 可能跑在 ``_trRefresh``
+      // 之前 ⇒ 那一刻 ``_tr.enabled`` 还是 false ⇒ 行级请求被跳过 ⇒
+      // 刷新后一句译文都没有（这里把它补回来）。
+      this._trRequestLines(false);
+      this._trMaybeFinalizeLines();
     } catch (e) {
       /* 网络问题不打扰用户 */
     }
@@ -3322,7 +3374,9 @@ const Qwen3Asr = {
 
     this.rounds = merged;
     // 归属：**只认服务端说的那份**（file / video）。前端猜不得。
-    this._roundsSource = kind;
+    // ⚠️ **翻译的单位也跟着认领**（视频 ⇒ 行级）—— 刷新时本地没走过
+    // ``start()`` ⇒ 不认领的话行级翻译一次都不会发起 ⇒ 刷新后没有译文。
+    this._claimRoundsSource(kind, true);
     this._subInvalidate();
     this._roundsDirty = true;      // 轮次表整体换过 → 重建面板
     this._renderRounds();
@@ -3336,6 +3390,13 @@ const Qwen3Asr = {
     else if (last) this._renderLive(last.committed || "", last.unfixed || "");
 
     if (this.snapshot) this._applySnapshot(this.snapshot);
+    // ⚠️ **行级翻译**：刷新后前端的行级记账是**空的** ⇒ 恢复出来的这些行
+    // 还得**重新要一次**译文（刷新前要过的译文随页面一起没了）。
+    //
+    // ⚠️ 后端**已经跑完**的话 ⇒ 最后一行的 ``done`` 帧也随旧连接一起没了
+    // ⇒ 它永远不会「定稿」⇒ 得 force（``_trMaybeFinalizeLines``）。
+    this._trRequestLines(false);
+    this._trMaybeFinalizeLines();
   },
 
   /**
@@ -3707,7 +3768,10 @@ const Qwen3Asr = {
         // 本地没有走过 start()）→ 按当前来源认领。
         // ⚠️ 用「为空才补」而不是「每次覆盖」：识别中途切来源时，
         // 轮次仍属于**原来源**，覆盖会把字幕串到新画面上。
-        if (!this._roundsSource) this._roundsSource = this._source;
+        // ⚠️ **翻译的单位也跟着认领**（`_claimRoundsSource`）—— 不然
+        // 刷新后 `_trMode` 还是默认的 "sentence" ⇒ 行级翻译一次都不发起
+        // ⇒ 刷新后一句译文都没有。
+        this._claimRoundsSource(this._source, false);
         // 音轨在容器里的起点（容器里音轨可能晚于画面起点）
         if (msg.audio_origin_sec !== undefined
             && msg.audio_origin_sec !== null) {
