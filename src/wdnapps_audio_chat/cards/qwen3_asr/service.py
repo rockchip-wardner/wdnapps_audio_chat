@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -204,6 +205,114 @@ _PAUSE_ROUNDS_LIMIT = 2
 #: 取 10 秒：够模型判准语种（连续语音 8~10 秒足够），代价也小
 #: （RTF≈0.18 ⇒ 一次回看多花 1.8 秒墙钟）。
 _LOOKBACK_SEC = 10.0
+
+#: **模型「重复自己」的判定阈值**（字符数）。
+#:
+#: Qwen3-ASR 的提示词里 **system 是空的**（见 SDK 的 ``_build_chat_embeds``
+#: —— 只有 ``<|im_start|>system\n<|im_end|>``，没有「请转写」这类指令）。
+#: ⇒ 音频里一旦出现**问句**，模型会**当成问答**来回答：先答一遍（有时
+#: 答成英文），再**把自己的答案复述一遍** ⇒ 已确认文本里出现整段重复。
+#:
+#: 实测《圆桌派》（一整集，114 段 / 4280 轮）里「新增文本与更早文本的
+#: 最长公共子串」的分布**极其干净**：
+#:
+#: ==============  ======  ==========================================
+#: 公共子串长度      轮数    说明
+#: ==============  ======  ==========================================
+#: < 4               4004   正常
+#: 4 / 5 / 6 / 7 / 8  111/47/14/6/3   真人重复（"那个，那个"、"multitasking，"）
+#: 11 / 13           1/6    **真人重复**（"《红楼梦》里边有好多的悲剧啊！"）
+#: **≥ 14**          **87**   **全是模型退化**（17~76 字）
+#: ==============  ======  ==========================================
+#:
+#: ⇒ 阈值取 **14**（13 那一档还有真人重复 ⇒ 不能更低）。
+#:
+#: ⚠️ 阈值不能更低：13 字那一档里混着**真人**的重复（说话人真的又说
+#: 了一遍）⇒ 误判会把真话剪掉。
+#: ⚠️ 也不能更高：模型退化的第一轮往往只是**改写**（公共子串只有 6~12
+#: 字），要等它**复述**到足够长才认得出 ⇒ 那一两轮的胡话已经在屏幕上了。
+_REPEAT_MIN_CHARS = 14
+
+#: **「同一段里自我复读」**的判定阈值（字符数）。
+#:
+#: 比 :data:`_REPEAT_MIN_CHARS` 更严（同一段里出现**两次**才算）⇒ 阈值
+#: 可以小一些。实测《圆桌派》EP01 整集（4280 轮）：阈值 12 命中 **7 轮，
+#: 全是退化**、**0 误报**。
+#:
+#: ⇒ 它兜的是「与更早文本重复」那条判据的盲区：模型把同一句**在同一轮
+#: 里**说两遍时，与更早文本的公共子串可能只有 17 字（实测
+#: ``Human Rights Watch（人权观察）：Human Rights Watch（《人类权利观察》）``）
+#: ⇒ 达不到 20 ⇒ 靠这条兜住。
+_SELF_REPEAT_MIN_CHARS = 12
+
+#: **「模型在说英文」**的判定阈值（连续非中文字符数）。
+#:
+#: Qwen3-ASR 的提示词里 **system 是空的** ⇒ 音频里出现**问句**时，模型会
+#: **当成问答**来回答，而且**用英文**回答（它自己知道这段是中文）。
+#: 实测《圆桌派》EP01 一整集（5303 轮）里，这种「英文回答」出现 **36 次**，
+#: 内容全是百科腔：
+#:
+#: * ``Human Rights Watch is a non-profit organization that advocates for
+#:   human rights``（出现了 9 次，每次措辞略不同）
+#: * ``Human Rights and Democracy: A History of the Global Movement…``
+#: * ``The following is a question: What are the main problems``（模型自己
+#:   写出来了！）
+#: * 甚至有 ``<img alt="https://www.cheerleader.com/2019-548367" …>``
+#:   （模型在编 HTML）
+#:
+#: ⇒ 判据：模型**自报语种是中文**，但新增文本里有一整段**连续的非中文**
+#: （≥ 阈值）⇒ 它不是在转写，是在**回答** ⇒ 那一截要剪掉。
+#:
+#: ⚠️ **阈值怎么定的**（同一集，5303 轮）：「新增文本里最长的一段连续非
+#: 中文」的分布是 —— **< 8 字：4206 轮**（正常）；8~18 字：29 轮（**真人
+#: 的英文**："to crazy啊"、"multitasking，"、"around the world."）；
+#: **≥ 20 字：36 轮（全是臆造）**。⇒ 阈值取 **20**（18 与 20 之间没有
+#: 样本，取 20 ⇒ 真人英文一律不动）。
+#:
+#: ⚠️ **为什么不是「模型说了英文就整段剪」**：媒体本身就是英文时，模型
+#: 自报的语种也是 English ⇒ 判据不成立 ⇒ 不会误伤 ✓。
+_LATIN_RUN_MIN = 20
+
+#: 自报语种是这些 ⇒ 才做「英文臆造」判定（中文 / 粤语 / 日文 / 韩文）。
+_CJK_LANGUAGES = frozenset((
+    "chinese", "mandarin", "cantonese", "yue", "zh", "zh-cn", "zh-tw",
+    "japanese", "ja", "korean", "ko",
+))
+
+
+def _is_cjk_language(lang: str) -> bool:
+    """这个语种是不是「以中文为主」的那一类。"""
+    return (lang or "").strip().lower() in _CJK_LANGUAGES
+
+
+def _non_cjk_run(text: str) -> int:
+    """最长的一段「连续非中文字符」的长度，以及它在哪儿开始。
+
+    返回 ``(长度, 起点)``；没有连续段则返回 ``(0, -1)``。
+
+    ⚠️ 中文**标点**（，。？！「」……）也算中文 —— 它们会把英文段落切开，
+    正合适：``他引用了"To be…"`` 里那段英文是一个独立的连续段。
+    """
+    best = 0
+    best_at = -1
+    run = 0
+    run_at = 0
+    for i, ch in enumerate(text):
+        if _CJK_CHAR_RE.match(ch):
+            run = 0
+            continue
+        if run == 0:
+            run_at = i
+        run += 1
+        if run > best:
+            best = run
+            best_at = run_at
+    return best, best_at
+
+
+#: 「中文字符」的判定（含中文标点 / 全角符号）。
+_CJK_CHAR_RE = re.compile(r"[　-〿㐀-䶿一-鿿"
+                          r"豈-﫿＀-￯]")
 
 #: **自适应静音阈值**：某一秒的 RMS 低于「最近 30 秒电平的中位数 - 本值」
 #: 才算停顿。
@@ -596,6 +705,26 @@ class _AsrManager:
         #: 回看期间**已确认**文本的长度 —— 用来把回看那部分从这一段的
         #: 最终文本里**砍掉**（否则同一句话在「实时结果」里出现两次）。
         self._lookback_committed_len: int = 0
+        #: **本 epoch 的公开文本**（= 真正要给用户看的内容）。
+        #:
+        #: = 模型的原始输出 **去掉** 两样东西：
+        #:
+        #: 1. **回看前缀** —— 回看是「把旧音频再喂一遍」，新会话的开头
+        #:    就是那段**重放的旧内容**（上一段已经显示过）⇒ 不该再出现；
+        #: 2. **模型重复自己的那一截**（模型退化，见 :data:`_REPEAT_MIN_CHARS`
+        #:    与 :meth:`_AsrManager._repeat_cut`）。
+        #:
+        #: ⚠️ **公开文本是唯一事实来源** —— 轮次帧、切句、时间锚点、
+        #: 最终文本全都用它 ⇒ 前端拿到的和后端汇总出来的**是同一份**，
+        #: 不会出现「字幕是一份、结果框是另一份」。
+        self._epoch_text: str = ""
+        #: 本 epoch 的**原始**已确认文本（模型自己说的，含回看前缀）。
+        #: 只用来算「这一轮**新增**了多少」⇒ 回看那几轮不贡献 ⇒ 前缀
+        #: 自动被排除（见 :meth:`_AsrManager._on_delta`）。
+        self._epoch_raw: str = ""
+        #: 模型**退化**了（它在重复自己）？⇒ 请求换一段会话。
+        #: 见 :meth:`_AsrManager._repeat_cut`。
+        self._degenerate: bool = False
 
         #: **切句器**（文件 / 视频路径的实时翻译用，见 :class:`_SentenceSplitter`）。
         self._splitter = _SentenceSplitter()
@@ -1005,6 +1134,97 @@ class _AsrManager:
                 return t0 + (char_idx - x0) * (t1 - t0) / (x1 - x0)
         return tbl[-1][1]
 
+    def _latin_cut(self, growth: str, language: str) -> Optional[int]:
+        """新增文本里是不是混进了一整段**英文**（模型在「回答问题」）？
+
+        返回那一段的起点（``growth`` 里的下标）；没有则返回 ``None``。
+
+        ⚠️ **背景**：Qwen3-ASR 的提示词里 **system 是空的**（见 SDK 的
+        ``_build_chat_embeds``）⇒ 音频里出现**问句**时，模型会**当成问答**
+        来回答，而且**用英文**回答 —— 吐出来的是一整段百科（实测《圆桌派》
+        EP01 出现 36 次：``Human Rights Watch is a non-profit organization
+        that advocates for human rights``、``The following is a question:
+        What are the main problems``、甚至 ``<img
+        alt="https://www.cheerleader.com/…"``）。
+
+        ⚠️ **模型自报的语种也会跟着跑偏** —— 实测拖动重开识别后，模型连着
+        10 轮自报 English（而这段媒体明明是中文）⇒ **不能用它当判据** ⇒
+        用「**这段媒体的语种**」（:attr:`_language`，跨请求沿用）。
+
+        ⇒ 判据：**这段媒体的语种是中文** + 新增文本里有**一整段连续的非中文**
+        （≥ :data:`_LATIN_RUN_MIN`）⇒ 它不是在转写 ⇒ 从那一段起剪掉。
+
+        ⚠️ **阈值 20 是量出来的**：同一集 5303 轮里，「新增文本里最长的一段
+        连续非中文」< 8 字的有 4206 轮（正常）、8~18 字的有 29 轮
+        （**真人的英文**："multitasking，"、"around the world."）、
+        **≥ 20 字的有 36 轮（全是臆造）** ⇒ 取 20，真人英文一律不动。
+
+        ⚠️ **媒体本身就是英文时不会误伤**：那时媒体语种是 English
+        ⇒ 判据不成立 ✓。
+        """
+        if not growth or not _is_cjk_language(language):
+            return None
+        length, at = _non_cjk_run(growth)
+        if length < _LATIN_RUN_MIN:
+            return None
+        return at
+
+    def _self_repeat_cut(self, growth: str) -> Optional[int]:
+        """这一轮**新增**的文本里，模型是不是**在同一段里重复自己**？
+
+        返回第二次出现的起点（``growth`` 里的下标）；没有则返回 ``None``。
+
+        ⚠️ **比「与更早文本重复」更严的判据**：同一段新增文本里，一个
+        ≥ :data:`_SELF_REPEAT_MIN_CHARS` 字的片段出现了**两次** ⇒ 模型
+        在自我复读。
+
+        实测《圆桌派》EP01 整集（4280 轮）：命中 **7 轮，全是退化** ——
+        ``Human Rights International (HRI) is a non-profit international
+        organization…``（``nternational`` 出现两次）、``但它是大人物小人物``
+        等；阈值 12 时 **0 误报**。
+
+        ⇒ 它补的是「与更早文本重复」那条判据的**盲区**：模型把同一句
+        **在同一轮里**说两遍时，与更早文本的公共子串可能只有 17 字
+        （实测 "Human Rights Watch（人权观察）：Human Rights Watch（…）"）
+        ⇒ 达不到 :data:`_REPEAT_MIN_CHARS` ⇒ 靠这条兜住。
+        """
+        n = _SELF_REPEAT_MIN_CHARS
+        if len(growth) < 2 * n:
+            return None
+        seen = {}
+        for i in range(len(growth) - n + 1):
+            key = growth[i:i + n]
+            if key in seen:
+                return i
+            seen[key] = i
+        return None
+
+    def _repeat_cut(self, growth: str, earlier: str) -> Optional[int]:
+        """这一轮**新增**的文本里，模型是不是在**重复自己**？
+
+        返回重复的起点（``growth`` 里的下标）；没有重复则返回 ``None``。
+
+        ⚠️ **为什么模型会重复自己**：Qwen3-ASR 的提示词里 **system 是空的**
+        （见 SDK 的 ``_build_chat_embeds`` —— 只有 ``<|im_start|>system\\n
+        <|im_end|>``，没有「请转写」这类指令）⇒ 音频里一旦出现**问句**，
+        模型就**当成问答**来回答：先答一遍（有时答成英文），再**把自己的
+        答案复述一遍**。
+
+        实测《圆桌派》EP01 一整集（109 段、4280 轮）：「新增文本与更早文本
+        的最长公共子串」在正常轮次里中位数 **0**、p90 **0**；模型退化时是
+        **20~76** 字 ⇒ 阈值 :data:`_REPEAT_MIN_CHARS` = **14**（真人重复的
+        那一档只有 4~13 字 —— 13 那一档还有真人的重复 ⇒ 不能更低）。
+
+        ⇒ 判定：**新增文本里有一段**（≥ 阈值）在**更早的文本**里出现过
+        ⇒ 从那里截断（那一截是复述，不该出现在字幕里）。
+        """
+        if len(growth) < _REPEAT_MIN_CHARS or not earlier:
+            return None
+        for i in range(len(growth) - _REPEAT_MIN_CHARS + 1):
+            if earlier.find(growth[i:i + _REPEAT_MIN_CHARS]) >= 0:
+                return i
+        return None
+
     def _sent_lookback(self, c0: int, c1: int) -> bool:
         """这句是不是**回看**里切出来的（重放的旧音频）？
 
@@ -1114,24 +1334,15 @@ class _AsrManager:
         去切 ``committed``，**跨段就对不上**（切出来是空的，或者是别的段
         的话）⇒ 尾巴会忽有忽无。
 
-        ⚠️ **回看的那一截要跳过** —— 换 epoch 时会把最近
-        :data:`_LOOKBACK_SEC` 秒的音频**再喂一遍**给新会话（否则模型零
-        上下文 ⇒ 语种判错、文本脱节）⇒ 新 epoch 开头那一截是**重放的旧
-        内容**，屏幕上已经显示过 ⇒ 尾巴不能从那儿开始（否则同一句话在
-        上一句下面并排出现两遍）。
+        ⚠️ **公开文本里本来就没有回看那一截**（见 :meth:`_on_delta`）⇒
+        这里**不需要**再减去「回看长度」—— 减了会把新内容削掉一截。
         """
-        with self._lock:
-            committed = self._sent_committed or ""
-            lb_len = self._lookback_committed_len
         done = self._splitter.done_offset()
-        # ⚠️ 取**较大**的那个起点：
-        #   * ``done``  —— 已经切成句的部分（译文挂在句子上）；
-        #   * ``lb_len`` —— 重放的旧内容（上一段已经显示过）。
-        # 两者都是「该跳过」的前缀 ⇒ 谁更靠后就从谁开始。
-        start = done if done > lb_len else lb_len
-        if start <= 0:
+        with self._lock:
+            committed = self._epoch_text or ""
+        if done <= 0:
             return committed
-        return committed[start:]
+        return committed[done:]
 
     def reset(self) -> None:
         """清空本轮结果，回到 idle。
@@ -1284,7 +1495,15 @@ class _AsrManager:
             elif source_info and not self._rounds_source:
                 # append 但还没有归属（例如服务重启后第一次就是拖动重开）
                 self._rounds_source = dict(source_info)
-            self._language = ""
+            if not append:
+                # ⚠️ **append（拖动后重开识别）不重置语种** —— 那是**同一段
+                # 媒体** ⇒ 语种不变 ⇒ 后面那些轮次才能拿它当「这段媒体是
+                # 中文」的凭据，去判「模型在自说自话」（见 ``_latin_cut``）。
+                #
+                # ⇒ 拖动重开后的那一段，模型若突然改说英文（实测《圆桌派》
+                #    拖到 41 s 后连着 10 轮吐英文且**卡住不动**），我们
+                #    仍然知道「这段媒体是中文」⇒ 那 10 轮会被剪掉 ✓。
+                self._language = ""
             self._last_result = None
             self._options = dict(options or {})
             self._cancel = False
@@ -1295,6 +1514,10 @@ class _AsrManager:
             # 识别时，调用方多解了前面一段给它当上下文（见
             # :data:`_LOOKBACK_SEC`）。
             self._first_lookback_sec = float(lookback_sec or 0.0)
+            # 新的一次识别 ⇒ 本 epoch 的**公开文本**归零（还没识别出东西）。
+            self._epoch_text = ""
+            self._epoch_raw = ""
+            self._degenerate = False
             self._set_state(self.STATE_RUNNING)
             # ---- 实时翻译（文件 / 视频路径）上下文 -------------------- #
             self._main_loop = loop
@@ -1373,6 +1596,11 @@ class _AsrManager:
             # 回看期间已确认了多长 —— 用来把回看那部分从最终文本里砍掉
             # （上一条识别留下的长度会让这一条**开头**被砍掉一截 ✗）。
             self._lookback_committed_len = 0
+            # 本 epoch 的**公开文本**也归零 —— 上一条识别留下的会让这一条
+            # **开头**带上一批的尾巴 ✗。
+            self._epoch_text = ""
+            self._epoch_raw = ""
+            self._degenerate = False
             # 本 epoch 的已确认文本（尾巴按它算）—— 新的一条 ⇒ 归零。
             self._sent_committed = ""
         try:
@@ -1558,17 +1786,20 @@ class _AsrManager:
             lang, body = _split_language(raw if isinstance(raw, str)
                                          else str(raw))
             lang = _valid_language(lang)
-            body = (body or "").strip()
-            # ⚠️ **砍掉回看那部分的文本** —— 回看是**重放**旧音频，模型把
-            # 那段又转写了一遍 ⇒ 那段上一段已经说过了 ⇒ 最终文本里不能
-            # 重复（否则「实时结果」里同一句话出现两次）。
+            # ⚠️ **用「公开文本」，不用 SDK 的原文** ——
             #
-            # 砍多少：回看期间**已确认**文本的长度（``_lookback_committed_len``
-            #）—— 它就是「这一段会话的开头」在最终文本里的长度 ⇒ 砍掉它
-            # 就正好剩下「回看之后」新识别出来的内容。
-            lb_len = self._lookback_committed_len
-            if lb_len > 0 and body:
-                body = (body[lb_len:] if len(body) > lb_len else "").strip()
+            # SDK 的原文 = 模型的原始输出，它**包含**两样我们**不要**的东西：
+            #   ① **回看重放**的那一段（旧内容 —— 上一段已经显示过）；
+            #   ② 模型**重复自己**的那一截（模型退化）。
+            #
+            # ⇒ 公开文本（``_epoch_text``）已经把这两样剔掉了 ⇒ 最终文本
+            # 与字幕、结果框**是同一份**。
+            #
+            # ⚠️ 时机：``_submit(...)`` 返回时这一轮的 delta **已经投递完**
+            # （SDK 保证）⇒ 公开文本已经含收尾那块确认下来的字 ✓。
+            with self._lock:
+                body = self._epoch_text or ""
+            body = (body or "").strip()
             if body:
                 segments.append(body)
             if lang:
@@ -1652,6 +1883,9 @@ class _AsrManager:
               committed 不前进 → 模型输入不变 → 输出不变 → **永久
               自锁**。切一个新会话（音频历史清零）能立刻解开。
             * ``silence`` —— 说话停顿（切口对齐到停顿处）。
+            * ``repeat`` —— **模型在重复自己**（模型退化，见
+              :data:`_REPEAT_MIN_CHARS` 与 :meth:`_AsrManager._repeat_cut`）。
+              退化中的模型会**一直**重复下去 ⇒ 换一个新会话最有效。
 
             **新会话带上下文（回看）**
             --------------------------
@@ -1685,6 +1919,11 @@ class _AsrManager:
             # 累积的 ⇒ 新段从头数，尾巴按新段算）。
             with self._lock:
                 self._sent_committed = ""
+                # 换段 ⇒ 本 epoch 的**公开文本**归零（新的会话从头开始说）。
+                self._epoch_text = ""
+                self._epoch_raw = ""
+                # 换段 ⇒ 「模型退化」的标记也归零（新会话是干净的）。
+                self._degenerate = False
             # 换段 ⇒ 时间表也归零（段内坐标，不能跨段用）
             self._tr_time_reset()
             # ⚠️ 回看的文本长度归零（**在收尾之后** —— 收尾那次 final
@@ -1834,12 +2073,20 @@ class _AsrManager:
                 # 用户喊停 → 这一块剩下的活（停顿检测 / 切会话）都不做了。
                 break
             epoch_sec += dur
-            # 切会话的三个理由（按优先级）：
+            # 切会话的理由（按优先级）：
+            #   repeat  —— **模型在重复自己**（模型退化，见 _REPEAT_MIN_CHARS）
             #   silence —— 说话停顿（切在停顿处 → 新会话从句子开头开始）
             #   length  —— 段太长（C++ demo 的 60 s 硬上限，兜底）
             #   stall   —— 模型输出卡住（自锁兜底，见 _STALL_ROUNDS_LIMIT）
+            #
+            # ⚠️ **repeat 排第一** —— 退化中的模型会**一直**重复下去（实测
+            # 《圆桌派》有一段连续 25 轮都在复述同一句）⇒ 越早换会话越好。
             reason = None
-            if chunk_paused and epoch_sec >= _FILE_SESSION_MIN_SEC:
+            with self._lock:
+                degenerate = self._degenerate
+            if degenerate:
+                reason = "repeat"
+            elif chunk_paused and epoch_sec >= _FILE_SESSION_MIN_SEC:
                 reason = "silence"
             elif epoch_sec >= _FILE_SESSION_MAX_SEC:
                 reason = "length"
@@ -1922,14 +2169,13 @@ class _AsrManager:
                     / float(CAPTURE_SAMPLE_RATE or 1))
             except (TypeError, ValueError):
                 pass
+        # ⚠️ **原始**已确认文本（**段内**累积）—— 切句 / 时间锚点 / 尾巴
+        # 全部用它。公开给前端的那份是**剥掉回看前缀**的（见下面）。
+        raw_committed = frame["committed"]
         with self._lock:
             if self._drop_frames:
                 # 「清空」之后才到的迟到轮次 → 丢掉（否则清空不干净）。
                 return
-            self._rounds.append(frame)
-            lang = _valid_language(frame["language"])
-            if lang:
-                self._language = lang
             origin = self._audio_origin_sec
             # ⚠️ **回看轮次** = 「重放旧音频」的那几轮（见
             # :data:`_LOOKBACK_SEC`）。判定用**时间**：回看区间的轮次
@@ -1947,13 +2193,92 @@ class _AsrManager:
                 cstart = frame.get("chunk_start_sec")
                 if cstart is not None and float(cstart) < lb_until - 1e-6:
                     is_lookback = True
+            degenerate = self._degenerate
+            if is_lookback:
+                # ⚠️ **回看轮次不进公开输出** ——
+                #
+                # 回看 = 「把旧音频再喂一遍」⇒ 它的输出有两处污染：
+                #
+                # 1. **语种**：重放的头几轮只有 ~1 秒音频、**零上下文**
+                #    ⇒ 模型会**重新判语种**，中文被判成 English，还会
+                #    **臆造**出英文内容（实测《圆桌派》重放第 1 轮：
+                #    ``lang=English u='You used to go old guys.'`` ⇒ 整段
+                #    结果被标成英文）。
+                #    ⇒ 回看轮次**不更新** ``_language``。
+                # 2. **文本**：重放的那段内容**上一段已经显示过** ⇒ 它
+                #    既不该进轮次列表，也不该留在字幕时间轴里（同一段
+                #    音频出现两遍、措辞不同 ⇒ 看着像「重复 / 错乱」）。
+                #
+                # ⇒ 回看轮次只做一件事：把**原始文本**记进 ``_epoch_raw``
+                #    ⇒ 下一轮算「新增」时从它算起 ⇒ **回看那一截自动
+                #    不进公开文本**（不用另外算前缀长度）。
+                self._epoch_raw = raw_committed
+            else:
+                # ⚠️ **公开文本**（``_epoch_text``）= 这一段真正要给用户看的
+                #    内容 = 原始文本 **去掉**：
+                #      ① 回看前缀（重放的旧内容 —— 上一段已经显示过）；
+                #      ② 模型**重复自己**的那一截（模型退化）。
+                #
+                # ⇒ 用「**新增**」累加：新增 = 原始文本相对上一轮的增量
+                #    ⇒ 回看那几轮不贡献 ⇒ 前缀自动被排除 ✓。
+                if raw_committed.startswith(self._epoch_raw):
+                    growth = raw_committed[len(self._epoch_raw):]
+                else:
+                    # 原始文本**变短**了（模型回滚 / 会话重置）⇒ 整段重来。
+                    growth = raw_committed
+                earlier = self._epoch_raw
+                self._epoch_raw = raw_committed
+                if degenerate:
+                    # ⚠️ **已经在退化** ⇒ 这一轮模型说的**一个字都不进**
+                    # 公开文本（它说的全是胡话 —— 实测退化期间还会漏出
+                    # 一个孤零零的 "."）⇒ 等换会话后重新开始说。
+                    growth = ""
+                else:
+                    # ⚠️ **三种「模型跑偏」都要剪掉**（取**最早**的切点）：
+                    #   ① **重复自己**（复述更早的内容）；
+                    #   ② **说英文**（自报中文却吐一整段英文 —— 它在「回答」）；
+                    #   ③ **同一段里复读**（把同一句说了两遍）。
+                    cuts = []
+                    c = self._repeat_cut(growth, earlier)
+                    if c is not None:
+                        cuts.append(c)
+                    # ⚠️ **用「媒体语种」判**，不用这一轮自报的那个 ——
+                    # 模型跑偏时**自报的语种也跟着跑偏**（实测拖动重开后
+                    # 连着 10 轮自报 English，而这段媒体明明是中文）⇒
+                    # 用自报语种判 = 永远判不出来。
+                    media_lang = self._language or frame["language"]
+                    c = self._latin_cut(growth, media_lang)
+                    if c is not None:
+                        cuts.append(c)
+                    c = self._self_repeat_cut(growth)
+                    if c is not None:
+                        cuts.append(c)
+                    if cuts:
+                        # 假的 ⇒ 剪掉，并换一段会话（见 :meth:`_repeat_cut`）。
+                        degenerate = True
+                        self._degenerate = True
+                        growth = growth[:min(cuts)]
+                self._epoch_text += growth
+                frame["committed"] = self._epoch_text
+                # ⚠️ **退化期间「假设」也是假的** ⇒ 一并丢掉 ——
+                # 不丢的话「实时结果」那一行仍会显示模型的胡话（实测
+                # 拖动重开后连着 10 轮吐英文且卡住不动）。
+                if degenerate:
+                    frame["unfixed"] = ""
+                self._rounds.append(frame)
+                lang = _valid_language(frame["language"])
+                # ⚠️ **退化那一轮不更新语种** —— 模型退化时常伴随「转成
+                #    英文」（实测退化里出现 "human rights violations"）
+                #    ⇒ 采信它会把**整段**结果标成英文。
+                if lang and not degenerate:
+                    self._language = lang
             # **停滞检测**：已确认文本（epoch 内累积）连续 N 轮长度不变
             # → 模型输出卡住了（SDK 侧等价于 ``stable_count == 0``）。
             # 见 :data:`_STALL_ROUNDS_LIMIT`。
             #
             # 注意 ``committed`` 是**当前会话内**的累积文本 —— 切 epoch
             # 后 decoder 重置，长度会变小 → 计数器自动归零。
-            clen = len(frame["committed"])
+            clen = len(raw_committed)
             if is_lookback:
                 # 回看轮次：只更新基准，不计轮数。
                 self._last_committed_len = clen
@@ -2024,14 +2349,27 @@ class _AsrManager:
         # 这一帧**发给前端（``sentences``），前端才知道「哪句到哪了」。
         # 时间锚点也是**先记再切** —— 这一轮的「已确认字数 → 结束时间」
         # 是下一句换算时间的依据。
-        self._tr_time_note(frame["committed"], frame.get("unfixed") or "",
+        if is_lookback:
+            # ⚠️ **回看轮次不记时间锚点、不切句** ——
+            #
+            # 公开文本里**没有**回看那一截（见上面）⇒ 公开文本的第 0 个字
+            # 就在「回看之后」⇒ 时间锚点只能从回看**之后**那一轮开始记，
+            # 否则「字 → 时间」会整体错 10 秒。
+            #
+            # ⇒ 直接返回：这一轮不进公开输出（不广播），也不进切句器。
+            return
+        # ⚠️ 切句 / 时间锚点 / 尾巴全都用**公开文本**（``_epoch_text``）——
+        # 它是唯一事实来源 ⇒ 前端（按 ``committed`` 算时间）与后端
+        # （按 ``_epoch_text`` 算时间）**逐帧一致**。
+        pub_text = self._epoch_text
+        self._tr_time_note(pub_text, frame.get("unfixed") or "",
                            frame.get("chunk_end_sec"))
         # ⚠️ **先记下本轮的已确认文本** —— 「尾巴」按它算（见
         # :meth:`_sent_tail_text`）。
         with self._lock:
-            self._sent_committed = frame["committed"] or ""
+            self._sent_committed = pub_text
         try:
-            self._splitter.feed(frame["committed"], self._sent_emit)
+            self._splitter.feed(pub_text, self._sent_emit)
         except Exception as exc:  # noqa: BLE001 — 切句是 best-effort
             _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
         with self._lock:
