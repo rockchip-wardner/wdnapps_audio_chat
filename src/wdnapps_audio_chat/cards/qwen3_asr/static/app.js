@@ -45,6 +45,25 @@
   const SUB_MIN_LINE_SEC = 0.5;       // 一行至少占多久（防「闪过去」）
 
   /* ------------------------------------------------------------------ *
+   * 「实时翻译」的请求调度
+   *
+   * ⚠️ **为什么要有上限**：行级翻译是**前端驱动**的（每行一次请求）。一集
+   * 98 分钟的访谈有 **1477 行**（实测：580 秒 ⇒ 146 行）⇒ 一次「打开实时
+   * 翻译」就会**同时**发出上千个请求 ⇒ 服务端队列（当时上限 32）瞬间爆掉，
+   * **丢最旧的** ⇒ 丢掉的正是**播放头附近那批行** ⇒ 画面字幕上一直**没有
+   * 译文**（用户报：「再勾选实时翻译，字幕上没有实时翻译」）。
+   *
+   * ⇒ 三个约束：
+   *   ① **每轮最多发 N 个**（``_TR_REQ_BATCH``）⇒ 队列永远不满；
+   *   ② **播放头附近的行先发**（``_trRequestLines`` 里的顺序）⇒ 屏幕上
+   *      那一行 **1 秒内**就有译文，其余的行在后台慢慢补；
+   *   ③ **速率不超过服务端的消化能力**（一台翻译实例 ≈ 3.8 句/秒）⇒
+   *      队列不会积压 ⇒ **不会丢**任何一句。
+   * ------------------------------------------------------------------ */
+  const TR_REQ_BATCH = 2;             // 每轮最多发几个翻译请求
+  const TR_REQ_TICK_MS = 600;         // 多久跑一轮（≈ 3.3 个/秒）
+
+  /* ------------------------------------------------------------------ *
    * 翻译目标语言：**中文名 + 本族名**（跟右上角「简体中文」下拉一个排法）
    *
    * ⚠️ 表里的 key = 后端 provider 的语言码（``LANG_CODES``），不是通用
@@ -505,6 +524,19 @@ const Qwen3Asr = {
   _trLineSlot: new Map(),
   /** 槽位号 → 译文（**按槽位对**，不按行 id —— 文本改了行 id 就变了）。 */
   _trLineTr: new Map(),
+  /**
+   * 句子级（音频文件来源）：**已经要过的句子文本**。
+   *
+   * ⚠️ 句子级翻译是**服务端在句子切出来那一刻一次性送出去**的 ⇒ 开关关着
+   * 时切出来的句子**永远不会被补翻** ⇒ 用户「取消勾选 → 再勾选」之后，
+   * 结果框里的那些句子**永远没有译文**。
+   *
+   * ⇒ 重新打开开关时，前端用这个表找出「还没翻过的句子」，再逐句要一次
+   * （走同一个 ``/translate/line`` 端点 ⇒ 译文照样从 WS 回来）。
+   */
+  _trSentReq: new Map(),
+  /** 句子级翻译的请求序号（前端自己编，后端原样带回）。 */
+  _trSentSeq: 0,
 
   init() {
     if (this._inited) return;
@@ -563,6 +595,17 @@ const Qwen3Asr = {
     // 实时翻译（流式同传）—— 开关 / 目标语言 / 启用翻译模型
     $("asr-tr-enabled")?.addEventListener("change", (e) => {
       const on = !!e.target.checked;
+      // ⚠️ **先本地置位，别等服务端往返** ——
+      //
+      // ``_trSyncUi()`` 会把勾选框按 ``this._tr.enabled`` **回写**，而它在
+      // **每一帧译文到达时**都会被调（见 WS 的 ``translation`` 分支）⇒ 服务端
+      // 往返的那几十毫秒里，只要来一帧译文，就会用**旧值**（还是开着的）把用户
+      // 刚点的「取消」**悄悄勾回去** ⇒ 表现为「关不掉 / 再打开也没反应」。
+      //
+      // ⇒ 先把本地状态改成用户点的那个值 ⇒ 回写时两边一致 ⇒ 点不动不了。
+      // （服务端那边失败时，``_trRefresh`` 会用权威值改回来。）
+      this._tr.enabled = on;
+      this._trSyncUi();
       if (!on) {
         // ⚠️ **关掉 ⇒ 画面字幕上的译文也一起收掉** —— 已经收到的译文
         // 留在 ``_tr.items`` 里 ⇒ 字幕会继续挂着旧译文（用户明明关了
@@ -571,6 +614,7 @@ const Qwen3Asr = {
         this._trLineTr.clear();   // 行级译文也一样
         this._trLineReq.clear();  // 重新打开时那几行要**重新**要一次
         this._trLineSlot.clear();
+        this._trSentReq.clear();  // 句子级也一样
         this._trVer++;   // 版本号 +1 ⇒ 缓存失效
         this._trRender();
       }
@@ -632,6 +676,23 @@ const Qwen3Asr = {
         this._probeCap().catch(() => {});
         this._trRefresh();
       }, 5000);
+    }
+    // ⚠️ **翻译请求的节拍器** ——
+    //
+    // 「实时翻译」开着时，每 ``TR_REQ_TICK_MS`` 跑一轮：把**还没翻**的行
+    // （视频）或句（音频文件）要过来，每轮最多 ``TR_REQ_BATCH`` 个 ⇒ 服务端
+    // 的翻译队列（32）永远不满 ⇒ **不会丢请求**。
+    //
+    // ⚠️ **为什么不能只靠 round 帧驱动**：识别结束之后**没有 round 帧了**
+    // ⇒ 「再勾选实时翻译」时那几百行永远不会被要 ⇒ 画面字幕上一直没有译文
+    // （用户报：「再勾选实时翻译，字幕上没有实时翻译」）。
+    if (!this._trTimer) {
+      this._trTimer = setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        if (!this._tr.enabled) return;
+        this._trRequestLines(false);
+        this._trRequestSentences();
+      }, TR_REQ_TICK_MS);
     }
     this._installLiveHooks();
   },
@@ -1529,10 +1590,9 @@ const Qwen3Asr = {
     // ⇒ 落在区间外 ⇒ **清空**（等新识别追上来的那一瞬自然恢复）。
     if (!this._subRecognizedAt(t)) { this._subClear(sub); return; }
 
-    let cur = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].start <= t) cur = i; else break;
-    }
+    // ⚠️ **当前行**用**同一个方法**算（``_curSubIndex``）—— 画面显示的是哪
+    // 一行，译文就该**先要哪一行** ⇒ 两边必须一致。
+    const cur = this._curSubIndex(lines);
     if (cur < 0) { this._subClear(sub); return; }
 
     // 可见行：当前行 + 上面还没淡出的行
@@ -2344,6 +2404,16 @@ const Qwen3Asr = {
    * 3~9 s ⇒ 字幕已经翻过去两三行了 ⇒ 看着像「不是实时翻译」。
    *
    * ``force`` —— 识别结束（``done``）时传 true：那时最后一行也定稿了。
+   *
+   * ⚠️ **每轮最多发 ``TR_REQ_BATCH`` 个** + **播放头附近的先发** ——
+   *
+   * 一集 98 分钟的访谈有 **~1477 行** ⇒ 「打开实时翻译」时如果一次性全要，
+   * 服务端队列（当时上限 32）瞬间爆掉，而它**丢最旧的** ⇒ 丢掉的正是**播放头
+   * 附近的那几行** ⇒ 画面字幕上一直**没有译文**（用户报：「再勾选实时翻译，
+   * 字幕上没有实时翻译」）。
+   *
+   * ⇒ 现在：① 离播放头越近的越先要（屏幕上那一行 **1 秒内**就有译文）；
+   *   ② 每轮最多发 ``TR_REQ_BATCH`` 个 ⇒ 队列永远不满 ⇒ 不会丢。
    */
   _trRequestLines(force) {
     if (this._trMode !== "line") return;
@@ -2360,7 +2430,11 @@ const Qwen3Asr = {
     // ⚠️ **还在长的 epoch** = 轮次里**最后**那个。拖动重开识别会追加新的
     // epoch ⇒ 老那个已经结束 ⇒ 它的末行也定稿了（不然那一行永远没译文）。
     const lastEpochIdx = this._splitEpochs(rounds).length - 1;
-    for (let i = 0; i < lines.length; i++) {
+    // ⚠️ **按「离播放头多远」排序** ⇒ 屏幕上那一行先要。
+    const order = this._trLineOrder(lines);
+    let sent = 0;
+    for (const i of order) {
+      if (sent >= TR_REQ_BATCH) break;
       const ln = lines[i];
       if (!ln || !ln.id) continue;
       const slot = this._trSlotOf(ln);
@@ -2381,7 +2455,52 @@ const Qwen3Asr = {
       if (!closed) continue;
       this._trLineReq.set(slot, text);
       this._trRequestLine(ln, slot, text);
+      sent++;
     }
+  },
+
+  /**
+   * 行要译文的**优先级顺序**：**离播放头越近的越先来**。
+   *
+   * ⚠️ **为什么不能按时间顺序**：一集 98 分钟的访谈有 ~900 行 ⇒ 全部要一遍
+   * 要 900 次请求 ⇒ 服务端队列（32）爆掉、**丢最旧的** ⇒ 丢的正是**屏幕
+   * 上那一行** ⇒ 画面字幕一直没有译文（用户报：「再勾选实时翻译，字幕上
+   * 没有实时翻译」）。
+   *
+   * ⇒ 改成「从当前行往两边扩」⇒ 屏幕上那 3 行**第一批**就要到 ⇒ 1 秒内
+   *    出译文；其余的行在后面的轮次里慢慢补。
+   */
+  _trLineOrder(lines) {
+    const n = (lines && lines.length) || 0;
+    const cur = this._curSubIndex(lines);
+    const out = [];
+    if (cur < 0) {
+      for (let i = 0; i < n; i++) out.push(i);
+      return out;
+    }
+    for (let d = 0; d < n; d++) {
+      if (cur - d >= 0) out.push(cur - d);
+      if (d > 0 && cur + d < n) out.push(cur + d);
+    }
+    return out;
+  },
+
+  /**
+   * **当前行**的下标 = 最后一个「开始时间 ≤ 播放头」的行。
+   *
+   * ⚠️ 与画面字幕的取行判据**必须是同一份** —— 字幕显示的是哪一行，译文
+   * 就该先要哪一行 ⇒ 抽成一个方法，两边共用。
+   */
+  _curSubIndex(lines) {
+    if (!lines || !lines.length) return -1;
+    const video = document.getElementById("asr-video");
+    if (!video) return -1;
+    const t = (video.currentTime || 0) - (this._audioOriginSec || 0);
+    let cur = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].start <= t) cur = i; else break;
+    }
+    return cur;
   },
 
   /** 一行属于哪个 epoch（行 id 的第一段就是 epoch 下标）。 */
@@ -2472,6 +2591,69 @@ const Qwen3Asr = {
     }).catch((e) => {
       // 翻译是**旁路** —— 请求失败不许打断识别
       console.warn("[qwen3-asr] 行级翻译请求失败:", e);
+    });
+  },
+
+  /**
+   * 句子级翻译（**音频文件**来源）：把**还没翻过**的句子补要一次。
+   *
+   * ⚠️ **为什么需要**：句子级翻译是**服务端在句子切出来那一刻一次性送出**
+   * 的（见服务端 ``_tr_emit``）⇒ 开关关着时切出来的句子**永远不会被补翻**
+   * ⇒ 用户「取消勾选 → 再勾选」之后，结果框里那些句子**永远没有译文**。
+   *
+   * ⇒ 重新打开开关时，前端找出「还没翻过的句子」，用同一个
+   * ``/translate/line`` 端点逐句要一次（译文照样从 WS 回来 ⇒ 前端按**原文
+   * 文本**配对，见 ``_renderSentences``）。
+   *
+   * ⚠️ **每轮最多 ``TR_REQ_BATCH`` 个** —— 同 ``_trRequestLines``（长音频
+   * 几千句 ⇒ 一次全要会把服务端的翻译队列打爆 ⇒ 丢最旧的 ⇒ 谁都翻不到）。
+   */
+  _trRequestSentences() {
+    if (this._trMode !== "sentence") return;
+    if (!this._tr.enabled) return;
+    const sents = this._sentences || [];
+    if (!sents.length) return;
+    // 已经有译文的句子 —— 按**原文文本**配对（与 ``_renderSentences`` 同口径）
+    const have = new Set();
+    for (const it of (this._tr.items || [])) {
+      const src = (it.source || "").trim();
+      if (src) have.add(src);
+    }
+    let sent = 0;
+    for (const s of sents) {
+      if (sent >= TR_REQ_BATCH) break;
+      const text = (s.t || "").trim();
+      if (!text) continue;
+      // 已经要过同样的文本 ⇒ 别重复要（译文可能还在路上）
+      const prev = this._trSentReq.get(s.i);
+      if (prev !== undefined && this._trNormText(prev) === this._trNormText(text)) {
+        continue;
+      }
+      if (have.has(text)) continue;
+      this._trSentReq.set(s.i, text);
+      this._trRequestSentence(text);
+      sent++;
+    }
+  },
+
+  /** 要一句（音频文件来源）的译文 —— 走同一个端点，译文从 WS 回来。 */
+  _trRequestSentence(text) {
+    if (!text) return;
+    const seq = this._trSentSeq++;
+    const body = {
+      text: text,
+      start_sec: null,
+      end_sec: null,
+      lang: (this.snapshot && this.snapshot.language) || "",
+      seq: seq,
+    };
+    fetch(API_PREFIX + "/qwen3-asr/translate/line", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch((e) => {
+      // 翻译是**旁路** —— 请求失败不许打断识别
+      console.warn("[qwen3-asr] 句子翻译请求失败:", e);
     });
   },
 
@@ -3581,6 +3763,9 @@ const Qwen3Asr = {
     this._trLineIdBySeq.clear();
     this._trLineSlot.clear();
     this._trLineTr.clear();
+    // 句子级（音频文件）的记账也归零 —— 新的一批 ⇒ 句子从头数
+    this._trSentSeq = 0;
+    this._trSentReq.clear();
     // 记下这批轮次来自**哪个来源** —— 视频字幕靠它判断「该不该渲染」
     // （否则会拿上一来源的轮次画到当前视频上，见 _onSourceChanged）。
     this._roundsSource = this._source;
@@ -3695,6 +3880,7 @@ const Qwen3Asr = {
     this._trLineTr.clear();   // 行级译文（视频来源）也一起清
     this._trLineReq.clear();
     this._trLineSlot.clear();
+    this._trSentReq.clear();  // 句子级（音频文件来源）的记账也一起清
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     // ⚠️ **句子流也清** —— DOM 与状态一起清（见 ``_sentClear``）。
@@ -3725,6 +3911,7 @@ const Qwen3Asr = {
     this._trLineTr.clear();   // 行级译文（视频来源）也一起清
     this._trLineReq.clear();
     this._trLineSlot.clear();
+    this._trSentReq.clear();  // 句子级（音频文件来源）的记账也一起清
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     // ⚠️ **再清一次句子流** —— 「本地先清」与「服务端 /reset 回来」之间
