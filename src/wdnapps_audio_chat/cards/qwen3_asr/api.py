@@ -70,7 +70,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 from fastapi import (APIRouter, Body, File, Form, Header, HTTPException,
                      Query, Request, UploadFile, WebSocket, WebSocketDisconnect)
@@ -97,15 +97,6 @@ router = APIRouter(tags=["qwen3-asr"])
 #: 单次上传上限。60 秒 48 kHz s24 单声道 ≈ 8.6 MB，留足余量；
 #: 含音轨的视频会大得多 —— 走「设备端路径」时不受这个限制。
 _MAX_UPLOAD_BYTES = 32 * 1024 * 1024
-
-#: 设备端媒体文件**允许的根目录**（相对 ``<assets>``）。
-#:
-#: ⚠️ 这个 webui **没有鉴权** —— 媒体端点等于「任意文件读取」入口，
-#: 所以根目录必须是**白名单**，不能是「整个 /userdata」。
-#:
-#: ``uploads`` —— 向导「上传…」落盘处（用户选的视频都在这）；
-#: ``tts``    —— TTS 生成的音频。
-_MEDIA_ROOT_NAMES = ("uploads", "tts")
 
 #: 常见容器在 ``mimetypes`` 里查不到的 MIME（``mkv`` / ``avi`` 之类）。
 #: 浏览器靠 Content-Type 决定用哪个解码器 —— 给错会直接播不出来。
@@ -146,70 +137,39 @@ def _upload_dir() -> Path:
 # --------------------------------------------------------------------------- #
 # 设备端媒体文件（给 <video> 播）
 # --------------------------------------------------------------------------- #
-def _media_roots() -> List[Path]:
-    """媒体文件允许的根目录（已 resolve）。"""
-    from app.core.config import default_resource_root
-
-    base = default_resource_root()
-    out: List[Path] = []
-    for name in _MEDIA_ROOT_NAMES:
-        try:
-            out.append((base / name).resolve())
-        except OSError:  # pragma: no cover — 目录不存在时跳过
-            continue
-    return out
-
-
 def _resolve_media_path(raw: str) -> Path:
     """把用户给的路径解析成**允许根目录内**的媒体文件。
 
     ⚠️ 这个 webui **没有鉴权** —— 这个端点等于「任意文件读取」入口
-    （``?path=/etc/shadow`` 能把 shadow 读出来）。所以必须三道闸：
+    （``?path=/etc/shadow`` 能把 shadow 读出来）。所以必须过闸：
 
-    1. **根目录白名单** —— 只允许 ``<assets>/uploads`` 与 ``<assets>/tts``；
-    2. **扩展名白名单** —— 只允许 :data:`MEDIA_EXTS`（音视频）；
-    3. **resolve 之后仍在根内** —— ``resolve()`` 会把 ``..`` 和软链接都
-       规范化，指向根外的软链接因此被拒。
+    1. **根目录白名单** —— 与设备端文件浏览器（``/api/fs``）共用
+       :func:`app.core.fs_paths.resolve_within_root`（根 = ``base.resource_dir``）。
+       页面上的路径**就是从那个浏览器里选出来的** ⇒ 两处口径必须一致，
+       否则用户选得到、却播不了；
+    2. **扩展名白名单** —— 只允许 :data:`MEDIA_EXTS`（音视频）。
 
-    Raises
-    ------
-    HTTPException
-        400 参数不对 / 404 不存在或不在允许范围。
+    ``resolve_within_root`` 自带「resolve 之后仍在根内」这道闸
+    （``..`` 与指向根外的软链接都会被规范化掉）。
     """
     raw = (raw or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="缺少 path 参数")
-    p = Path(raw)
-    if not p.is_absolute():
+    if not Path(raw).is_absolute():
+        # 相对路径会被 resolve 到**服务进程的 CWD** ⇒ 报错里会冒出
+        # 用户压根没写过的路径，很难看懂。
         raise HTTPException(
             status_code=400,
             detail="path 必须是设备端的绝对路径: {}".format(raw))
 
-    try:
-        resolved = p.resolve()
-    except OSError as exc:
-        raise HTTPException(
-            status_code=404, detail="文件不存在: {}".format(exc)) from exc
+    from app.core.fs_paths import resolve_within_root
+    resolved = resolve_within_root(raw)
 
     if resolved.suffix.lower() not in MEDIA_EXTS:
         raise HTTPException(
             status_code=400,
             detail="不是可播放的音视频文件（支持 {}）".format(
                 ", ".join(sorted(MEDIA_EXTS))))
-
-    roots = _media_roots()
-    for root in roots:
-        try:
-            inside = resolved.is_relative_to(root)
-        except ValueError:  # pragma: no cover
-            inside = False
-        if inside:
-            break
-    else:
-        raise HTTPException(
-            status_code=403,
-            detail="只能播放资源目录下的文件（{}）".format(
-                ", ".join(str(r) for r in roots)))
 
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -252,7 +212,7 @@ async def get_media(path: str = Query(..., description="设备端媒体文件绝
     没有 Range 的话浏览器只能从头播、拖不动。
 
     ⚠️ 这个端点**没有鉴权**，所以路径必须过
-    :func:`_resolve_media_path` 的三道闸（根目录 / 扩展名 / resolve）。
+    :func:`_resolve_media_path` 的闸（绝对路径 / 根目录 / 扩展名 / 存在性）。
     """
     p = _resolve_media_path(path)
     return FileResponse(p, media_type=_media_type(p),
