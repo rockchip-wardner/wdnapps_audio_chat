@@ -45,6 +45,114 @@
   const SUB_MIN_LINE_SEC = 0.5;       // 一行至少占多久（防「闪过去」）
 
   /* ------------------------------------------------------------------ *
+   * 翻译目标语言：**中文名 + 本族名**（跟右上角「简体中文」下拉一个排法）
+   *
+   * ⚠️ 表里的 key = 后端 provider 的语言码（``LANG_CODES``），不是通用
+   * 的 ISO 码 —— 「模型支持哪些语言」和「语言叫什么」是两件事。
+   *
+   * ⚠️ 表里**没有**的码（将来模型加了新语言）⇒ 前端退回英文名
+   * （``it.name``），不会显示成空白。
+   * ------------------------------------------------------------------ */
+  const TR_LANG_LABELS = {
+    "zh-CN": { zh: "中文（简体）", native: "简体中文" },
+    "en":     { zh: "英语",       native: "English" },
+    "ja":     { zh: "日语",       native: "日本語" },
+    "ko":     { zh: "韩语",       native: "한국어" },
+    "fr":     { zh: "法语",       native: "Français" },
+    "de":     { zh: "德语",       native: "Deutsch" },
+    "es":     { zh: "西班牙语",   native: "Español" },
+    "pt":     { zh: "葡萄牙语",   native: "Português" },
+    "it":     { zh: "意大利语",   native: "Italiano" },
+    "ru":     { zh: "俄语",       native: "Русский" },
+    "ar":     { zh: "阿拉伯语",   native: "العربية" },
+    "hi":     { zh: "印地语",     native: "हिन्दी" },
+    "th":     { zh: "泰语",       native: "ไทย" },
+    "vi":     { zh: "越南语",     native: "Tiếng Việt" },
+    "id":     { zh: "印尼语",     native: "Bahasa Indonesia" },
+    "ms":     { zh: "马来语",     native: "Bahasa Melayu" },
+    "tr":     { zh: "土耳其语",   native: "Türkçe" },
+    "pl":     { zh: "波兰语",     native: "Polski" },
+    "nl":     { zh: "荷兰语",     native: "Nederlands" },
+    "cs":     { zh: "捷克语",     native: "Čeština" },
+    "he":     { zh: "希伯来语",   native: "עברית" },
+    "uk":     { zh: "乌克兰语",   native: "Українська" },
+    "tl":     { zh: "塔加洛语",   native: "Tagalog" },
+    "km":     { zh: "高棉语",     native: "ភាសាខ្មែរ" },
+    "my":     { zh: "缅甸语",     native: "မြန်မာဘာသာ" },
+    "fa":     { zh: "波斯语",     native: "فارسی" },
+    "gu":     { zh: "古吉拉特语", native: "ગુજરાતી" },
+    "ur":     { zh: "乌尔都语",   native: "اردو" },
+    "te":     { zh: "泰卢固语",   native: "తెలుగు" },
+    "mr":     { zh: "马拉地语",   native: "मराठी" },
+    "bn":     { zh: "孟加拉语",   native: "বাংলা" },
+    "ta":     { zh: "泰米尔语",   native: "தமிழ்" },
+    "bo":     { zh: "藏语",       native: "བོད་ཡིག" },
+    "kk":     { zh: "哈萨克语",   native: "Қазақша" },
+    "mn":     { zh: "蒙古语",     native: "Монгол" },
+    "ug":     { zh: "维吾尔语",   native: "ئۇيغۇرچە" },
+  };
+
+  /* ------------------------------------------------------------------ *
+   * 「这段文字板端**渲染得出来**吗」
+   *
+   * ⚠️ **为什么需要它**：板端字体覆盖有限 —— 泰语 / 天城文（印地语）/
+   * 藏文 / 高棉文 / 缅甸文 / 古吉拉特文 / 泰卢固文 / 泰米尔文 /
+   * 孟加拉文 **都没有字体** ⇒ 那些本族文字会渲染成**豆腐块**（□）。
+   * （右上角「简体中文」下拉里的「印地语 / 泰语」现在就是这样 —— 实测
+   * 截过图：हिन्दी 和 ไทย 都是一排方框。）
+   *
+   * 判据：把字符画到 canvas 上，跟「**一定渲染不出来**的字符」
+   * （U+FFFF，非字符位 ⇒ 所有字体都只能给 .notdef）逐像素比 —— 一模
+   * 一样就是豆腐块。
+   *
+   * ⚠️ 不用「量宽度」：豆腐块和正常字符可能同宽（都是方块）⇒ 量宽度
+   * 判不出来。**必须比像素**。
+   * ------------------------------------------------------------------ */
+  const _renderableCache = new Map();
+  let _renderCanvas = null;
+
+  function _canRender(text) {
+    if (!text) return false;
+    if (_renderableCache.has(text)) return _renderableCache.get(text);
+    let ok = true;
+    try {
+      if (!_renderCanvas) {
+        _renderCanvas = document.createElement("canvas");
+        _renderCanvas.width = 40;
+        _renderCanvas.height = 40;
+      }
+      const ctx = _renderCanvas.getContext("2d");
+      if (!ctx) throw new Error("no 2d context");
+      const cs = getComputedStyle(document.body);
+      const font = (cs.fontSize || "16px") + " " + (cs.fontFamily || "sans-serif");
+      const draw = (ch) => {
+        ctx.clearRect(0, 0, 40, 40);
+        ctx.fillStyle = "#000";
+        ctx.textBaseline = "top";
+        ctx.font = font;
+        ctx.fillText(ch, 0, 0);
+        return ctx.getImageData(0, 0, 40, 40).data;
+      };
+      const notdef = draw("\uFFFF");
+      for (const ch of text) {
+        if (ch === " " || ch === "\u00a0") continue;
+        const px = draw(ch);
+        let same = true;
+        for (let i = 3; i < px.length; i += 4) {
+          if (px[i] !== notdef[i]) { same = false; break; }
+        }
+        if (same) { ok = false; break; }
+      }
+    } catch (e) {
+      // canvas 不可用（老浏览器 / 隐私模式）⇒ 保守按「能渲染」处理
+      ok = true;
+    }
+    _renderableCache.set(text, ok);
+    return ok;
+  }
+
+
+  /* ------------------------------------------------------------------ *
    * 「拖动进度条 → 识别跟过去」的三个参数
    * ------------------------------------------------------------------ */
 
@@ -2038,6 +2146,25 @@ const Qwen3Asr = {
     }
   },
 
+  /**
+   * 一个目标语言的**显示文案**：「中文名 本族名」。
+   *
+   * 跟右上角「简体中文」下拉一个排法（左边中文名、右边本族名）——
+   * 那边是两个并排的 span，这边是原生 ``<select>`` ⇒ 只能拼成一段文字。
+   *
+   * ⚠️ **本族名渲染不出来时退回英文名** —— 板端没有泰语 / 天城文 / 藏文
+   * 那些字体 ⇒ 本族文字是**豆腐块**（右上角那个下拉里的「印地语 / 泰语」
+   * 现在就是一排方框）。⇒ 「泰语 Thai」比「泰语 ไทย（一排方框）」好看。
+   */
+  _trLangLabel(it) {
+    const code = (it && it.id) || "";
+    const en = (it && it.name) || code;
+    const lab = TR_LANG_LABELS[code];
+    if (!lab) return en;
+    const native = _canRender(lab.native) ? lab.native : en;
+    return lab.zh + " " + native;
+  },
+
   async _trLoadLanguages() {
     const sel = document.getElementById("asr-tr-target");
     if (!sel || this._tr.loaded) return;
@@ -2046,7 +2173,7 @@ const Qwen3Asr = {
     items.forEach((it) => {
       const opt = document.createElement("option");
       opt.value = it.id || "";
-      opt.textContent = it.name || it.id || "";
+      opt.textContent = this._trLangLabel(it);
       sel.appendChild(opt);
     });
     sel.value = this._tr.targetLang;
@@ -2158,6 +2285,8 @@ const Qwen3Asr = {
     const ids = items.map((it) => it.id);
 
     sel.innerHTML = "";
+    // ⚠️ **「不翻译」必须是第一项**（也是默认项）—— 它是哨兵值
+    // （``off``），用户明确说「不要翻译」⇒ 不能被卡片当前状态盖掉。
     const off = document.createElement("option");
     off.value = "off";
     off.textContent = "不翻译";
@@ -2165,7 +2294,7 @@ const Qwen3Asr = {
     items.forEach((it) => {
       const opt = document.createElement("option");
       opt.value = it.id || "";
-      opt.textContent = it.name || it.id || "";
+      opt.textContent = this._trLangLabel(it);
       sel.appendChild(opt);
     });
 
