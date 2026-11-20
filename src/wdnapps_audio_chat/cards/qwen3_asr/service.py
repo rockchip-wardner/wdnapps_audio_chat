@@ -289,6 +289,17 @@ _TR_MAX_SENTENCE_CHARS = 60
 #: 同一路径的多次识别之间也不会撞。
 _TR_FILE_INDEX_BASE = 100000
 
+#: **行级译文的序号基准**（视频来源的双语字幕）。
+#:
+#: ⚠️ 行级翻译是**前端驱动**的（前端才知道行是怎么排的，见
+#: ``api.py::post_translate_line``）⇒ 序号由前端给（``seq``），后端只
+#: 加上这个基准 ⇒ 和句子级的序号区间**不撞**（前端是按序号覆盖同一条
+#: 译文的，撞了就互相顶掉）。
+#:
+#: ⇒ 取一个大得离谱的基准：句级是 ``请求号 × 100000 + 句序号``，请求号
+#: 会一直涨 ⇒ 行级用 ``10^9`` 起，短时间内不可能撞上。
+_TR_LINE_INDEX_BASE = 1000000000
+
 
 def _ascii_sentence_end(text: str, dot: int) -> int:
     """英文句点 ``.``（在 ``text[dot]``）算不算句末？算的话返回切点。
@@ -1007,6 +1018,7 @@ class _AsrManager:
         start_sec: float = 0.0,
         source_info: Optional[Dict[str, Any]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        tr_mode: str = "sentence",
     ) -> int:
         """发起一次**流式**识别（文件 / 视频）。返回 request_id。
 
@@ -1048,6 +1060,19 @@ class _AsrManager:
         订阅者，而订阅队列属于主循环 ⇒ 译文只能从主循环发出去。
         ⚠️ 文件识别自己跑在另一个线程的另一个循环里（``asyncio.run``），
         那个循环识别一结束就关掉 ⇒ 不能拿它广播。
+
+        ``tr_mode`` —— **翻译的单位**：
+
+        * ``"sentence"``（默认）—— 后端自己按标点断句、逐句送去翻译。
+          音频文件用这个（没有字幕行，译文只出现在「译文面板」里）。
+        * ``"line"`` —— **不做**句子级翻译；译文由**前端**逐行来要
+          （见 ``api.py::post_translate_line``）。
+
+          ⚠️ 为什么视频必须是这个：字幕的**显示单位是「行」**，译文必须
+          **逐行**跟着（YouTube 的 cue 对 cue）。句子级做不到 —— 一句跨
+          3 行时译文只挂得上最后那行，中间两行光秃秃，而且译文永远慢
+          半拍（实测字幕行 ~1.5 s 一行、译文 3~9 s 一句 ⇒ 看着像「不是
+          实时翻译」）。
         """
         with self._lock:
             if self._state == self.STATE_RUNNING:
@@ -1078,12 +1103,17 @@ class _AsrManager:
             # 序号落在不同区间（见 :data:`_TR_FILE_INDEX_BASE`）⇒ 不会和
             # 上一次识别的译文撞车（前端是**按序号覆盖**同一条译文的）。
             self._splitter.reset_request()
-            self._tr_ctx = {
-                "rid": rid,
-                "stream_id": "file-{}".format(rid),
-                "base": rid * _TR_FILE_INDEX_BASE,
-                "loop": loop,
-            }
+            # ⚠️ ``tr_mode == "line"`` ⇒ **不建**句子级翻译上下文 ⇒ 后端
+            # 不会自己断句、不会送翻译（译文由前端逐行来要）。否则两句
+            # 译文会**同时**挂在同一行上（句子级 + 行级各一份）。
+            self._tr_ctx = None
+            if tr_mode != "line":
+                self._tr_ctx = {
+                    "rid": rid,
+                    "stream_id": "file-{}".format(rid),
+                    "base": rid * _TR_FILE_INDEX_BASE,
+                    "loop": loop,
+                }
             # 新的一段 ⇒ 时间表归零（段内坐标）
             self._tr_time_reset()
 

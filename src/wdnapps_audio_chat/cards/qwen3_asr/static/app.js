@@ -430,6 +430,27 @@ const Qwen3Asr = {
   _trTimedCache: null,
   _trTimedVer: -1,
 
+  /**
+   * **翻译的单位**：``"sentence"``（后端按标点断句）还是 ``"line"``
+   * （前端逐行来要译文）。
+   *
+   * ⚠️ 视频来源必须是 ``"line"`` —— 字幕的**显示单位是「行」**，译文必须
+   * **逐行**跟着（YouTube 的 cue 对 cue）。句子级做不到：一句跨 3 行时
+   * 译文只挂得上最后那行，中间两行光秃秃，而且译文永远慢半拍（实测
+   * 字幕行 ~1.5 s 一行、译文 3~9 s 一句 ⇒ 看着像「不是实时翻译」）。
+   */
+  _trMode: "sentence",
+  /** 行级翻译：给每行编的序号（前端自己编，后端原样带回）。 */
+  _trLineSeq: 0,
+  /** 槽位号 → 已经要过的**文本**（文本没变就不重翻）。 */
+  _trLineReq: new Map(),
+  /** 行序号 → 槽位号（译文回来时据此对回是哪一行）。 */
+  _trLineIdBySeq: new Map(),
+  /** 槽位号 → 这一行当前的请求 {seq, item, text}。 */
+  _trLineSlot: new Map(),
+  /** 槽位号 → 译文（**按槽位对**，不按行 id —— 文本改了行 id 就变了）。 */
+  _trLineTr: new Map(),
+
   init() {
     if (this._inited) return;
     this._inited = true;
@@ -492,6 +513,9 @@ const Qwen3Asr = {
         // 留在 ``_tr.items`` 里 ⇒ 字幕会继续挂着旧译文（用户明明关了
         // 「实时翻译」）。
         this._tr.items = [];
+        this._trLineTr.clear();   // 行级译文也一样
+        this._trLineReq.clear();  // 重新打开时那几行要**重新**要一次
+        this._trLineSlot.clear();
         this._trVer++;   // 版本号 +1 ⇒ 缓存失效
         this._trRender();
       }
@@ -1004,6 +1028,9 @@ const Qwen3Asr = {
       }
       fd.append("start_sec", String(containerSec));
       fd.append("append", "true");
+      // ⚠️ **翻译的单位**要跟第一次一致（见 ``start()``）—— 不然这一段
+      // 会跑句子级翻译 ⇒ 同一批里两种译文混在一起。
+      if (this._trMode === "line") fd.append("translate_mode", "line");
       const r = await fetch(API_PREFIX + "/qwen3-asr/transcribe", {
         method: "POST", body: fd,
       });
@@ -2165,6 +2192,125 @@ const Qwen3Asr = {
     return lab.zh + " " + native;
   },
 
+  /**
+   * 行级翻译：把**定稿的行**送去翻译。
+   *
+   * 「定稿」= 这一行的文字**不会再变了** —— 后面还有内容 ⇒ 它不会再长。
+   * ⚠️ **最后一行**还可能在长（模型还在往里加词）⇒ 等它定稿。
+   *
+   * ⚠️ **为什么不等「整句」**：句子的边界是**后端**按标点切的，字幕行的
+   * 边界是**前端**按显示宽度切的 —— 两者对不上。等句定稿 ⇒ 译文要等
+   * 3~9 s ⇒ 字幕已经翻过去两三行了 ⇒ 看着像「不是实时翻译」。
+   *
+   * ``force`` —— 识别结束（``done``）时传 true：那时最后一行也定稿了。
+   */
+  _trRequestLines(force) {
+    if (this._trMode !== "line") return;
+    if (!this._tr.enabled) return;
+    const rounds = this.rounds || [];
+    if (!rounds.length) return;
+    const lines = this._buildSubTimeline().lines;
+    if (!lines.length) return;
+    // 每个 epoch 的最后一行 = 还「在长」的那行 ⇒ 其余的都定稿了
+    const lastOfEpoch = new Map();
+    for (let i = 0; i < lines.length; i++) {
+      lastOfEpoch.set(this._trEpochOf(lines[i]), i);
+    }
+    // ⚠️ **还在长的 epoch** = 轮次里**最后**那个。拖动重开识别会追加新的
+    // epoch ⇒ 老那个已经结束 ⇒ 它的末行也定稿了（不然那一行永远没译文）。
+    const lastEpochIdx = this._splitEpochs(rounds).length - 1;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      if (!ln || !ln.id) continue;
+      const slot = this._trSlotOf(ln);
+      const text = (ln.words || []).map((w) => w.text).join("").trim();
+      if (!text) continue;
+      // ⚠️ 文本**没变** ⇒ 不用重翻（行 id 变了但只是标点/空格 ⇒ 译文一样）
+      const prev = this._trLineReq.get(slot);
+      if (prev !== undefined && this._trNormText(prev) === this._trNormText(text)) {
+        continue;
+      }
+      const ep = this._trEpochOf(ln);
+      const epIdx = parseInt(ep, 10);
+      // 定稿？—— ① 它的 epoch 里它后面还有行；② 它的 epoch 已经结束
+      // （后面还有别的 epoch 在长）；③ 识别结束了
+      const closed = force
+        || (lastOfEpoch.get(ep) > i)
+        || (!isNaN(epIdx) && epIdx < lastEpochIdx);
+      if (!closed) continue;
+      this._trLineReq.set(slot, text);
+      this._trRequestLine(ln, slot, text);
+    }
+  },
+
+  /** 一行属于哪个 epoch（行 id 的第一段就是 epoch 下标）。 */
+  _trEpochOf(ln) {
+    const s = (ln && ln.id) || "";
+    const i = s.indexOf(":");
+    return i < 0 ? s : s.slice(0, i);
+  },
+
+  /**
+   * 一行的**槽位号** = ``epoch 下标 : 段内行号``（行 id 的前两段）。
+   *
+   * ⚠️ **不用整个行 id 当钥匙** —— 行 id 里含**文本**和**时间** ⇒ 模型
+   * 改一个词、或者排版挪一下时间，行 id 就变了 ⇒ 译文会「对不上行」
+   * （行上没了译文）⇒ 还得重翻一遍（实测 7 行发了 11 次请求）。
+   *
+   * ⇒ 用**槽位号**：文本改了它也不变 ⇒ 译文一直挂在那儿 ✓。
+   */
+  _trSlotOf(ln) {
+    const s = (ln && ln.id) || "";
+    const i = s.indexOf(":");
+    if (i < 0) return s;
+    const j = s.indexOf(":", i + 1);
+    return j < 0 ? s : s.slice(0, j);
+  },
+
+  /** 比文本用：去掉空白和标点（模型改标点不该触发重翻）。 */
+  _trNormText(text) {
+    return String(text || "").replace(/[\s.,!?;:'"、，。！？；：]/g, "");
+  },
+
+  /**
+   * 丢掉一条行级译文（模型改词了 ⇒ 旧译文是**旧文本**的）。
+   *
+   * ⚠️ 不丢的话「译文面板」里会**同时**留着旧版和新版 ⇒ 同一行出现两条
+   * 译文（实测：7 行翻了 11 次，面板里堆了 11 条）。
+   */
+  _trDropLineItem(item) {
+    if (!item) return;
+    const pos = this._tr.items.findIndex((x) => x.index === item.index);
+    if (pos >= 0) this._tr.items.splice(pos, 1);
+    this._trVer++;
+  },
+
+  /** 要一行字幕的译文（走后端 → 译文走 WS 回来）。 */
+  _trRequestLine(ln, slot, text) {
+    if (!text) return;
+    const seq = this._trLineSeq++;
+    this._trLineIdBySeq.set(seq, slot);
+    // ⚠️ 这一行**之前**要过译文 ⇒ 旧的作废（模型改词了 ⇒ 旧译文是旧文本的）
+    const old = this._trLineSlot.get(slot);
+    if (old && old.item) this._trDropLineItem(old.item);
+    this._trLineSlot.set(slot, { seq: seq, item: null, text: text });
+    const body = {
+      text: text,
+      start_sec: ln.start,
+      end_sec: ln.end,
+      lang: (this.snapshot && this.snapshot.language) || "",
+      seq: seq,
+    };
+    fetch(API_PREFIX + "/qwen3-asr/translate/line", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch((e) => {
+      // 翻译是**旁路** —— 请求失败不许打断识别
+      console.warn("[qwen3-asr] 行级翻译请求失败:", e);
+    });
+  },
+
   async _trLoadLanguages() {
     const sel = document.getElementById("asr-tr-target");
     if (!sel || this._tr.loaded) return;
@@ -2449,9 +2595,18 @@ const Qwen3Asr = {
    * （前端，YouTube 式排版）⇒ 两者的切点不一定重合 ⇒ 靠**时间**对齐最稳。
    */
   _trItemsForLine(lines, i) {
+    const ln = lines[i];
+    if (!ln) return [];
+    // ⚠️ **行级**（视频来源）⇒ 直接按**槽位号**对 —— 译文就是这一行的
+    // 译文，**一一对应**。不用时间窗口（行的时间会随排版微调，对不上）。
+    if (this._trMode === "line") {
+      const it = this._trLineTr.get(this._trSlotOf(ln));
+      if (!it) return [];
+      if (it.status && it.status !== "done") return [];
+      return [it];
+    }
     const timed = this._trTimedSorted();
     if (!timed.length || i < 0 || i >= lines.length) return [];
-    const ln = lines[i];
     // 本行的**显示窗口** = [本行开始, 下一行开始)
     const nextStart = (i + 1 < lines.length) ? lines[i + 1].start : Infinity;
     // 第一个 end_sec >= 本行开始的（二分）
@@ -3236,6 +3391,19 @@ const Qwen3Asr = {
     this._tr.items = [];
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
+    // ⚠️ **翻译的单位** —— 视频 ⇒ 逐行；音频文件 ⇒ 逐句。
+    //
+    // ⚠️ 视频必须是「逐行」：字幕的显示单位是「行」，译文必须**逐行**跟着
+    // （YouTube 的 cue 对 cue）。句子级做不到 —— 一句跨 3 行时译文只挂得
+    // 上最后那行，中间两行光秃秃，而且译文永远慢半拍 ⇒ 看着像「不是实时
+    // 翻译」。
+    this._trMode = (this._source === "video") ? "line" : "sentence";
+    // 新的一批 ⇒ 行级翻译的记账也归零（已请求的行 / 行号 / 行译文）
+    this._trLineSeq = 0;
+    this._trLineReq.clear();
+    this._trLineIdBySeq.clear();
+    this._trLineSlot.clear();
+    this._trLineTr.clear();
     // 记下这批轮次来自**哪个来源** —— 视频字幕靠它判断「该不该渲染」
     // （否则会拿上一来源的轮次画到当前视频上，见 _onSourceChanged）。
     this._roundsSource = this._source;
@@ -3255,6 +3423,10 @@ const Qwen3Asr = {
       } else {
         fd.append("path", this._path);
       }
+      // ⚠️ **翻译的单位** —— 视频 ⇒ **逐行**（前端逐行来要译文，译文
+      // 跟那一行走 ⇒ 节奏和字幕一致）；音频文件 ⇒ 逐句（没有字幕行，
+      // 译文只出现在「译文面板」里）。
+      if (this._trMode === "line") fd.append("translate_mode", "line");
       // 不带 online_* 参数 → SDK 用 ONLINE_*_DEFAULT（= C demo 常量）
 
       const r = await fetch(API_PREFIX + "/qwen3-asr/transcribe", {
@@ -3343,6 +3515,9 @@ const Qwen3Asr = {
     this._renderLive("", "");
     // 译文也一起清（服务端 /reset 也会清统计）
     this._tr.items = [];
+    this._trLineTr.clear();   // 行级译文（视频来源）也一起清
+    this._trLineReq.clear();
+    this._trLineSlot.clear();
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     this._trSyncUi();
@@ -3368,6 +3543,9 @@ const Qwen3Asr = {
     // 服务端那边也做了同一件事的另一半：``/reset`` 会把翻译队列的**代数**
     // +1 ⇒ 之后才回来的译文**根本不会推过来**。
     this._tr.items = [];
+    this._trLineTr.clear();   // 行级译文（视频来源）也一起清
+    this._trLineReq.clear();
+    this._trLineSlot.clear();
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     this._trSyncUi();
@@ -3543,6 +3721,9 @@ const Qwen3Asr = {
         this._renderLive(msg.committed || "", msg.unfixed || "");
         this._renderRounds();
         this._renderVideoSubtitle();
+        // ⚠️ **行级翻译**：时间轴长了一行 ⇒ 之前那行**定稿**了 ⇒ 该要
+        // 它的译文了（译文跟那一行走 ⇒ 节奏和字幕一致）。
+        this._trRequestLines(false);
         const empty = document.getElementById("asr-empty");
         if (empty) empty.classList.add("hidden");
         if (this.snapshot) {
@@ -3591,12 +3772,34 @@ const Qwen3Asr = {
             ? null : Number(msg.start_sec),
           end_sec: (msg.end_sec === undefined || msg.end_sec === null)
             ? null : Number(msg.end_sec),
+          // ⚠️ **行级**翻译 ⇒ 前端给这一行编的序号（原样带回）。
+          // 句子级翻译没有这个（``null``）。
+          seq: (msg.seq === undefined || msg.seq === null)
+            ? null : Number(msg.seq),
         };
+        // ⚠️ **行级** ⇒ 译文挂到**那一行**上（一一对应）。
+        //
+        // ⚠️ 按**槽位号**对（``epoch:行号``），不按行 id —— 行 id 里含文本
+        // 和时间 ⇒ 模型改个词就变了 ⇒ 译文会「对不上行」。
+        let expired = false;
+        if (it.seq !== null && this._trMode === "line") {
+          const slot = this._trLineIdBySeq.get(it.seq);
+          const info = slot ? this._trLineSlot.get(slot) : null;
+          // ⚠️ 这一行**已经又改过**了 ⇒ 这条是**过期**的译文 ⇒ 丢掉
+          if (slot && info && info.seq === it.seq) {
+            info.item = it;
+            this._trLineTr.set(slot, it);
+          } else {
+            expired = true;
+          }
+        }
         // ⚠️ **按句序号覆盖**，不是 append —— 翻译是**乱序完成**的
         //（多实例并行），append 会让字幕顺序乱掉。
-        const pos = this._tr.items.findIndex((x) => x.index === it.index);
-        if (pos >= 0) this._tr.items[pos] = it;
-        else this._tr.items.push(it);
+        if (!expired) {
+          const pos = this._tr.items.findIndex((x) => x.index === it.index);
+          if (pos >= 0) this._tr.items[pos] = it;
+          else this._tr.items.push(it);
+        }
         this._tr.items.sort((a, b) => a.index - b.index);
         // 版本号 +1 ⇒ 「按时间挂译文」的缓存失效（字幕下一帧就会重画）
         this._trVer++;
@@ -3610,6 +3813,9 @@ const Qwen3Asr = {
       case "done": {
         this._renderLive(msg.text || "", "");
         this._renderRounds();
+        // ⚠️ 识别结束 ⇒ **最后一行**也定稿了 ⇒ 把它要过来（不然它永远
+        // 没有译文）。
+        this._trRequestLines(true);
         const hint = document.getElementById("asr-hint");
         if (hint) {
           // 音频时长 + 耗时都报出来 —— 用户能看出「多长的音频被识别了」

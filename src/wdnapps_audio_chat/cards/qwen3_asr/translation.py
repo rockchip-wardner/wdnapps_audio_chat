@@ -74,12 +74,13 @@ class _Item:
     """队列里的一项：一句待译的话。"""
 
     __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at",
-                 "gen", "start_sec", "end_sec")
+                 "gen", "start_sec", "end_sec", "seq")
 
     def __init__(self, index: int, text: str, lang: str, stream_id: str,
                  loop: Any, enqueued_at: float, gen: int = 0,
                  start_sec: Optional[float] = None,
-                 end_sec: Optional[float] = None):
+                 end_sec: Optional[float] = None,
+                 seq: Optional[int] = None):
         self.index = index
         self.text = text
         self.lang = lang
@@ -95,6 +96,9 @@ class _Item:
         #: 字幕显示双语）。
         self.start_sec = start_sec
         self.end_sec = end_sec
+        #: **行级**翻译时前端给这一行编的序号（原样带回，前端据此对回
+        #: 是哪一行）。句子级翻译没有这个（``None``）。
+        self.seq = seq
 
 
 class TranslationService:
@@ -178,12 +182,16 @@ class TranslationService:
     # ------------------------------------------------------------------ #
     def submit(self, *, index: int, text: str, lang: str, stream_id: str,
                loop: Any, start_sec: Optional[float] = None,
-               end_sec: Optional[float] = None) -> None:
+               end_sec: Optional[float] = None,
+               seq: Optional[int] = None) -> None:
         """送来一句待译的话。
 
         ``start_sec`` / ``end_sec`` —— 这句话的**音频时间范围**（可选）。
         文件 / 视频路径会给 ⇒ 前端靠它把译文挂到对应的**字幕行**上
         （画面字幕显示双语，译文跟着字幕的节奏走）。
+
+        ``seq`` —— **行级**翻译时前端给这一行编的序号（原样带回）。
+        句子级翻译不传（``None``）。
 
         ⚠️ **绝不抛异常** —— 翻译出问题不许影响识别。
         """
@@ -194,7 +202,7 @@ class TranslationService:
             self._submitted += 1
             gen = self._gen
         item = _Item(index, text, lang, stream_id, loop, time.monotonic(),
-                     gen, start_sec, end_sec)
+                     gen, start_sec, end_sec, seq)
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -340,6 +348,9 @@ class TranslationService:
             payload["start_sec"] = item.start_sec
         if item.end_sec is not None:
             payload["end_sec"] = item.end_sec
+        # ⚠️ **行级**翻译 ⇒ 把前端的行序号原样带回（前端据此对回是哪一行）
+        if item.seq is not None:
+            payload["seq"] = item.seq
 
         def _emit() -> None:
             try:

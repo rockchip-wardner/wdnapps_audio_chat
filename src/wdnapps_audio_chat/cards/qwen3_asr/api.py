@@ -82,6 +82,7 @@ from wdnapps_audio_chat.cards.qwen3_asr.board_mic import (DEFAULT_DEVICE,
                                                           get_board_mic)
 from wdnapps_audio_chat.cards.qwen3_asr.service import (_LIVE_ENDPOINT_CONFIG,
                                                         _LIVE_SESSION_TTL_SEC,
+                                                        _TR_LINE_INDEX_BASE,
                                                         get_asr_service,
                                                         get_live_asr_service)
 from app.core.audio.capture import (CAPTURE_N_CHANNELS, CAPTURE_SAMPLE_RATE,
@@ -330,6 +331,7 @@ async def post_asr_transcribe(
     rollback_rounds: Optional[int] = Form(None),
     start_sec: Optional[float] = Form(None),
     append: Optional[bool] = Form(None),
+    translate_mode: Optional[str] = Form(None),
 ) -> dict:
     """发起一次流式识别。
 
@@ -353,6 +355,13 @@ async def post_asr_transcribe(
 
     ``append`` —— **保留**已有的轮次（而不是清空）。拖动后重开识别时
     用它：前面识别过的部分要留在字幕时间轴上。
+
+    ``translate_mode`` —— **翻译的单位**：
+
+    * ``"sentence"``（默认）—— 后端按标点断句、逐句翻译（音频文件）。
+    * ``"line"`` —— 后端**不**做句子级翻译；译文由前端逐行来要
+      （``POST /translate/line``）。视频来源用这个：字幕的显示单位是
+      「行」，译文必须逐行跟着。
     """
     if file is not None and file.filename:
         raw = await file.read()
@@ -405,6 +414,10 @@ async def post_asr_transcribe(
         rid = svc.transcribe_stream(_factory, options=options,
                                      append=bool(append), start_sec=start_at,
                                      source_info=source_info,
+                                     # ⚠️ **翻译的单位** —— ``"line"`` = 前端逐行
+                                     # 来要译文（视频来源：字幕逐行推进，译文
+                                     # 必须逐行跟着，见 ``post_translate_line``）。
+                                     tr_mode=(translate_mode or "sentence"),
                                      # ⚠️ **主循环**：译文要广播给 WS 订阅者，
                                      # 而订阅队列属于主循环 ⇒ 必须把它传下去
                                      # （识别自己跑在另一个线程的另一个循环里，
@@ -715,6 +728,30 @@ class TranslateEnablePayload(BaseModel):
     npu_index: Optional[int] = Field(default=None, ge=0, le=15)
 
 
+class TranslateLinePayload(BaseModel):
+    """翻**一整行字幕**的请求。
+
+    ⚠️ **为什么要有这个端点**：字幕的**显示单位是「行」**，不是「句」——
+    字幕逐行推进，译文必须**逐行**跟着（YouTube 的 cue 对 cue）。
+    句子级翻译做不到：一句跨 3 行时，译文只挂得上最后那行 ⇒ 中间两行
+    光秃秃，而且译文永远慢半拍（实测：字幕行 1.5 s 一行，译文 3~9 s 一句）。
+
+    ⇒ 断句在**前端**（只有前端知道行是怎么排的）⇒ 翻译单位也得由前端
+    驱动 ⇒ 这个端点就是前端来要「这一行的译文」。
+    """
+
+    model_config = {"extra": "ignore"}
+    #: 这一行的原文（**整行**，不是碎片）
+    text: str = Field(min_length=1, max_length=600)
+    #: 这一行在音频里的时间范围（秒，音轨相对时间）
+    start_sec: Optional[float] = None
+    end_sec: Optional[float] = None
+    #: 源语（ASR 报的语言名，如 ``English``）
+    lang: Optional[str] = None
+    #: 前端给这一行编的序号 —— 回包原样带回，前端据此对回是哪一行
+    seq: Optional[int] = None
+
+
 @router.get("/translate/status")
 def get_translate_status() -> dict:
     """译文状态：开关 / 目标语言 / 模型就绪情况 / 统计。"""
@@ -752,6 +789,45 @@ def post_translate_settings(payload: TranslateSettingsPayload) -> dict:
     svc = get_translation_service()
     svc.configure(enabled=payload.enabled, target_lang=payload.target_lang)
     return svc.status()
+
+
+@router.post("/translate/line")
+async def post_translate_line(payload: TranslateLinePayload) -> dict:
+    """翻**一整行字幕**（视频来源的双语字幕用）。
+
+    ⚠️ 译文**不在这条响应里** —— 它走**同一条 WS**（``translation`` 帧），
+    和句子级翻译一模一样 ⇒ 前端只有一条通道要处理。
+
+    ⚠️ 源语没给 ⇒ 用 ASR 当前的语种（跟句子级翻译一个口径）。
+    """
+    import asyncio
+
+    from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        get_translation_service,
+    )
+
+    lang = (payload.lang or "").strip()
+    if not lang:
+        from wdnapps_audio_chat.cards.qwen3_asr.service import get_asr_service
+        lang = str(get_asr_service().snapshot().get("language") or "").strip()
+    if not lang:
+        raise HTTPException(status_code=400, detail="不知道源语，没法翻")
+
+    seq = int(payload.seq) if payload.seq is not None else 0
+    svc = get_translation_service()
+    if not svc.status().get("enabled"):
+        return {"ok": False, "skipped": "翻译没开"}
+    svc.submit(
+        index=_TR_LINE_INDEX_BASE + seq,
+        text=payload.text,
+        lang=lang,
+        stream_id="line",
+        loop=asyncio.get_running_loop(),
+        start_sec=payload.start_sec,
+        end_sec=payload.end_sec,
+        seq=seq,
+    )
+    return {"ok": True, "seq": seq}
 
 
 @router.post("/translate/enable")
