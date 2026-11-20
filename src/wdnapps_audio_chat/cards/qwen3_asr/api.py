@@ -82,6 +82,7 @@ from wdnapps_audio_chat.cards.qwen3_asr.board_mic import (DEFAULT_DEVICE,
                                                           get_board_mic)
 from wdnapps_audio_chat.cards.qwen3_asr.service import (_LIVE_ENDPOINT_CONFIG,
                                                         _LIVE_SESSION_TTL_SEC,
+                                                        _LOOKBACK_SEC,
                                                         _TR_LINE_INDEX_BASE,
                                                         get_asr_service,
                                                         get_live_asr_service)
@@ -353,6 +354,17 @@ async def post_asr_transcribe(
 
     svc = get_asr_service()
     start_at = max(0.0, float(start_sec or 0.0))
+    # ⚠️ **回看**：拖动进度条后重开识别时，新会话是**零上下文**的 ⇒
+    #    模型会**重新判语种**（中文音频被判成 English / Russian）⇒
+    #    头几轮的假设文本是外文（实测冒出过「Мыщение」）⇒ 那一段的
+    #    译文也会跟着失败（源语种认不出来）。
+    #
+    # ⇒ **多解前面一段**当上下文（``_LOOKBACK_SEC`` 秒），那一段是
+    # **纯上下文**（不参与停滞 / 停顿检测、句子级翻译也会跳过它）。
+    #
+    # ⚠️ 时间戳仍然是**绝对**音频时间 ⇒ 前端的时间轴不用改。
+    decode_at = max(0.0, start_at - _LOOKBACK_SEC)
+    lookback_sec = start_at - decode_at
 
     # 这批轮次**归属的来源** —— 服务端记着，页面刷新后前端靠它把轮次
     # 还原到正确的来源页签（见 ``GET /rounds`` 的 ``source``）。
@@ -368,11 +380,12 @@ async def post_asr_transcribe(
     def _factory():
         """惰性解码器 —— 真正的解码在 worker 线程里做（阻塞 I/O）。"""
         return iter_media_pcm(source, filename=name, chunk_seconds=1.0,
-                              start_sec=start_at)
+                              start_sec=decode_at)
 
     try:
         rid = svc.transcribe_stream(_factory, options=options,
                                      append=bool(append), start_sec=start_at,
+                                     lookback_sec=lookback_sec,
                                      source_info=source_info,
                                      # ⚠️ **翻译的单位** —— ``"line"`` = 前端逐行
                                      # 来要译文（视频来源：字幕逐行推进，译文

@@ -119,6 +119,12 @@ _FILE_SESSION_MAX_SEC = 60.0
 #: 取 8 轮（8 秒）：跳过前 4 轮的「冷启动」窗口（前 4 轮本来就不提交，
 #: 见 C++ 的 ``remaining_rollback_rounds``），又不至于让正常停顿
 #: （几秒的沉默）误触发。
+#:
+#: ⚠️ **「还没确认过任何东西」不算停滞**（v0.34 实测修正）：热身期实测要
+#: 到**第 10 轮**才第一次提交 ⇒ 按「连续 8 轮没增长」判，**每段开头都会
+#: 误切一刀**（实测中文《圆桌派》每个会话都在 10.1 s 处被切掉），上下文
+#: 白丢、还要再热身一轮。⇒ 「committed 还是空」时**不计轮数**；真正的自锁
+#: 是「**确认过东西之后**停止增长」。
 _STALL_ROUNDS_LIMIT = 8
 
 #: **停顿检测阈值**：连续多少轮「模型当前的假设文本**完全没变**」算说话停顿。
@@ -165,6 +171,39 @@ _STALL_ROUNDS_LIMIT = 8
 #: 60 s 硬上限上（见 :data:`_FILE_SESSION_MAX_SEC`），仍会有碎片 ——
 #: 要根治得靠「回看（look-back）」，见 AGENTS.md。
 _PAUSE_ROUNDS_LIMIT = 2
+
+#: **回看窗口**（秒）：切会话时把**最近这么多秒**的音频再喂一遍给新会话。
+#:
+#: 为什么必须回看
+#: --------------
+#: SDK 的增量会话里，**音频历史就是上下文**（``asr.py:1043`` 的
+#: ``prefix + audio_embed_history + postfix + committed_segment``）。
+#: 换 ``stream_id`` ⇒ 新会话 ⇒ **音频历史清零** ⇒ 新会话是「零上下文」。
+#:
+#: 零上下文的直接后果（实测，中文音频）：
+#:
+#: * **语种判错** —— 模型每轮都吐 ``language <lang>``（``asr.py:1391``
+#:   保留**最新**的猜测），零上下文时把中文判成 **English** ⇒
+#:   整段输出变成英文（用户报「拖动后全是英文输出」）；
+#: * **文本与音频脱节** —— 没有上下文，模型只能瞎猜 ⇒ 同一句英文重复
+#:   二十多次（用户报「中间有概率出现停滞」）。
+#:
+#: ⇒ 切会话时把末尾的音频**再喂一遍**，新会话就有上下文了：语种判对、
+#: 文本接得上。
+#:
+#: ⚠️ **重复文本不用额外去重** —— 前端的时间轴有重叠守卫
+#: （``app.js::_buildSubTimeline`` 的 ``guardEnd``）⇒ 回看那一段的行
+#: 会被自动丢掉（前端时间轴是**绝对**时间 ⇒ 重叠判定天然成立）。
+#:
+#: ⚠️ **回看的轮次不参与停滞 / 停顿检测** —— 那是在**重放旧音频**，
+#: ``committed`` 的增长不代表「当前音频有新内容」。
+#:
+#: ⚠️ **句子级翻译要跳过回看区间**（``_tr_emit``）—— 回看的文本上一段
+#: 已经翻过一遍，再翻一次就是重复译文。
+#:
+#: 取 10 秒：够模型判准语种（连续语音 8~10 秒足够），代价也小
+#: （RTF≈0.18 ⇒ 一次回看多花 1.8 秒墙钟）。
+_LOOKBACK_SEC = 10.0
 
 #: **自适应静音阈值**：某一秒的 RMS 低于「最近 30 秒电平的中位数 - 本值」
 #: 才算停顿。
@@ -533,6 +572,21 @@ class _AsrManager:
         self._pause_rounds: int = 0
         #: 本轮是否命中停顿（文件主循环消费后即失效）。
         self._pause_hit: bool = False
+        #: **回看区间的结束时刻**（绝对音频时间）。
+        #:
+        #: 两个用途：
+        #:
+        #: * **判定回看轮次** —— ``chunk_start_sec`` 落在它之前的轮次是
+        #:   「重放旧音频」的那几轮 ⇒ 停滞 / 停顿检测**不算**它们；
+        #: * **句子级翻译** —— 完全落在回看区间里的句子**不翻**（上一段
+        #:   已经翻过一遍 ⇒ 再翻就是重复译文）。
+        self._lookback_until_sec: float = -1.0
+        #: 本次识别最前面那段**纯上下文**有多长（秒）—— 拖动后重开识别
+        #: 时，调用方多解了前面一段给它当上下文（见 :data:`_LOOKBACK_SEC`）。
+        self._first_lookback_sec: float = 0.0
+        #: 回看期间**已确认**文本的长度 —— 用来把回看那部分从这一段的
+        #: 最终文本里**砍掉**（否则同一句话在「实时结果」里出现两次）。
+        self._lookback_committed_len: int = 0
 
         #: **切句器**（文件 / 视频路径的实时翻译用，见 :class:`_SentenceSplitter`）。
         self._splitter = _SentenceSplitter()
@@ -909,6 +963,16 @@ class _AsrManager:
         ctx = self._tr_ctx
         if not ctx:
             return
+        # ⚠️ **回看区间里的句子不翻** —— 那是切会话时**重放**的旧音频，
+        # 上一段已经翻过一遍了 ⇒ 再翻一次就是重复译文（见
+        # :data:`_LOOKBACK_SEC`）。
+        start_sec = self._tr_time_at(c0)
+        end_sec = self._tr_time_at(c1)
+        with self._lock:
+            lb_until = self._lookback_until_sec
+        if (end_sec is not None and lb_until >= 0.0
+                and end_sec <= lb_until + 1e-6):
+            return
         try:
             from wdnapps_audio_chat.cards.qwen3_asr.translation import (
                 get_translation_service,
@@ -921,8 +985,8 @@ class _AsrManager:
                 loop=ctx.get("loop"),
                 # ⚠️ **时间**是给「画面字幕显示双语」用的：前端要靠它把
                 # 译文挂到对应的字幕行上（按时间重叠匹配）。
-                start_sec=self._tr_time_at(c0),
-                end_sec=self._tr_time_at(c1),
+                start_sec=start_sec,
+                end_sec=end_sec,
             )
         except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
             _LOG.debug("文件路径送去翻译失败（best-effort）: %s", exc)
@@ -1016,6 +1080,7 @@ class _AsrManager:
         options: Optional[Dict[str, Any]] = None,
         append: bool = False,
         start_sec: float = 0.0,
+        lookback_sec: float = 0.0,
         source_info: Optional[Dict[str, Any]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         tr_mode: str = "sentence",
@@ -1049,6 +1114,17 @@ class _AsrManager:
 
         ``append`` —— **保留**已有的轮次（而不是清空）。拖动后重开识别
         时用它：前面已经识别过的部分要留在字幕时间轴上。
+
+        ``lookback_sec`` —— **回看**（秒）：本次识别最前面这一段是
+        **纯上下文**（调用方多解了它，但不算识别起点）。
+
+        为什么需要它：拖动后重开识别 ⇒ 新会话**零上下文** ⇒ 模型会
+        **重新判语种**（中文被判成 English / Russian）⇒ 头几轮的外文
+        臆测还会让那一段的**译文**失败（源语种认不出来）。
+        ⇒ 调用方（API 层）多解 ``_LOOKBACK_SEC`` 秒喂给它当上下文 ✓。
+
+        ⚠️ 这一段**不参与**停滞 / 停顿检测，也不参与句子级翻译
+        （它上一段已经翻过一遍了）—— 见 :data:`_LOOKBACK_SEC`。
 
         ``source_info`` —— 这批轮次归属的来源（见 :attr:`_rounds_source`）：
         ``{"kind": "video"|"audio", "name": ..., "path": ...}``。
@@ -1094,6 +1170,10 @@ class _AsrManager:
             self._stop_reason = ""
             self._drop_frames = False  # 新的一批 → 轮次帧照收
             self._audio_origin_sec = 0.0
+            # 本次识别最前面那段**纯上下文**有多长（秒）—— 拖动后重开
+            # 识别时，调用方多解了前面一段给它当上下文（见
+            # :data:`_LOOKBACK_SEC`）。
+            self._first_lookback_sec = float(lookback_sec or 0.0)
             self._set_state(self.STATE_RUNNING)
             # ---- 实时翻译（文件 / 视频路径）上下文 -------------------- #
             self._main_loop = loop
@@ -1161,6 +1241,13 @@ class _AsrManager:
             self._pause_rounds = 0
             self._last_unfixed = ""
             self._pause_hit = False
+            # ⚠️ **回看状态也要归零** —— 上一条识别留下的「回看区间」会
+            # 让这一条的头几轮被误判成「回看轮次」（按**时间**判定 ⇒
+            # 上一条的区间恰好覆盖这一条的开头）。
+            self._lookback_until_sec = -1.0
+            # 回看期间已确认了多长 —— 用来把回看那部分从最终文本里砍掉
+            # （上一条识别留下的长度会让这一条**开头**被砍掉一截 ✗）。
+            self._lookback_committed_len = 0
         try:
             model_id, session = self._select_session()
         except RuntimeError as e:
@@ -1292,6 +1379,14 @@ class _AsrManager:
         src_channels = CAPTURE_N_CHANNELS
         src_width = CAPTURE_SAMPLE_WIDTH
         feed: Optional[PcmFeedBuffer] = None
+        # **回看缓冲**（源格式 PCM）—— 切会话时把最近 ``_LOOKBACK_SEC``
+        # 秒**再喂一遍**给新会话（见 :data:`_LOOKBACK_SEC`）。
+        #
+        # 只存**源格式**（不解码、不重采样）⇒ 切会话时零成本地取出来
+        # 重新切块即可。⚠️ 源格式在**第一个块**到达后才是确定的 ⇒ 那之前
+        # 缓冲是空的（``lb_bps`` 也还是 0）。
+        lb_buf = bytearray()
+        lb_bps = 0
         # 自适应停顿检测 —— 用来把切会话的切口对齐到**说话停顿**。
         #
         # ⚠️ 这个检测器看的是**音频信号**（不是 SDK 会话）→ 电平参照要
@@ -1324,6 +1419,16 @@ class _AsrManager:
                                          else str(raw))
             lang = _valid_language(lang)
             body = (body or "").strip()
+            # ⚠️ **砍掉回看那部分的文本** —— 回看是**重放**旧音频，模型把
+            # 那段又转写了一遍 ⇒ 那段上一段已经说过了 ⇒ 最终文本里不能
+            # 重复（否则「实时结果」里同一句话出现两次）。
+            #
+            # 砍多少：回看期间**已确认**文本的长度（``_lookback_committed_len``
+            #）—— 它就是「这一段会话的开头」在最终文本里的长度 ⇒ 砍掉它
+            # 就正好剩下「回看之后」新识别出来的内容。
+            lb_len = self._lookback_committed_len
+            if lb_len > 0 and body:
+                body = (body[lb_len:] if len(body) > lb_len else "").strip()
             if body:
                 segments.append(body)
             if lang:
@@ -1406,8 +1511,22 @@ class _AsrManager:
               在「这一秒没有新内容」时会让 ``stable_count == 0`` →
               committed 不前进 → 模型输入不变 → 输出不变 → **永久
               自锁**。切一个新会话（音频历史清零）能立刻解开。
+            * ``silence`` —— 说话停顿（切口对齐到停顿处）。
+
+            **新会话带上下文（回看）**
+            --------------------------
+            新会话的音频历史是**空的** ⇒ 模型「零上下文」⇒ 它会**重新判
+            语种**（中文音频被判成 English ⇒ 整段英文输出），文本也和音频
+            脱节（同一句英文重复二十多次）。
+
+            ⇒ 切会话时把最近 :data:`_LOOKBACK_SEC` 秒的音频**再喂一遍**
+            给新会话 ⇒ 新会话有上下文了。
             """
             nonlocal stream_id, epoch, epoch_sec, epoch_origin, feed
+            # ⚠️ **先**把回看状态清零 —— 收尾那次 final 调用会投递**上一段**
+            # 的最后几轮（它们不是回看轮次）。
+            with self._lock:
+                self._lookback_until_sec = -1.0
             await _close_epoch(reason)
             # ⚠️ **这一段到此为止** ⇒ 把剩下的尾巴切出来送去翻译。
             #
@@ -1424,10 +1543,23 @@ class _AsrManager:
             self._splitter.reset_epoch()
             # 换段 ⇒ 时间表也归零（段内坐标，不能跨段用）
             self._tr_time_reset()
+            # ⚠️ 回看的文本长度归零（**在收尾之后** —— 收尾那次 final
+            # 调用还要用它把回看那部分从最终文本里砍掉）。
+            with self._lock:
+                self._lookback_committed_len = 0
             epoch += 1
             stream_id = "file-{}#{}".format(rid, epoch)
-            epoch_origin = audio_sec
-            epoch_sec = 0.0
+            # ⚠️ **回看**：新会话的音频历史是空的 ⇒ 零上下文 ⇒ 语种判错、
+            # 文本脱节 ⇒ 把最近 ``_LOOKBACK_SEC`` 秒**再喂一遍**。
+            #
+            # 时间轴的补偿：新会话的起点要**往前挪**回看窗口那么长
+            # （``epoch_origin = audio_sec - lb_dur``）⇒ 回看那几秒落在
+            # **真实绝对时间**上 ⇒ 前端的时间轴 / 重叠守卫都还成立。
+            lookback = bytes(lb_buf)
+            lb_dur = (len(lookback) / float(lb_bps)) if lb_bps > 0 else 0.0
+            epoch_origin = audio_sec - lb_dur
+            # 会话长度**含**回看（回看也是喂给模型的音频 ⇒ 同样占历史）。
+            epoch_sec = lb_dur
             feed = _new_feed()
             with self._lock:
                 self._stall_rounds = 0
@@ -1436,9 +1568,22 @@ class _AsrManager:
                 self._pause_rounds = 0
                 self._last_unfixed = ""
                 self._pause_hit = False
+            if lookback and lb_dur > 0.0:
+                # ⚠️ **回看的轮次不参与停滞 / 停顿检测** —— 那是在重放旧
+                # 音频，``committed`` 的增长不代表「当前有新内容」。
+                #
+                # 判定用**绝对时间**（``chunk_start_sec < 回看区间终点``，
+                # 见 ``_on_delta``）—— 用轮次编号分不开「请求起点的回看」
+                # 和「轮换时的回看」（两者的轮次编号都从 1 开始）。
+                blocks = list(feed.push(lookback))
+                with self._lock:
+                    self._lookback_until_sec = audio_sec
+                for blk in blocks:
+                    await _submit(blk, final=False)
             _LOG.info(
                 "asr stream epoch rotated: rid=%s epoch=%s reason=%s "
-                "audio_sec=%.1f", rid, epoch, reason, audio_sec)
+                "audio_sec=%.1f lookback=%.1fs", rid, epoch, reason, audio_sec,
+                lb_dur)
 
         for chunk in chunk_factory():
             if self._cancel:
@@ -1469,9 +1614,32 @@ class _AsrManager:
                     _LOG.info(
                         "asr stream start offset: rid=%s container=%.1fs "
                         "audio=%.1fs", rid, container_start_sec, audio_sec)
+                # ⚠️ **请求起点的回看**（拖动后重开识别）：调用方多解了
+                # 前面 ``_first_lookback_sec`` 秒 ⇒ 这一段是**纯上下文**
+                # （不算识别起点，也不参与停滞 / 停顿检测）。
+                #
+                # ⇒ 回看区间的**结束时刻** = 第一个块的音频时刻 + 回看长度
+                # （= 真正开始识别的那一点）。
+                first_lb = float(self._first_lookback_sec or 0.0)
+                if first_lb > 0.0:
+                    with self._lock:
+                        self._lookback_until_sec = audio_sec + first_lb
+                    _LOG.info(
+                        "asr stream lookback: rid=%s from=%.1fs until=%.1fs",
+                        rid, audio_sec, audio_sec + first_lb)
             frame_bytes = max(1, src_channels * src_width)
             dur = len(chunk.pcm) / float((src_rate or 1) * frame_bytes or 1)
             audio_sec += dur
+            # ⚠️ **回看缓冲**：留住最近 ``_LOOKBACK_SEC`` 秒的**源格式** PCM
+            # —— 切会话时再喂一遍给新会话（见 :data:`_LOOKBACK_SEC`）。
+            #
+            # 只存源格式（不解码、不重采样）⇒ 切会话时直接重新切块即可。
+            lb_bps = int(src_rate or 0) * frame_bytes
+            if lb_bps > 0 and chunk.pcm:
+                lb_buf.extend(chunk.pcm)
+                keep = int(_LOOKBACK_SEC * lb_bps)
+                if len(lb_buf) > keep:
+                    del lb_buf[:len(lb_buf) - keep]
             # 这一块里有没有「说话停顿」—— 只在**这一块**成立时才算数
             # （否则标记会一直挂着，等到后面某个跟停顿无关的位置才切）。
             chunk_paused = False
@@ -1619,6 +1787,22 @@ class _AsrManager:
             if lang:
                 self._language = lang
             origin = self._audio_origin_sec
+            # ⚠️ **回看轮次** = 「重放旧音频」的那几轮（见
+            # :data:`_LOOKBACK_SEC`）。判定用**时间**：回看区间的轮次
+            # ``chunk_start_sec`` 落在回看窗口里。
+            #
+            # ⇒ 为什么不用轮次编号：请求起点那段回看（拖动后重开识别）
+            # 的轮次编号也是从 1 开始，而**轮换**时的回看轮次编号同样
+            # 从 1 开始（两者会互相串）⇒ 只有**绝对时间**能分开。
+            #
+            # 回看期间**不算**停滞 / 停顿 —— 那是在重放旧音频，
+            # ``committed`` 的增长不代表「当前音频有新内容」。
+            is_lookback = False
+            lb_until = self._lookback_until_sec
+            if lb_until >= 0.0:
+                cstart = frame.get("chunk_start_sec")
+                if cstart is not None and float(cstart) < lb_until - 1e-6:
+                    is_lookback = True
             # **停滞检测**：已确认文本（epoch 内累积）连续 N 轮长度不变
             # → 模型输出卡住了（SDK 侧等价于 ``stable_count == 0``）。
             # 见 :data:`_STALL_ROUNDS_LIMIT`。
@@ -1626,11 +1810,31 @@ class _AsrManager:
             # 注意 ``committed`` 是**当前会话内**的累积文本 —— 切 epoch
             # 后 decoder 重置，长度会变小 → 计数器自动归零。
             clen = len(frame["committed"])
-            if clen == self._last_committed_len:
+            if is_lookback:
+                # 回看轮次：只更新基准，不计轮数。
+                self._last_committed_len = clen
+                # 回看期间**已确认**了多长 —— 用来把回看那部分从最终
+                # 文本里砍掉（见 ``_absorb``）。
+                if clen > self._lookback_committed_len:
+                    self._lookback_committed_len = clen
+            elif clen == 0:
+                # ⚠️ **还没确认过任何东西** ⇒ 这是**热身期**，不是「卡住」。
+                #
+                # SDK 的回退策略在前 ``rollback_rounds``（4）轮里**不允许
+                # 提交**（``asr.py:1067``）⇒ 新会话的头几轮 ``committed``
+                # 恒为空。实测中文《圆桌派》**第 10 轮**才第一次提交 ⇒
+                # 「连续 8 轮 committed 没增长」这条判据在**每段开头**都会
+                # 命中 ⇒ 每段都被误切一刀，白白丢掉上下文（还要再热身一次）。
+                #
+                # ⇒ **committed 还是空的时候不计停滞轮数**（真正的自锁是
+                # 「确认过东西之后**停止增长**」，见 :data:`_STALL_ROUNDS_LIMIT`）。
+                self._stall_rounds = 0
+                self._last_committed_len = clen
+            elif clen == self._last_committed_len:
                 self._stall_rounds += 1
             else:
                 self._stall_rounds = 0
-            self._last_committed_len = clen
+                self._last_committed_len = clen
             # **停顿检测**（模型侧，零延迟）：假设文本**内容**连续不变 →
             # 模型这一秒没产出新内容 → 说话停了。见 _PAUSE_ROUNDS_LIMIT。
             #
@@ -1645,7 +1849,11 @@ class _AsrManager:
             #   ⚠️ 计的是「**内容连续相同的轮数**」（含第一轮），不是「不变
             #   的次数」—— 「连续 2 轮相同」只对应 **1 次**不变 ≈ 1 秒没说话。
             utxt = frame["unfixed"]
-            if not utxt:
+            if is_lookback:
+                # 回看轮次：只更新基准，不计轮数。
+                self._last_unfixed = utxt
+                self._pause_rounds = 0
+            elif not utxt:
                 self._pause_rounds = 0
             elif utxt == self._last_unfixed:
                 self._pause_rounds += 1
