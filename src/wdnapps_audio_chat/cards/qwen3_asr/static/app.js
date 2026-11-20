@@ -194,6 +194,21 @@
   //: 两次「为拖动重开识别」之间的**静默期**（毫秒）—— 防抖。
   const SUB_SEEK_DEBOUNCE_MS = 1500;
 
+  //: 判定「播放头这一刻**有没有字幕可显示**」的两端余量（秒）。
+  //:
+  //: ⚠️ 这跟 :data:`SUB_SEEK_COVER_MARGIN_SEC` 是**两件事**：
+  //:
+  //: * ``SUB_SEEK_COVER_MARGIN_SEC`` —— 「拖动要不要**重开识别**」：
+  //:   宁可多重开一次，也不能让用户停在没有字幕的地方。
+  //: * 这里 —— 「屏幕上**能不能留字幕**」：播放头落在**还没识别过**的
+  //:   音频上时，画面上留着的必然是**拖动前**那一行（旧字幕不更新）⇒
+  //:   必须清掉。
+  //:
+  //: 头端留 0.2 秒（区间起点比播放头晚一点点）、尾端留 1.5 秒
+  //: （识别前沿比播放头快好几倍，只有刚开识别的那一瞬会贴脸）。
+  const SUB_SHOW_RANGE_HEAD_SEC = 0.2;
+  const SUB_SHOW_RANGE_TAIL_SEC = 1.5;
+
   /** CJK（含日文假名 / 韩文）—— 逐字点亮，不按空格切。 */
   const CJK_RE = /[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]/;
 
@@ -982,6 +997,42 @@ const Qwen3Asr = {
     return false;
   },
 
+  /** 从一批轮次**重建**已识别区间（刷新恢复用）。 */
+  _rebuildSubRanges(rounds) {
+    for (const r of (rounds || [])) {
+      if (!r) continue;
+      if (r.chunk_start_sec === undefined || r.chunk_start_sec === null) continue;
+      this._subNoteRange(r.chunk_start_sec, r.chunk_end_sec);
+    }
+  },
+
+  /**
+   * 播放头这一刻**有没有字幕可显示**？
+   *
+   * 与 :meth:`_subCovered` 的区别（两个判据问的不是同一件事）：
+   *
+   * * ``_subCovered`` —— 「拖动要不要**重开识别**」：宁可多重开一次，
+   *   也不能让用户停在没有字幕的地方 ⇒ 余量给得很大（4 秒）。
+   * * 这里 —— 「屏幕上**能不能留字幕**」：播放头落在**还没识别过**的
+   *   音频上时，画面上留着的必然是**拖动前**那一行 ⇒ 必须清掉。
+   *
+   * ⚠️ 为什么不能用「当前行距播放头多远」来判断：识别过的音频里可能
+   * 有一大段**静音**（访谈里的停顿），那时「当前行」自然停在静音前
+   * 那一行 —— 那是**对的**（话没说完，字幕停住），不能一起清掉。
+   * ⇒ 用**区间**判断「这一段音频到底识别过没有」。
+   */
+  _subRecognizedAt(t) {
+    const x = Number(t);
+    if (!Number.isFinite(x)) return false;
+    for (const r of (this._subRanges || [])) {
+      if (x >= r.start - SUB_SHOW_RANGE_HEAD_SEC
+          && x <= r.end + SUB_SHOW_RANGE_TAIL_SEC) {
+        return true;
+      }
+    }
+    return false;
+  },
+
   /**
    * 拖动 → 必要时把识别**开过去**。
    *
@@ -1444,6 +1495,18 @@ const Qwen3Asr = {
 
     // 播放头（容器时间）→ 音频时间（chunk 时间戳也是音轨相对时间）
     const t = (video.currentTime || 0) - (this._audioOriginSec || 0);
+
+    // ⚠️ **播放头必须落在「已识别的音频区间」里** —— 否则画面上留着的
+    // 是**拖动前**那一行（旧字幕一直不更新，用户报「拖动后还保留着
+    // 前面或者不是实时语音的字幕」）。
+    //
+    // 实测（150 秒对谈片段，拖到 110 s）：播放头 112.4 s，画面上还挂着
+    // 78.7~80.1 s 那一行（**滞后 32 秒**）；而已识别区间是
+    // (0.1, 82.1) 和 (103.4, 108.4) —— 播放头落在**两个区间之外**
+    //（新识别还没追上来）。
+    //
+    // ⇒ 落在区间外 ⇒ **清空**（等新识别追上来的那一瞬自然恢复）。
+    if (!this._subRecognizedAt(t)) { this._subClear(sub); return; }
 
     let cur = -1;
     for (let i = 0; i < lines.length; i++) {
@@ -3397,6 +3460,14 @@ const Qwen3Asr = {
     // ``start()`` ⇒ 不认领的话行级翻译一次都不会发起 ⇒ 刷新后没有译文。
     this._claimRoundsSource(kind, true);
     this._subInvalidate();
+    // ⚠️ **已识别区间要从恢复出来的轮次重建** —— ``_subInvalidate()``
+    // 把 ``_subRanges`` 清空了，而它是两个判据的输入：
+    //
+    // * 「拖动要不要重开识别」（``_subCovered``）—— 空 ⇒ 每次拖动都
+    //   重新识别一遍（白烧算力）；
+    // * 「画面上能不能留字幕」（``_subRecognizedAt``）—— 空 ⇒ 刷新后
+    //   字幕**永远不显示**。
+    this._rebuildSubRanges(merged);
     this._roundsDirty = true;      // 轮次表整体换过 → 重建面板
     this._renderRounds();
     this._renderTranscript();
