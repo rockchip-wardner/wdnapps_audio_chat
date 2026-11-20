@@ -74,10 +74,12 @@ class _Item:
     """队列里的一项：一句待译的话。"""
 
     __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at",
-                 "gen")
+                 "gen", "start_sec", "end_sec")
 
     def __init__(self, index: int, text: str, lang: str, stream_id: str,
-                 loop: Any, enqueued_at: float, gen: int = 0):
+                 loop: Any, enqueued_at: float, gen: int = 0,
+                 start_sec: Optional[float] = None,
+                 end_sec: Optional[float] = None):
         self.index = index
         self.text = text
         self.lang = lang
@@ -86,6 +88,13 @@ class _Item:
         self.enqueued_at = enqueued_at
         #: 入队时的**代数**（见 :attr:`TranslationService._gen`）。
         self.gen = gen
+        #: 这句话的**音频时间范围**（秒，音轨相对时间）。
+        #:
+        #: ⚠️ 实时路径（麦克风）没有这个 —— 那边是端点切句，字幕不按时间
+        #: 排。文件 / 视频路径有 ⇒ 前端靠它把译文挂到**字幕行**上（画面
+        #: 字幕显示双语）。
+        self.start_sec = start_sec
+        self.end_sec = end_sec
 
 
 class TranslationService:
@@ -168,8 +177,13 @@ class TranslationService:
     # 生产（ASR 的 endpoint 帧调它）
     # ------------------------------------------------------------------ #
     def submit(self, *, index: int, text: str, lang: str, stream_id: str,
-               loop: Any) -> None:
+               loop: Any, start_sec: Optional[float] = None,
+               end_sec: Optional[float] = None) -> None:
         """送来一句待译的话。
+
+        ``start_sec`` / ``end_sec`` —— 这句话的**音频时间范围**（可选）。
+        文件 / 视频路径会给 ⇒ 前端靠它把译文挂到对应的**字幕行**上
+        （画面字幕显示双语，译文跟着字幕的节奏走）。
 
         ⚠️ **绝不抛异常** —— 翻译出问题不许影响识别。
         """
@@ -179,7 +193,8 @@ class TranslationService:
                 return
             self._submitted += 1
             gen = self._gen
-        item = _Item(index, text, lang, stream_id, loop, time.monotonic(), gen)
+        item = _Item(index, text, lang, stream_id, loop, time.monotonic(),
+                     gen, start_sec, end_sec)
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -319,6 +334,12 @@ class TranslationService:
             "reason": reason,
             "latency_ms": latency_ms,
         }
+        # ⚠️ **时间**（可选）—— 文件 / 视频路径给 ⇒ 前端把译文挂到对应的
+        # 字幕行上；实时路径没有 ⇒ 前端只把它列在译文面板里。
+        if item.start_sec is not None:
+            payload["start_sec"] = item.start_sec
+        if item.end_sec is not None:
+            payload["end_sec"] = item.end_sec
 
         def _emit() -> None:
             try:

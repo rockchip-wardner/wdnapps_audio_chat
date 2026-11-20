@@ -264,6 +264,7 @@ const Qwen3Asr = {
   _trRows: [],            // 转写框的行元素（与时间轴同序）
   _trTl: null,            // 已同步的那份时间轴（对象同一性 → 该重排了）
   _trCur: -1,             // 当前行下标（按播放头）
+  _trPassVer: -1,         // 上次「整表刷译文」时的译文版本号（≠ ⇒ 该刷了）
   _trFollow: true,        // 是否跟随播放头滚动（用户上翻时暂停跟随）
   _trAutoAt: 0,           // 上次自动滚动的时间戳（用来分辨「谁滚的」）
 
@@ -298,19 +299,28 @@ const Qwen3Asr = {
     language: "",
   },
 
-  /* ---------------- 实时翻译状态（流式同传，第一期） ---------------- */
+  /* ---------------- 实时翻译状态（流式同传） ---------------- */
   _tr: {
     enabled: false,      // 「实时翻译」开关
     targetLang: "en",    // 目标语言（provider 的语言 key）
     modelReady: false,   // 翻译模型在不在跑
     modelStatus: "",     // 人类可读的模型状态
-    items: [],           // 已收到的译文 [{index, source, text, status, ...}]
+    items: [],           // 已收到的译文 [{index, source, text, status, start_sec, end_sec, ...}]
     busy: false,         // 「启用翻译模型」进行中
     loaded: false,       // 语言列表拉过了
     langItems: null,     // 语言清单（运行时才有的，缓存一份）
     wizardTarget: "",    // 向导里选的目标语言（换步会重建 body，得记住）
     modelId: "",         // 翻译模型的 model_id（后端定的，进度条要用）
   },
+
+  /**
+   * 译文列表的**版本号** —— 每次改动 +1。
+   *
+   * 用来让「按时间挂到字幕行上」的缓存（见 ``_trTimedSorted``）失效重建。
+   */
+  _trVer: 0,
+  _trTimedCache: null,
+  _trTimedVer: -1,
 
   init() {
     if (this._inited) return;
@@ -368,7 +378,16 @@ const Qwen3Asr = {
 
     // 实时翻译（流式同传）—— 开关 / 目标语言 / 启用翻译模型
     $("asr-tr-enabled")?.addEventListener("change", (e) => {
-      this._trSet({ enabled: !!e.target.checked });
+      const on = !!e.target.checked;
+      if (!on) {
+        // ⚠️ **关掉 ⇒ 画面字幕上的译文也一起收掉** —— 已经收到的译文
+        // 留在 ``_tr.items`` 里 ⇒ 字幕会继续挂着旧译文（用户明明关了
+        // 「实时翻译」）。
+        this._tr.items = [];
+        this._trVer++;   // 版本号 +1 ⇒ 缓存失效
+        this._trRender();
+      }
+      this._trSet({ enabled: on });
     });
     $("asr-tr-target")?.addEventListener("change", (e) => {
       this._trSet({ target_lang: e.target.value });
@@ -1174,7 +1193,19 @@ const Qwen3Asr = {
       el.style.opacity = "0";
       el.style.visibility = "hidden";
       sub.appendChild(el);
-      this._subSlots.push({ el, id: "", spans: [] });
+      // 每个槽 = 「原文行 + 译文行」两段（译文可有可无）。
+      //
+      // ⚠️ 译文**不是**独立的一行 —— 它是这一行的**下半部分** ⇒ 跟着
+      // 同一行的淡入淡出、同一套槽位 ⇒ 「翻译跟随字幕的显示节奏」是
+      // **结构上**成立的，不是靠额外同步。
+      const orig = document.createElement("div");
+      orig.className = "asr-sub-orig";
+      el.appendChild(orig);
+      const tr = document.createElement("div");
+      tr.className = "asr-sub-tr hidden";
+      el.appendChild(tr);
+      this._subSlots.push({ el: el, orig: orig, tr: tr, id: "", spans: [],
+                            trKey: "" });
     }
     return this._subSlots;
   },
@@ -1267,21 +1298,31 @@ const Qwen3Asr = {
     if (cur < 0) { this._subClear(sub); return; }
 
     // 可见行：当前行 + 上面还没淡出的行
-    const want = [];
-    for (let i = cur; i >= 0 && want.length < SUB_MAX_VISIBLE_LINES; i--) {
+    //
+    // ⚠️ 记的是**行号**（不是行对象）—— 找译文要靠「上一行的结束时间」
+    // 定区间（见 ``_trItemsForLine``）⇒ 需要它在时间轴里的位置。
+    const wantIdx = [];
+    for (let i = cur; i >= 0 && wantIdx.length < SUB_MAX_VISIBLE_LINES; i--) {
       const ln = lines[i];
       if (i < cur && t - ln.end > SUB_PREV_HOLD_SEC) break;
-      want.unshift(ln);
+      wantIdx.unshift(i);
     }
+    const want = wantIdx.map((i) => lines[i]);
 
-    // 每行：已经点亮到第几个词 + 当前正在说的词
-    const states = want.map((ln) => {
+    // 每行：已经点亮到第几个词 + 当前正在说的词 + **这一行的译文**
+    const states = want.map((ln, k) => {
       const rv = this._revealState(ln, t);
-      return { ln: ln, revealed: rv.revealed, current: rv.current };
+      const trs = this._trItemsForLine(lines, wantIdx[k]);
+      return { ln: ln, revealed: rv.revealed, current: rv.current,
+               trs: trs, trKey: this._trKeyOf(trs) };
     });
 
     // 签名没变 → 什么都不用动（rAF 每秒 60 次，别白折腾 DOM）
-    const sig = states.map((s) => s.ln.id + ":" + s.revealed + ":" + s.current).join(";");
+    //
+    // ⚠️ 签名里**必须含译文** —— 译文是**异步**到的（要等模型翻完），
+    // 到了之后这一行的内容变了 ⇒ 签名得变 ⇒ DOM 得重画。
+    const sig = states.map((s) => s.ln.id + ":" + s.revealed + ":" + s.current
+                            + ":" + s.trKey).join(";");
     if (sig === this._subSig) return;
     this._subSig = sig;
 
@@ -1302,19 +1343,42 @@ const Qwen3Asr = {
       slot.el.style.opacity = age === 0 ? "1" : (age === 1 ? "0.7" : "0.42");
       if (slot.id !== st.ln.id) {
         slot.id = st.ln.id;
-        slot.el.innerHTML = "";
+        slot.orig.innerHTML = "";
         slot.spans = st.ln.words.map((w) => {
           const sp = document.createElement("span");
           sp.className = "asr-sub-word";
           sp.textContent = w.text;
-          slot.el.appendChild(sp);
+          slot.orig.appendChild(sp);
           return sp;
         });
+        // ⚠️ **槽位换行 ⇒ 必须把译文一起清掉** —— 槽位是**复用**的
+        // （固定几个槽位轮着用），上一行挂的译文会留在 DOM 里。
+        //
+        // ⚠️ 光把 ``trKey`` 置空是**不够**的：下面那段「key 变了才写 DOM」
+        // 的判断里，新旧 key 都是 ""（这一行本来就没译文）⇒ **不写 DOM**
+        // ⇒ 旧译文的文字**留在屏幕上**。
+        //
+        // 症状（实测）：同一句译文同时显示在**两行**上；关掉「实时翻译」
+        // 之后画面字幕上的译文也**收不掉**。
+        slot.trKey = "";
+        slot.tr.textContent = "";
+        slot.tr.classList.add("hidden");
       }
       for (let k = 0; k < slot.spans.length; k++) {
         const spoken = k < st.revealed;
         slot.spans[k].classList.toggle("asr-sub-pending", !spoken);
         slot.spans[k].classList.toggle("asr-sub-current", spoken && k === st.current);
+      }
+      // ---- 译文（双语字幕的另一半）------------------------------- //
+      //
+      // 译文挂在**这一行**下面 ⇒ 跟这一行一起淡入淡出 ⇒ 天然跟着字幕
+      // 的节奏。译文可能**比原文晚到**（要等模型翻完）⇒ 每帧都看一眼，
+      // 变了才动 DOM。
+      if (slot.trKey !== st.trKey) {
+        slot.trKey = st.trKey;
+        const txt = this._trTextOf(st.trs);
+        slot.tr.textContent = txt;
+        slot.tr.classList.toggle("hidden", !txt);
       }
     }
   },
@@ -1417,16 +1481,26 @@ const Qwen3Asr = {
       const el = document.createElement("div");
       el.className = "asr-sub-line asr-tr-future";
       el.dataset.lineId = ln.id;
+      // 原文一行（逐词点亮的那段）
+      const orig = document.createElement("div");
+      orig.className = "asr-sub-orig";
       const spans = [];
       for (const w of ln.words) {
         const sp = document.createElement("span");
         sp.className = "asr-sub-word";
         sp.textContent = w.text;
-        el.appendChild(sp);
+        orig.appendChild(sp);
         spans.push(sp);
       }
+      el.appendChild(orig);
+      // 译文一行（双语字幕的另一半）—— 与画面字幕**同一份映射**
+      // （见 ``_trItemsForLine``）⇒ 两边显示的译文必然一致。
+      const tr = document.createElement("div");
+      tr.className = "asr-sub-tr asr-sub-tr-box hidden";
+      el.appendChild(tr);
       body.appendChild(el);
-      rows.push({ id: ln.id, el: el, spans: spans, state: "future" });
+      rows.push({ id: ln.id, el: el, spans: spans, state: "future",
+                  tr: tr, trKey: "" });
     }
   },
 
@@ -1460,7 +1534,37 @@ const Qwen3Asr = {
         spans[k].classList.toggle("asr-sub-current", spoken && k === rv.current);
       }
     }
+    // ---- 译文（双语）----------------------------------------------- //
+    //
+    // 译文是**异步**到的（要等模型翻完）⇒ 到的时候要补到对应行上。
+    // ⚠️ 只刷 [lo..hi] 不够：刚到的译文可能属于**已经滚过去的**行 ⇒
+    // 「译文版本变了」时整表刷一遍（一次几千行也就几毫秒，而译文一两句
+    // 才来一次）。
+    const trAll = full || this._trVer !== this._trPassVer;
+    if (trAll) {
+      this._trPassVer = this._trVer;
+      for (let i = 0; i < rows.length; i++) {
+        this._transcriptSetTr(rows[i], lines, i);
+      }
+    } else {
+      for (let i = lo; i <= hi; i++) {
+        if (i < 0 || i >= rows.length) continue;
+        this._transcriptSetTr(rows[i], lines, i);
+      }
+    }
     this._trCur = cur;
+  },
+
+  /** 给一行填上它的译文（没有就收起来）。 */
+  _transcriptSetTr(row, lines, i) {
+    if (!row || !row.tr) return;
+    const trs = this._trItemsForLine(lines, i);
+    const key = this._trKeyOf(trs);
+    if (row.trKey === key) return;
+    row.trKey = key;
+    const txt = this._trTextOf(trs);
+    row.tr.textContent = txt;
+    row.tr.classList.toggle("hidden", !txt);
   },
 
   /** 切换一行的状态（过去 / 当前 / 未来）。 */
@@ -2171,6 +2275,94 @@ const Qwen3Asr = {
     return row;
   },
 
+  /**
+   * 有时间的译文（按**结束时间**排序）。
+   *
+   * 只有文件 / 视频路径的译文带时间（实时路径是端点切句，不按时间排）⇒
+   * 画面字幕的双语显示靠它。
+   */
+  _trTimedSorted() {
+    if (this._trTimedCache && this._trTimedVer === this._trVer) {
+      return this._trTimedCache;
+    }
+    const out = [];
+    for (const it of this._tr.items) {
+      if (it.start_sec === null || it.end_sec === null) continue;
+      out.push(it);
+    }
+    out.sort((a, b) => (a.end_sec - b.end_sec));
+    this._trTimedCache = out;
+    this._trTimedVer = this._trVer;
+    return out;
+  },
+
+  /**
+   * 第 ``i`` 条字幕行该挂**哪些**句译文（数组）。
+   *
+   * 规则（YouTube 的「cue 对 cue」）
+   * --------------------------------
+   * 译文 T 归给「**T 结束的那一刻正在显示的那一行**」—— 也就是
+   * 「最后一个 开始时间 ≤ T.结束 的行」。
+   *
+   * 等价说法：T 的结束时刻落在 ``[本行开始, 下一行开始)`` 这个**显示窗口**
+   * 里。
+   *
+   * ⚠️ **为什么不用「本行开始 ≤ T.结束 ≤ 本行结束」**：译文的结束时刻是
+   * **后端算的**、字幕行的时间是**前端算的**，两者虽用同一套锚点算法，
+   * 但后端在**切句那一刻**就把时间**冻结**了，而前端的行时间会随着最后
+   * 一段（正在长的那段）继续变 ⇒ 译文的结束时刻偶尔会落在**两行之间的
+   * 空隙**里。
+   *
+   * ⇒ 用「当时正在显示哪一行」这个判据：空隙里的那一刻，屏幕上还是**上一
+   * 行** ⇒ 译文归上一行 ⇒ **稳定**，不会在两行之间来回跳。
+   *
+   * 为什么不用序号对齐：译文按「**句**」断（后端），字幕按「**行**」断
+   * （前端，YouTube 式排版）⇒ 两者的切点不一定重合 ⇒ 靠**时间**对齐最稳。
+   */
+  _trItemsForLine(lines, i) {
+    const timed = this._trTimedSorted();
+    if (!timed.length || i < 0 || i >= lines.length) return [];
+    const ln = lines[i];
+    // 本行的**显示窗口** = [本行开始, 下一行开始)
+    const nextStart = (i + 1 < lines.length) ? lines[i + 1].start : Infinity;
+    // 第一个 end_sec >= 本行开始的（二分）
+    let a = 0, b = timed.length;
+    while (a < b) {
+      const m = (a + b) >> 1;
+      if (timed[m].end_sec < ln.start - 1e-9) a = m + 1; else b = m;
+    }
+    if (a >= timed.length) return [];
+    // ⚠️ 窗口里可能挤了**不止一句**（短句连着来时）⇒ 全收，别丢。
+    //
+    // ⚠️ 只收 **status == "done"** 的：翻失败的（failed / unavailable），
+    // 广播出来的 text 是「原文（未翻译）」⇒ 挂在字幕行下面等于**把英文
+    // 又抄了一遍**，比没有译文还难看。失败的句子在「译文面板」里有交代
+    // （灰色 + 原因），字幕行上不重复。
+    const out = [];
+    for (let k = a; k < timed.length; k++) {
+      const it = timed[k];
+      if (it.end_sec >= nextStart - 1e-9) break;
+      if (it.status && it.status !== "done") continue;
+      out.push(it);
+    }
+    return out;
+  },
+
+  /** 一组译文的**变更标识**（判断「要不要动 DOM」用）。 */
+  _trKeyOf(items) {
+    if (!items || !items.length) return "";
+    return items.map((it) => it.index).join(",");
+  },
+
+  /** 一组译文的显示文本。 */
+  _trTextOf(items) {
+    if (!items || !items.length) return "";
+    return items
+      .map((it) => it.text || it.source || "")
+      .filter((s) => !!s)
+      .join(" ");
+  },
+
   _trRender() {
     const box = document.getElementById("asr-rt-translated");
     if (!box) return;
@@ -2318,6 +2510,7 @@ const Qwen3Asr = {
       L.resampler = null;
       // 新会话 ⇒ 上一轮的译文也清掉（句序号会从头数）
       this._tr.items = [];
+      this._trVer++;   // 版本号 +1 ⇒ 缓存失效
       this._trRender();
       this._liveClearGap();
       this._liveRender();
@@ -2912,6 +3105,7 @@ const Qwen3Asr = {
     // ``service.py`` 的 ``_TR_FILE_INDEX_BASE``）⇒ 不清的话上一批的
     // 译文会**留在列表里**，跟这一批混在一起。
     this._tr.items = [];
+    this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     // 记下这批轮次来自**哪个来源** —— 视频字幕靠它判断「该不该渲染」
     // （否则会拿上一来源的轮次画到当前视频上，见 _onSourceChanged）。
@@ -3020,6 +3214,7 @@ const Qwen3Asr = {
     this._renderLive("", "");
     // 译文也一起清（服务端 /reset 也会清统计）
     this._tr.items = [];
+    this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     this._trSyncUi();
     this._audioOriginSec = 0;
@@ -3044,6 +3239,7 @@ const Qwen3Asr = {
     // 服务端那边也做了同一件事的另一半：``/reset`` 会把翻译队列的**代数**
     // +1 ⇒ 之后才回来的译文**根本不会推过来**。
     this._tr.items = [];
+    this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
     this._trSyncUi();
   },
@@ -3260,6 +3456,12 @@ const Qwen3Asr = {
           status: msg.status || "failed",
           reason: msg.reason || "",
           latency_ms: Number(msg.latency_ms) || 0,
+          // ⚠️ **时间范围**（可选）—— 文件 / 视频路径给 ⇒ 画面字幕能把它
+          // 挂到对应的字幕行上（双语字幕，译文跟着字幕的节奏走）。
+          start_sec: (msg.start_sec === undefined || msg.start_sec === null)
+            ? null : Number(msg.start_sec),
+          end_sec: (msg.end_sec === undefined || msg.end_sec === null)
+            ? null : Number(msg.end_sec),
         };
         // ⚠️ **按句序号覆盖**，不是 append —— 翻译是**乱序完成**的
         //（多实例并行），append 会让字幕顺序乱掉。
@@ -3267,8 +3469,13 @@ const Qwen3Asr = {
         if (pos >= 0) this._tr.items[pos] = it;
         else this._tr.items.push(it);
         this._tr.items.sort((a, b) => a.index - b.index);
+        // 版本号 +1 ⇒ 「按时间挂译文」的缓存失效（字幕下一帧就会重画）
+        this._trVer++;
         this._trRender();
         this._trSyncUi();
+        // 转写框（视频来源）**立刻**补上译文 —— 视频**暂停**时 rAF 循环
+        // 不跑 ⇒ 只靠 rAF 的话，译文要等用户点了播放才出现。
+        this._renderTranscript();
         break;
       }
       case "done": {

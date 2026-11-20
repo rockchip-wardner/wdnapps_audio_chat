@@ -212,6 +212,28 @@
   transition: opacity 0.2s linear;
 }
 
+/* 一行里的**原文**（逐词点亮的那一段） */
+.asr-sub-orig {
+  display: block;
+}
+
+/* 一行里的**译文**（双语字幕的另一半）
+   ---------------------------------------------------------------
+   它是**这一行**的下半部分，不是独立的一行 ⇒ 跟着同一行的淡入淡出、
+   同一套行槽 ⇒ 「翻译跟随字幕的显示节奏」是结构上成立的。
+
+   字号略小、颜色略淡 —— 原文是主角，译文是辅助（YouTube 双语字幕的
+   常见排法）。⚠️ 板端**没有 emoji / 符号字体** ⇒ 纯文字。 */
+.asr-sub-tr {
+  display: block;
+  margin-top: 1px;
+  font-size: 0.88em;
+  line-height: 1.35;
+  color: #d7e3f4;
+  font-weight: 400;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.95);
+}
+
 /* 一个词 */
 .asr-sub-word {
   transition: opacity 0.12s linear, color 0.12s linear;
@@ -444,6 +466,14 @@
 /* 词：颜色跟「实时结果」一致（浅色底，不能用字幕的白色） */
 .asr-transcript-body .asr-sub-word {
   color: #111827;
+}
+
+/* 译文行：浅色底 ⇒ 深色字（画面字幕那边是浅字） */
+.asr-transcript-body .asr-sub-tr {
+  color: #374151;
+  text-shadow: none;
+  font-size: 0.92em;
+  padding-left: 2px;
 }
 
 /* 正在说的那个词 —— 高亮。字幕用的 #ffd97d 在白底上几乎看不见，

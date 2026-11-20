@@ -350,6 +350,25 @@ def _first_sentence_end(text: str) -> int:
     return -1
 
 
+def _lcp(a: str, b: str) -> int:
+    """两个字符串的**最长公共前缀**长度。
+
+    ⚠️ 与前端的 ``static/app.js::_lcp`` **同一套算法** —— 字幕的时间轴与
+    译文的时间轴必须用**同一个锚点**，否则译文会挂到别的行上。
+
+    ⚠️ 别把一个代理对劈成两半（emoji / 少数字的扩展汉字）。
+    """
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    if 0 < i < n:
+        c = ord(a[i - 1])
+        if 0xD800 <= c <= 0xDBFF:
+            i -= 1
+    return i
+
+
 class _SentenceSplitter:
     """把「累积的已确认文本」切成句子 —— 文件 / 视频路径的实时翻译。
 
@@ -392,10 +411,14 @@ class _SentenceSplitter:
         self._last = ""
 
     def feed(self, committed: str, emit) -> None:
-        """喂一轮 ``committed``，切出的句子交给 ``emit(text, index)``。
+        """喂一轮 ``committed``，切出的句子交给 ``emit(text, index, c0, c1)``。
 
         ⚠️ 一轮里可能攒下**好几句**（模型停顿之后一口气补一大段）⇒
         这里是个**循环**，不是「一刀切一句」。
+
+        ``c0`` / ``c1`` = 这句在**当前 epoch 的 committed 文本**里的字符
+        区间（半开区间 ``[c0, c1)``）—— 有了它才能把这句话换算成**音频
+        时间**（前端要靠时间把译文挂到字幕行上）。
         """
         committed = committed or ""
         # epoch 切换的**兜底检测**：decoder 重置后 committed 从头开始
@@ -416,17 +439,18 @@ class _SentenceSplitter:
                 # 兜底 2：太长还没标点 ⇒ 强制切（保证「实时」）
                 cut = _TR_MAX_SENTENCE_CHARS
             sentence = rest[:cut].strip()
+            c0 = self._done
             self._done += cut
             if sentence:
                 self._index += 1
-                emit(sentence, self._index)
+                emit(sentence, self._index, c0, self._done)
 
     def flush(self, emit) -> None:
         """收尾 / epoch 切换：把剩下的尾巴提交。"""
         tail = (self._last or "")[self._done:].strip()
         if tail:
             self._index += 1
-            emit(tail, self._index)
+            emit(tail, self._index, self._done, len(self._last))
         self._done = len(self._last)
 
 
@@ -514,6 +538,19 @@ class _AsrManager:
         #: ``{"rid", "stream_id", "base", "loop"}`` —— ``base`` 是句序号的
         #: 基准（见 :data:`_TR_FILE_INDEX_BASE`）。
         self._tr_ctx: Optional[Dict[str, Any]] = None
+        #: **epoch 内**的「字符数 → 音频时间」锚点表（懒算，见
+        #: :meth:`_tr_time_table`）。
+        #:
+        #: 用途：把切出来的一句（epoch 内的字符区间）换算成**音频时间** ——
+        #: 前端要靠时间把译文挂到**字幕行**上（画面字幕要显示双语）⇒ 译文
+        #: 必须带时间。
+        #:
+        #: ⚠️ **epoch 内**的 committed 是段内累积文本 ⇒ 字数与时间都是段内
+        #: 坐标；换段要归零（见 :meth:`_tr_time_reset`）。
+        self._tr_epoch_rounds: List[Dict[str, Any]] = []
+        self._tr_committed: str = ""
+        self._tr_time_cache: List[List[float]] = []
+        self._tr_time_key: Optional[tuple] = None
 
         self._session = None
         self._model_id: Optional[str] = None
@@ -763,7 +800,96 @@ class _AsrManager:
             return (self._rounds[-1].get("committed") or "").strip()
 
     # ------------------------------------------------- 实时翻译（文件路径）
-    def _tr_emit(self, text: str, seq: int) -> None:
+    def _tr_time_reset(self) -> None:
+        """换 epoch / 新请求 ⇒ 时间表归零（段内坐标，不能跨段用）。"""
+        with self._lock:
+            self._tr_epoch_rounds = []
+            self._tr_committed = ""
+            self._tr_time_cache = []
+            self._tr_time_key = None
+
+    def _tr_time_note(self, committed: str, unfixed: str,
+                      end_sec: Optional[float]) -> None:
+        """记一轮：「这一轮**结束**时，音频里已经说出了多少字」。
+
+        ⚠️ 只在**有 chunk 时间戳**时记 —— 没有时间戳就没法把译文挂到
+        字幕行上（前端会退回「不挂译文」）。
+        """
+        if end_sec is None:
+            return
+        try:
+            t = float(end_sec)
+        except (TypeError, ValueError):
+            return
+        if t != t or t in (float("inf"), float("-inf")):
+            return
+        with self._lock:
+            self._tr_epoch_rounds.append({
+                # **假设文本** = 已确认 + 还在改写的尾巴（前端同一个口径）
+                "hyp": (committed or "") + (unfixed or ""),
+                "end": t,
+            })
+            self._tr_committed = committed or ""
+
+    def _tr_time_table(self) -> List[List[float]]:
+        """epoch 内的「字符数 → 音频时间」锚点表。
+
+        ⚠️ **锚点必须与前端一致** —— 前端（``static/app.js`` 的
+        ``_epochTable``）用的是「**假设文本**与最终文本的**最长公共前缀**
+        长度」，不是「已确认字数」。
+
+        差在哪（实测）：英文音频的**前 4 轮 ``committed`` 是空的**（模型先
+        猜了个中文填充词「嗯哼。」，第 2 轮拿到上下文后才推翻）⇒ 按「已确认
+        字数」算出来的锚点会**整体偏晚**好几秒 ⇒ 译文挂到**下一行**字幕上
+        （实测偏一行）。
+
+        ⇒ 这里用**同一套**算法（LCP(假设, 当前已确认文本)），连「同一个
+        字数只保留最早的时间」这条高水位线规则都一样。
+
+        ⚠️ 「最终文本」这里用**当前**已确认文本：正在长的那一段，前端也是
+        拿当前文本算的（它的缓存键 = 轮次数）⇒ 两边**逐帧一致**。
+        """
+        with self._lock:
+            rounds = list(self._tr_epoch_rounds)
+            final_text = self._tr_committed
+            key = (len(rounds), len(final_text))
+            if self._tr_time_key == key:
+                return self._tr_time_cache
+        mono: List[List[float]] = []
+        hi = -1
+        for r in rounds:
+            x = _lcp(r["hyp"], final_text)
+            if x < hi:
+                x = hi
+            if mono and mono[-1][0] == x:
+                continue                    # 同样的字数 ⇒ 保留**最早**的时间
+            hi = x
+            mono.append([float(x), float(r["end"])])
+        with self._lock:
+            self._tr_time_cache = mono
+            self._tr_time_key = key
+        return mono
+
+    def _tr_time_at(self, char_idx: int) -> Optional[float]:
+        """epoch 内「第几个字」→ 音频时间（表内线性插值）。
+
+        没有表（没有 chunk 时间戳）⇒ 返回 ``None`` ⇒ 译文不带时间。
+        """
+        tbl = self._tr_time_table()
+        if not tbl:
+            return None
+        if char_idx <= tbl[0][0]:
+            return tbl[0][1]
+        for i in range(1, len(tbl)):
+            x0, t0 = tbl[i - 1]
+            x1, t1 = tbl[i]
+            if char_idx <= x1:
+                if x1 <= x0:
+                    return t1
+                return t0 + (char_idx - x0) * (t1 - t0) / (x1 - x0)
+        return tbl[-1][1]
+
+    def _tr_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> None:
         """把切出来的一句送去翻译（文件 / 视频路径）。
 
         ⚠️ **翻译出问题不许影响识别** —— 这里吞掉所有异常（翻译链路
@@ -782,6 +908,10 @@ class _AsrManager:
                 lang=self._language,
                 stream_id=str(ctx["stream_id"]),
                 loop=ctx.get("loop"),
+                # ⚠️ **时间**是给「画面字幕显示双语」用的：前端要靠它把
+                # 译文挂到对应的字幕行上（按时间重叠匹配）。
+                start_sec=self._tr_time_at(c0),
+                end_sec=self._tr_time_at(c1),
             )
         except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
             _LOG.debug("文件路径送去翻译失败（best-effort）: %s", exc)
@@ -954,6 +1084,8 @@ class _AsrManager:
                 "base": rid * _TR_FILE_INDEX_BASE,
                 "loop": loop,
             }
+            # 新的一段 ⇒ 时间表归零（段内坐标）
+            self._tr_time_reset()
 
         self._broadcast({"type": "state", "state": self.snapshot()})
         threading.Thread(
@@ -1260,6 +1392,8 @@ class _AsrManager:
             # 换段 ⇒ 切句器的**文本记账**归零（句子序号继续，见
             # ``_SentenceSplitter.reset_epoch``）。
             self._splitter.reset_epoch()
+            # 换段 ⇒ 时间表也归零（段内坐标，不能跨段用）
+            self._tr_time_reset()
             epoch += 1
             stream_id = "file-{}#{}".format(rid, epoch)
             epoch_origin = audio_sec
@@ -1507,6 +1641,10 @@ class _AsrManager:
         # （见 ``wdndds/ai_session.py`` 的 ``bridge.done.wait``）⇒
         # flush 一定发生在本轮 feed 之后。
         if self._tr_ctx is not None:
+            # 时间锚点：**先记再切** —— 这一轮的「已确认字数 → 结束时间」
+            # 是下一句换算时间的依据。
+            self._tr_time_note(frame["committed"], frame.get("unfixed") or "",
+                               frame.get("chunk_end_sec"))
             try:
                 self._splitter.feed(frame["committed"], self._tr_emit)
             except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
