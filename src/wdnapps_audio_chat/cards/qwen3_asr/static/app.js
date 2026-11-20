@@ -455,6 +455,27 @@ const Qwen3Asr = {
     modelId: "",         // 翻译模型的 model_id（后端定的，进度条要用）
   },
 
+  /* ---------------- 句子流状态（结果框按句排版） ---------------- */
+  /**
+   * 已成句的原文。
+   *
+   * ⚠️ **断句只有一份实现** —— 文件 / 视频路径的句子由**服务端**的
+   * ``_SentenceSplitter`` 切，随 round 帧的 ``sentences`` 字段送来；
+   * 麦克风路径由端点检测切。前端**不自己**断句 —— 自己断就是两份口径，
+   * 迟早漂移。
+   */
+  _sentences: [],   // [{i: 句序号, t: 原文}]
+  /**
+   * 「已确认但还没成句」的尾巴（**服务端**算好送来，见
+   * ``service.py::_sent_tail_text``）。
+   *
+   * ⚠️ **不让前端自己切** —— 服务端给的 ``committed`` 是**段内**累积文本
+   * （换 epoch 就从头数）⇒ 前端拿偏移量去切，跨段就对不上。
+   */
+  _sentTail: "",
+  /** 最近一轮的「未确认尾巴」—— 重画句子流时要用。 */
+  _sentUnfixed: "",
+
   /**
    * 译文列表的**版本号** —— 每次改动 +1。
    *
@@ -2021,6 +2042,19 @@ const Qwen3Asr = {
       startBtn.disabled = !this._isFileSource() || !this._hasSource()
         || this._busy() || this._starting;
     }
+    // ⚠️ **结果框画什么** —— 三种来源三个框：
+    //   * 音频文件 ⇒ 「句子流」（原文 + 译文成对），见 `#asr-sentences`；
+    //   * 含音轨的视频 ⇒ 「字幕同款转写框」（见 `#asr-transcript`）；
+    //   * 实时（麦克风）⇒ 实时区块自己的框（`#asr-rt-text`）⇒ 这里空的。
+    //
+    // `asr-live-file` 这个类用来**藏起那两个「镜像」span**（连续文本）——
+    // 否则句子流与连续文本在同一个框里出现两遍。
+    const liveBox = $("asr-live");
+    if (liveBox) {
+      liveBox.classList.toggle("asr-live-file", this._source === "file");
+    }
+    const sents = $("asr-sentences");
+    if (sents) sents.classList.toggle("hidden", this._source !== "file");
   },
 
   /** 当前来源是不是「文件 / 视频」（决定「开始识别」按钮是否可用）。 */
@@ -2244,6 +2278,9 @@ const Qwen3Asr = {
     const head = L.segments.length ? L.segments.join(" ") + " " : "";
     if (c) c.textContent = head + (L.committed || "");
     if (u) u.textContent = L.unfixed || "";
+    // 句子流（原文 + 译文成对）—— 麦克风的句子由**端点检测**给出
+    // （文件 / 视频路径的句子由服务端切，见 `_renderLive`）。
+    this._sentPaint();
   },
 
   // ------------------------------------------------------------------ //
@@ -2781,45 +2818,19 @@ const Qwen3Asr = {
       .join(" ");
   },
 
+  /**
+   * 译文刷新 ⇒ 把译文刷进**句子流**。
+   *
+   * ⚠️ **不再有独立的译文列表** —— 那一栏把原文又抄了一遍（与结果框逐字
+   * 重复）⇒ 同一句话在屏幕上出现两遍。现在译文**挂在它自己的原文下面**
+   * ⇒ 一一对应，不重复（见 `_renderSentences`）。
+   *
+   * ⇒ 这一块只剩**控制条**（目标语言 / 开关 / 启用翻译模型 / 状态），
+   * 译文本身一律在结果框里。
+   */
   _trRender() {
-    const box = document.getElementById("asr-rt-translated");
-    if (!box) return;
-    const items = this._tr.items;
-    const empty = document.getElementById("asr-tr-empty");
-    // ⚠️ **只删译文行，别用 ``innerHTML = ""``** —— 那会把
-    // ``#asr-tr-empty``（那句「开启实时翻译后…」的提示）**一起删掉**，
-    // 而后面 ``empty.classList.remove("hidden")`` 操作的是一个**已经脱离
-    // DOM 的节点** ⇒ 清空之后提示再也回不来（译文区一片空白）。
-    // 句子不多（几十条以内）⇒ 直接重建每一行，别搞增量 diff。
-    Array.from(box.querySelectorAll(".asr-tr-item")).forEach((el) => el.remove());
-    if (!items.length) {
-      if (empty) empty.classList.remove("hidden");
-      return;
-    }
-    if (empty) empty.classList.add("hidden");
-    items.forEach((it) => {
-      const row = document.createElement("div");
-      row.className = "asr-tr-item";
-      if (it.status && it.status !== "done") row.classList.add("is-" + it.status);
-      const src = document.createElement("div");
-      src.className = "asr-tr-src";
-      src.textContent = it.source || "";
-      const dst = document.createElement("div");
-      dst.className = "asr-tr-dst";
-      if (it.status === "done") {
-        dst.textContent = it.text || "";
-      } else if (it.status === "skipped") {
-        // 源语 == 目标语 ⇒ 原文就是译文（不浪费一次推理）
-        dst.textContent = it.text || it.source || "";
-        dst.classList.add("is-muted");
-      } else {
-        dst.textContent = "（未翻译）" + (it.reason || "");
-        dst.classList.add("is-muted");
-      }
-      row.appendChild(src);
-      row.appendChild(dst);
-      box.appendChild(row);
-    });
+    this._sentPaint();      // 麦克风来源的句子流
+    this._sentPaintFile();  // 文件 / 视频来源的句子流
   },
 
   _updateHint() {
@@ -2930,6 +2941,9 @@ const Qwen3Asr = {
       this._tr.items = [];
       this._trVer++;   // 版本号 +1 ⇒ 缓存失效
       this._trRender();
+      // ⚠️ **句子流也清** —— 上一轮画出来的句子要撤掉（否则两轮混在
+      // 一个框里）。只清麦克风这个框 —— 文件来源的结果**不受影响**。
+      this._sentClear(["asr-rt-sentences"]);
       this._liveClearGap();
       this._liveRender();
       await this._liveOpenMic();
@@ -3455,6 +3469,15 @@ const Qwen3Asr = {
     }
 
     this.rounds = merged;
+    // ⚠️ **句子也要恢复** —— 结果框画的是「句子流」⇒ 句子没了框就是空的
+    // （用户刷新一下，刚识别出来的内容就没了）。
+    //
+    // ⚠️ **只恢复「音频文件」的** —— 视频来源的结果走「字幕同款转写框」
+    // （那里已经有原文 + 译文）⇒ 恢复一份句子只会让两处对不上。
+    if (kind === "file" && Array.isArray(data.sentences)) {
+      this._sentClear(["asr-sentences"]);
+      this._sentPush(data.sentences);
+    }
     // 归属：**只认服务端说的那份**（file / video）。前端猜不得。
     // ⚠️ **翻译的单位也跟着认领**（视频 ⇒ 行级）—— 刷新时本地没走过
     // ``start()`` ⇒ 不认领的话行级翻译一次都不会发起 ⇒ 刷新后没有译文。
@@ -3542,6 +3565,9 @@ const Qwen3Asr = {
     this._tr.items = [];
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
+    // ⚠️ **新的一批 ⇒ 句子流也清空** —— 句子序号从头数 ⇒ 上一批的句子
+    // 不清的话会**接着**这一批往下画（两批混在一个框里）。
+    this._sentClear(["asr-sentences"]);
     // ⚠️ **翻译的单位** —— 视频 ⇒ 逐行；音频文件 ⇒ 逐句。
     //
     // ⚠️ 视频必须是「逐行」：字幕的显示单位是「行」，译文必须**逐行**跟着
@@ -3671,6 +3697,8 @@ const Qwen3Asr = {
     this._trLineSlot.clear();
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
+    // ⚠️ **句子流也清** —— DOM 与状态一起清（见 ``_sentClear``）。
+    this._sentClear();
     this._trSyncUi();
     this._audioOriginSec = 0;
     this._subInvalidate();
@@ -3699,6 +3727,10 @@ const Qwen3Asr = {
     this._trLineSlot.clear();
     this._trVer++;   // 版本号 +1 ⇒ 缓存失效
     this._trRender();
+    // ⚠️ **再清一次句子流** —— 「本地先清」与「服务端 /reset 回来」之间
+    // 可能刚好到了一条句子帧（那一句已经在推理）⇒ 不再清一次，页面上
+    // 就留下一句「刚清空却还在」的原文。
+    this._sentClear();
     this._trSyncUi();
   },
 
@@ -3710,11 +3742,196 @@ const Qwen3Asr = {
   },
 
   // ------------------------------------------------------------------ 渲染
+  /**
+   * 渲染「实时结果」框。
+   *
+   * 三种来源三种形态：
+   * * **视频** ⇒ 框里是「字幕同款转写框」（`_renderTranscript` 画的，
+   *   已经是「原文 + 译文」逐句成对）⇒ 这里只更新那两个**镜像** span
+   *   （回归脚本从 ``#asr-live-committed`` 读最终文本）⇒ 由 CSS 隐藏。
+   * * **音频文件** ⇒ 句子流（原文 + 译文成对），见 `_sentPaintFile`。
+   * * **麦克风** ⇒ 它自己的框（`_liveRender`）。
+   */
   _renderLive(committed, unfixed) {
     const c = document.getElementById("asr-live-committed");
     const u = document.getElementById("asr-live-unfixed");
     if (c) c.textContent = committed || "";
     if (u) u.textContent = unfixed || "";
+    this._sentUnfixed = unfixed || "";
+    if (this._source !== "file") return;      // 视频走转写框；麦克风走自己的框
+    this._sentPaintFile();
+  },
+
+  /**
+   * 收下服务端切好的句子（原文）。
+   *
+   * ⚠️ **只收「音频文件」来源的** —— 视频来源的结果走「字幕同款转写框」
+   * （那里已经是「原文 + 译文」成对）⇒ 再收一份句子，两处内容对不上。
+   */
+  _sentPush(list) {
+    if (this._source !== "file") return;
+    if (!Array.isArray(list)) return;
+    for (const s of list) {
+      if (!s) continue;
+      // ⚠️ ``tr`` = 这句话**真的送去翻译了**吗（服务端给的）⇒ 译文位
+      // 该显示「翻译中」还是空着。
+      this._sentences.push({
+        i: Number(s.i) || 0,
+        t: s.t || "",
+        tr: !!s.tr,
+      });
+    }
+  },
+
+  /**
+   * 画「句子流」（**音频文件 / 视频**来源）。
+   *
+   * 句子由**服务端**切（随 round 帧的 ``sentences`` 送来），尾巴由服务端
+   * 算好（``sentence_tail``）⇒ 前端只负责**画**。
+   */
+  _sentPaintFile() {
+    const box = document.getElementById("asr-sentences");
+    if (!box) return;
+    this._renderSentences(box, this._sentences, this._sentTail, this._sentUnfixed);
+  },
+
+  /**
+   * 画「句子流」（**麦克风**来源）。
+   *
+   * ⚠️ 麦克风的句子由**端点检测**给出（``_live.segments``）—— 那是另一条
+   * 路径的句子（文件 / 视频路径的句子见 `_sentPaintFile`）。
+   *
+   * 当前正在说的那一句**还没结束** ⇒ 它是「尾巴」（已确认部分）+ 蓝色
+   * 的未确认部分。
+   */
+  _sentPaint() {
+    const box = document.getElementById("asr-rt-sentences");
+    if (!box) return;
+    const L = this._live;
+    const segs = L.segments || [];
+    const sentences = [];
+    for (let i = 0; i < segs.length; i++) {
+      // ⚠️ 麦克风的句子在**端点命中时**就送去翻译了（服务端
+      // ``_submit_translation``）⇒ 翻译开着就一定会来 ⇒ 可以占「翻译中」。
+      sentences.push({ i: i + 1, t: segs[i], tr: !!this._tr.enabled });
+    }
+    this._renderSentences(box, sentences, L.committed || "", L.unfixed || "");
+  },
+
+  /**
+   * 清空句子流（新一次识别 / 「清空」按钮）。
+   *
+   * ⚠️ **DOM 与状态要一起清** —— ``_sentRows`` 挂在 DOM 元素上（增量渲染
+   * 用的行缓存）⇒ 只清数组不清 DOM ⇒ 下一轮的句子会**接着上一轮的句子
+   * 往下画**（屏幕上看着像「清空没生效」）。
+   *
+   * ``ids`` —— 只清哪几个框（不传 = 两个都清）。两条来源各有一个框，
+   * 换来源时**不该**把另一条的结果也抹掉。
+   */
+  _sentClear(ids) {
+    this._sentences = [];
+    this._sentTail = "";
+    this._sentUnfixed = "";
+    const list = (ids && ids.length)
+      ? ids
+      : ["asr-sentences", "asr-rt-sentences"];
+    for (const id of list) {
+      const box = document.getElementById(id);
+      if (!box) continue;
+      if (box._sentRows) {
+        box._sentRows.forEach((row) => row.remove());
+        box._sentRows.clear();
+      }
+      if (box._sentTail) box._sentTail.textContent = "";
+      if (box._sentLive) box._sentLive.textContent = "";
+    }
+  },
+
+  /**
+   * 渲染「句子流」：一句一句，**原文 + 译文成对**。
+   *
+   * ⚠️ **译文不再单独一栏** —— 那一栏把原文又抄了一遍（与结果框逐字
+   * 重复）⇒ 同一句话在屏幕上出现两次。现在译文**挂在它自己的原文下面**
+   * ⇒ 一一对应，不重复。
+   *
+   * ⚠️ **增量渲染** —— 句子会一直增加（长音频几千句）⇒ 每帧重建整个
+   * DOM 不可接受（同 ``_renderRounds`` 的教训）⇒ 新句才建节点，老句只
+   * 更新译文那一行。
+   */
+  _renderSentences(box, sentences, tail, unfixed) {
+    if (!box) return;
+    if (!box._sentRows) {
+      box._sentRows = new Map();
+      box._sentTail = document.createElement("div");
+      box._sentTail.className = "asr-sent-tail";
+      box._sentLive = document.createElement("div");
+      box._sentLive.className = "asr-sent-live";
+      box.appendChild(box._sentTail);
+      box.appendChild(box._sentLive);
+    }
+    // 译文按**原文**配对：服务端给的 ``source`` 就是那句原文 ⇒ 精确匹配
+    // （句子序号在两次识别之间会重排，不能拿它当键）。
+    const trBySrc = new Map();
+    for (const it of (this._tr.items || [])) {
+      const src = (it.source || "").trim();
+      if (src && !trBySrc.has(src)) trBySrc.set(src, it);
+    }
+    const on = !!this._tr.enabled;
+    for (const s of (sentences || [])) {
+      const key = String(s.i) + "|" + (s.t || "");
+      let row = box._sentRows.get(key);
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "asr-sent";
+        const src = document.createElement("div");
+        src.className = "asr-sent-src";
+        src.textContent = s.t || "";
+        row.appendChild(src);
+        const dst = document.createElement("div");
+        dst.className = "asr-sent-dst";
+        row.appendChild(dst);
+        box.insertBefore(row, box._sentTail);
+        box._sentRows.set(key, row);
+      }
+      const dst = row.querySelector(".asr-sent-dst");
+      if (!dst) continue;
+      const it = trBySrc.get((s.t || "").trim());
+      let txt = "";
+      let muted = false;
+      if (it) {
+        if (it.status === "done") {
+          txt = it.text || "";
+        } else if (it.status === "skipped") {
+          // 源语 == 目标语 ⇒ 原文就是译文（不浪费一次推理）
+          txt = it.text || it.source || "";
+          muted = true;
+        } else {
+          txt = "（未翻译）" + (it.reason || "");
+          muted = true;
+        }
+      } else if (on && s.tr) {
+        // 译文还没到 ⇒ 先占个位（用户知道这句在等）
+        //
+        // ⚠️ **只给「真的送去翻译了」的句子占位**（服务端给的 ``tr``）——
+        // 翻译开关可能是**识别过程中**才打开的 ⇒ 开关打开前切出来的句子
+        // 永远不会有译文 ⇒ 占着「翻译中」就是骗人。
+        //
+        // ⚠️ 板端**没有符号字体** ⇒ 只用文字，不写省略号（会渲染成豆腐块）。
+        txt = "翻译中";
+        muted = true;
+      }
+      if (dst.textContent !== txt) dst.textContent = txt;
+      dst.classList.toggle("is-muted", muted);
+      dst.classList.toggle("hidden", !txt);
+    }
+    if (box._sentTail.textContent !== (tail || "")) {
+      box._sentTail.textContent = tail || "";
+    }
+    box._sentTail.classList.toggle("hidden", !tail);
+    if (box._sentLive.textContent !== (unfixed || "")) {
+      box._sentLive.textContent = unfixed || "";
+    }
+    box._sentLive.classList.toggle("hidden", !unfixed);
   },
 
   /**
@@ -3872,6 +4089,15 @@ const Qwen3Asr = {
         if (msg.chunk_start_sec !== undefined && msg.chunk_start_sec !== null) {
           this._subNoteRange(msg.chunk_start_sec, msg.chunk_end_sec);
         }
+        // ⚠️ **句子由服务端切**（随这一帧送来）⇒ 前端不自己断句。
+        // 断句口径只有一份（服务端的 `_SentenceSplitter`）—— 自己断就是
+        // 两份口径，迟早漂移。
+        this._sentPush(msg.sentences);
+        // 「已确认但还没成句」的尾巴 —— **服务端算好**（``committed`` 是段内
+        // 累积文本，前端自己切会跨段错位）。
+        if (msg.sentence_tail !== undefined && msg.sentence_tail !== null) {
+          this._sentTail = String(msg.sentence_tail || "");
+        }
         this._renderLive(msg.committed || "", msg.unfixed || "");
         this._renderRounds();
         this._renderVideoSubtitle();
@@ -3965,6 +4191,14 @@ const Qwen3Asr = {
         break;
       }
       case "done": {
+        // ⚠️ 收尾时切出来的**最后一句**跟着这一帧来（没有下一帧可以搭
+        // 便车了）⇒ 不接住它，那句话就永远不出现。
+        this._sentPush(msg.sentences);
+        // ⚠️ **尾巴要清掉** —— 收尾把尾巴切成了句子 ⇒ 尾巴还留着的话，
+        // 那句话在屏幕上出现两遍（一次是尾巴，一次是句子）。
+        if (msg.sentence_tail !== undefined && msg.sentence_tail !== null) {
+          this._sentTail = String(msg.sentence_tail || "");
+        }
         this._renderLive(msg.text || "", "");
         this._renderRounds();
         // ⚠️ 识别结束 ⇒ **最后一行**也定稿了 ⇒ 把它要过来（不然它永远
@@ -3983,6 +4217,11 @@ const Qwen3Asr = {
       case "stopped": {
         // 停止 → **正常收尾**，不是失败：把已识别的文本交回界面。
         // （后端在取消时不再广播 error 帧。）
+        // ⚠️ 收尾时切出来的**最后一句**跟着这一帧来（同 ``done``）。
+        this._sentPush(msg.sentences);
+        if (msg.sentence_tail !== undefined && msg.sentence_tail !== null) {
+          this._sentTail = String(msg.sentence_tail || "");
+        }
         this._renderLive(msg.text || "", "");
         this._renderRounds();
         // ⚠️ **要不要把画面也停住，取决于「谁喊的停」**：

@@ -433,8 +433,8 @@ class _SentenceSplitter:
     --------
     * **主**：句末标点（:data:`_TR_SENTENCE_END`）—— 标点就是句号，
       语义最准；
-    * **兜底 1**：epoch 切换（decoder 重置）→ 把上一段剩下的尾巴提交
-      （否则那一段永远不译）；
+    * **兜底 1**：epoch 切换（decoder 重置）→ 把上一段剩下的尾巴切出来
+      （否则那一段永远不成句 ⇒ 永远没有译文）；
     * **兜底 2**：超过 :data:`_TR_MAX_SENTENCE_CHARS` 还没切 → 强制切
       （一段没标点的长音频也能边播边出译文）；
     * **收尾**：识别结束时把剩余的提交。
@@ -502,6 +502,15 @@ class _SentenceSplitter:
             self._index += 1
             emit(tail, self._index, self._done, len(self._last))
         self._done = len(self._last)
+
+    def done_offset(self) -> int:
+        """当前 epoch 里**已经切成句**的字符数。
+
+        ⚠️ **只给服务端自己用** —— 前端**不**拿它去切 ``committed``
+        （那是**段内**文本，跨段切不对）⇒ 尾巴由
+        :meth:`_AsrManager._sent_tail_text` 算好再发给前端。
+        """
+        return self._done
 
 
 class _AsrManager:
@@ -603,6 +612,27 @@ class _AsrManager:
         #: ``{"rid", "stream_id", "base", "loop"}`` —— ``base`` 是句序号的
         #: 基准（见 :data:`_TR_FILE_INDEX_BASE`）。
         self._tr_ctx: Optional[Dict[str, Any]] = None
+        #: **本轮新增的句子**（切句器的产出）—— 随 round 帧发给前端。
+        #:
+        #: 前端的结果框按「一句一句」排版（原文 + 译文成对）⇒ 它需要知道
+        #: **句子边界**。边界由**后端**切（前端不自己断句 ⇒ 断句口径只有
+        #: 一份，见 :class:`_SentenceSplitter`）。
+        #:
+        #: ⚠️ 切句**不看翻译开关** —— 没开翻译时也要切（前端照样按句排版）；
+        #: 开关只管「送不送去翻译」（见 :meth:`_AsrManager._sent_emit`）。
+        self._sent_pending: List[Dict[str, Any]] = []
+        #: **本次识别**切出来的**全部句子**（页面刷新后恢复用）。
+        #:
+        #: ⚠️ ``_sent_pending`` 是「本轮新增」（随帧发给前端）⇒ 刷新后就没了
+        #: ⇒ 结果框会**空掉**（用户看到「刚才识别出来的内容全没了」）。
+        #: 这份是**累积**的，随 ``GET /rounds`` 一起返回 ⇒ 前端能还原。
+        self._sent_log: List[Dict[str, Any]] = []
+        #: **当前 epoch 内**的已确认文本（逐轮更新）。
+        #:
+        #: ⚠️ ``committed`` 是**段内**累积的（换 epoch 就从头开始）⇒ 前端
+        #: 不能自己拿它算「还没成句的尾巴」（跨段就对不上）⇒ **服务端算好**
+        #: 再发（见 :meth:`_AsrManager._sent_tail_text`）。
+        self._sent_committed: str = ""
         #: **epoch 内**的「字符数 → 音频时间」锚点表（懒算，见
         #: :meth:`_tr_time_table`）。
         #:
@@ -729,6 +759,15 @@ class _AsrManager:
         with self._lock:
             return dict(self._rounds_source)
 
+    def sentences(self) -> List[Dict[str, Any]]:
+        """本次识别切出来的**全部句子**（页面刷新后还原句子流用）。
+
+        ⚠️ 与 :meth:`rounds` 同一个理由 —— 轮次能恢复，句子也得能恢复，
+        否则结果框刷新后是空的（用户看到「刚才识别出来的内容全没了」）。
+        """
+        with self._lock:
+            return [dict(s) for s in self._sent_log]
+
     def _set_state(self, state: str, *, error: str = "") -> None:
         with self._lock:
             self._state = state
@@ -840,7 +879,15 @@ class _AsrManager:
                 "stopped": True,
             }
             self._set_state(self.STATE_STOPPED)
-        self._broadcast({
+        # 收尾时切出来的**最后一句** —— 跟着 ``stopped`` 帧发给前端，
+        # 否则那句话永远不出现（没有下一帧可以搭便车了）。
+        #
+        # ⚠️ **尾巴要一起发**（``sentence_tail``）—— 收尾把尾巴切成了句子
+        # ⇒ 前端手里那份「尾巴」得**清掉**，否则那句话在屏幕上出现两遍。
+        with self._lock:
+            pending = self._sent_pending
+            self._sent_pending = []
+        stopped_frame = {
             "type": "stopped",
             "request_id": rid,
             "language": language or self._language,
@@ -849,7 +896,11 @@ class _AsrManager:
             "audio_sec": audio_sec,
             # 「谁喊的停」—— 前端据此决定要不要把画面也停住。
             "reason": self._stop_reason or "user",
-        })
+            "sentence_tail": self._sent_tail_text(),
+        }
+        if pending:
+            stopped_frame["sentences"] = pending
+        self._broadcast(stopped_frame)
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     def _partial_text(self) -> str:
@@ -954,30 +1005,72 @@ class _AsrManager:
                 return t0 + (char_idx - x0) * (t1 - t0) / (x1 - x0)
         return tbl[-1][1]
 
-    def _tr_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> None:
+    def _sent_lookback(self, c0: int, c1: int) -> bool:
+        """这句是不是**回看**里切出来的（重放的旧音频）？
+
+        回看是「把上一段的音频再喂一遍」⇒ 模型会把同一句话**再转写一遍**
+        ⇒ 这句话在结果框里会**出现两遍**（上一段已经显示过）⇒ 要丢掉。
+
+        判据用**时间**：这句的结束时间落在回看窗口里（见
+        :data:`_LOOKBACK_SEC`）。
+        """
+        end_sec = self._tr_time_at(c1)
+        with self._lock:
+            lb_until = self._lookback_until_sec
+        return bool(end_sec is not None and lb_until >= 0.0
+                    and end_sec <= lb_until + 1e-6)
+
+    def _sent_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> None:
+        """切出来的一句 ⇒ ① 记进「本轮新增句子」 ②（开了翻译）送去翻译。
+
+        ⚠️ **切句与翻译解耦** —— 前端的结果框按「一句一句」排版（原文 +
+        译文成对），所以**句子边界必须一直有** ⇒ 切句器**不看**翻译开关；
+        开关只管「送不送去翻译」这一步。
+
+        ⚠️ **先送翻译、再记账** —— 「这句真的送去翻译了吗」要跟着这条句子
+        一起发给前端（``tr`` 字段）⇒ 前端才知道译文位该显示「翻译中」还是
+        空着（翻译开关可能是**识别过程中**才打开的 ⇒ 开关打开前切出来的
+        句子永远不会有译文）。
+        """
+        if self._sent_lookback(c0, c1):
+            return
+        # ⚠️ ``_tr_emit`` 自己判断「有没有翻译上下文 / 开关开没开」⇒ 没开
+        # 翻译时它直接返回 ``False``（不送，也不报错）。
+        sent = self._tr_emit(text, seq, c0, c1)
+        with self._lock:
+            entry = {"i": int(seq), "t": text, "tr": bool(sent)}
+            self._sent_pending.append(entry)
+            # ⚠️ **累积一份** —— 页面刷新后靠它还原句子流（见 ``_sent_log``）。
+            self._sent_log.append(dict(entry))
+
+    def _tr_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> bool:
         """把切出来的一句送去翻译（文件 / 视频路径）。
+
+        返回：这句话**真的送去翻译了**吗？
 
         ⚠️ **翻译出问题不许影响识别** —— 这里吞掉所有异常（翻译链路
         自己的降级在 ``translation.py`` 里做）。
         """
         ctx = self._tr_ctx
         if not ctx:
-            return
-        # ⚠️ **回看区间里的句子不翻** —— 那是切会话时**重放**的旧音频，
-        # 上一段已经翻过一遍了 ⇒ 再翻一次就是重复译文（见
-        # :data:`_LOOKBACK_SEC`）。
+            return False
         start_sec = self._tr_time_at(c0)
         end_sec = self._tr_time_at(c1)
         with self._lock:
             lb_until = self._lookback_until_sec
         if (end_sec is not None and lb_until >= 0.0
                 and end_sec <= lb_until + 1e-6):
-            return
+            return False
         try:
             from wdnapps_audio_chat.cards.qwen3_asr.translation import (
                 get_translation_service,
             )
-            get_translation_service().submit(
+            svc = get_translation_service()
+            # ⚠️ **开关没开 ⇒ 根本不会进队列**（``translation.py`` 的
+            # ``submit`` 直接返回）⇒ 别让前端以为「正在翻译」。
+            if not svc.settings().get("enabled"):
+                return False
+            svc.submit(
                 index=int(ctx["base"]) + int(seq),
                 text=text,
                 lang=self._language,
@@ -988,30 +1081,57 @@ class _AsrManager:
                 start_sec=start_sec,
                 end_sec=end_sec,
             )
+            return True
         except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
             _LOG.debug("文件路径送去翻译失败（best-effort）: %s", exc)
+            return False
 
-    def _tr_flush(self) -> None:
-        """把当前 epoch **剩下的尾巴**切出来送去翻译。
+    def _sent_flush(self) -> None:
+        """把当前 epoch **剩下的尾巴**切成一句。
 
         调用点有两个（都是「这一段不会再有新的已确认文本了」的时刻）：
         * epoch 切换（``_rotate_epoch``）—— 上一段的尾巴不带标点，
-          不主动提交就永远不译；
+          不主动切出来就永远不成句；
         * 识别收尾（``_stream_main`` 末尾）。
 
-        ⚠️ **「清空」之后不提交** —— ``_drop_frames`` 的语义就是
-        「清空之后迟到的轮次一律丢掉」；尾巴那句译文同理，否则用户刚点完
+        ⚠️ **「清空」之后不切** —— ``_drop_frames`` 的语义就是
+        「清空之后迟到的轮次一律丢掉」；尾巴那句同理，否则用户刚点完
         「清空」，页面上又冒出一行。
         """
-        if not self._tr_ctx:
-            return
         with self._lock:
             if self._drop_frames:
                 return
         try:
-            self._splitter.flush(self._tr_emit)
-        except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
+            self._splitter.flush(self._sent_emit)
+        except Exception as exc:  # noqa: BLE001 — 切句是 best-effort
             _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
+
+    def _sent_tail_text(self) -> str:
+        """当前 epoch 里「**已确认但还没成句**」的尾巴。
+
+        ⚠️ **服务端算，不让前端自己切** —— 前端拿到的 ``committed`` 是
+        **段内**累积文本（换 epoch 就从头数）⇒ 前端拿「已切成句的字符数」
+        去切 ``committed``，**跨段就对不上**（切出来是空的，或者是别的段
+        的话）⇒ 尾巴会忽有忽无。
+
+        ⚠️ **回看的那一截要跳过** —— 换 epoch 时会把最近
+        :data:`_LOOKBACK_SEC` 秒的音频**再喂一遍**给新会话（否则模型零
+        上下文 ⇒ 语种判错、文本脱节）⇒ 新 epoch 开头那一截是**重放的旧
+        内容**，屏幕上已经显示过 ⇒ 尾巴不能从那儿开始（否则同一句话在
+        上一句下面并排出现两遍）。
+        """
+        with self._lock:
+            committed = self._sent_committed or ""
+            lb_len = self._lookback_committed_len
+        done = self._splitter.done_offset()
+        # ⚠️ 取**较大**的那个起点：
+        #   * ``done``  —— 已经切成句的部分（译文挂在句子上）；
+        #   * ``lb_len`` —— 重放的旧内容（上一段已经显示过）。
+        # 两者都是「该跳过」的前缀 ⇒ 谁更靠后就从谁开始。
+        start = done if done > lb_len else lb_len
+        if start <= 0:
+            return committed
+        return committed[start:]
 
     def reset(self) -> None:
         """清空本轮结果，回到 idle。
@@ -1030,6 +1150,7 @@ class _AsrManager:
             session = self._session
             self._rounds = []
             self._rounds_source = {}
+            self._sent_log = []      # 句子流也要清（否则刷新后又冒出来）
             self._language = ""
             self._last_result = None
             self._current_request_id = None
@@ -1183,6 +1304,10 @@ class _AsrManager:
             # 序号落在不同区间（见 :data:`_TR_FILE_INDEX_BASE`）⇒ 不会和
             # 上一次识别的译文撞车（前端是**按序号覆盖**同一条译文的）。
             self._splitter.reset_request()
+            # 新的一次识别 ⇒ 上一轮的句子作废（前端会拿到新一轮的句子）。
+            with self._lock:
+                self._sent_pending = []
+                self._sent_log = []
             # ⚠️ ``tr_mode == "line"`` ⇒ **不建**句子级翻译上下文 ⇒ 后端
             # 不会自己断句、不会送翻译（译文由前端逐行来要）。否则两句
             # 译文会**同时**挂在同一行上（句子级 + 行级各一份）。
@@ -1248,6 +1373,8 @@ class _AsrManager:
             # 回看期间已确认了多长 —— 用来把回看那部分从最终文本里砍掉
             # （上一条识别留下的长度会让这一条**开头**被砍掉一截 ✗）。
             self._lookback_committed_len = 0
+            # 本 epoch 的已确认文本（尾巴按它算）—— 新的一条 ⇒ 归零。
+            self._sent_committed = ""
         try:
             model_id, session = self._select_session()
         except RuntimeError as e:
@@ -1316,14 +1443,27 @@ class _AsrManager:
                 "epoch_errors": result.get("epoch_errors", 0),
             }
             self._set_state(self.STATE_DONE)
-        self._broadcast({
+        # 收尾时切出来的**最后一句**（没有下一帧可以搭便车了）—— 跟着
+        # ``done`` 帧发给前端，否则那句话永远不出现。
+        #
+        # ⚠️ **尾巴要一起发**（``sentence_tail``）—— 收尾把尾巴切成了句子
+        # ⇒ 前端手里那份「尾巴」得**清掉**，否则那句话在屏幕上出现两遍
+        # （一次是尾巴，一次是句子）。
+        with self._lock:
+            pending = self._sent_pending
+            self._sent_pending = []
+        done_frame = {
             "type": "done",
             "request_id": rid,
             "language": language or self._language,
             "text": body,
             "elapsed_sec": elapsed,
             "audio_sec": result.get("audio_sec", 0.0),
-        })
+            "sentence_tail": self._sent_tail_text(),
+        }
+        if pending:
+            done_frame["sentences"] = pending
+        self._broadcast(done_frame)
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     async def _stream_main(self, rid: int, session, chunk_factory,
@@ -1532,15 +1672,19 @@ class _AsrManager:
             #
             # 为什么必须在这里显式提交：``committed`` 是**段内累计**的，
             # 换段后 decoder 重置、文本从头开始 ⇒ 上一段末尾那半句（通常
-            # 没有标点）**再也不会出现在任何一轮里** ⇒ 不提交就永远不译。
+            # 没有标点）**再也不会出现在任何一轮里** ⇒ 不切出来就永远不成句。
             #
             # 放在 ``_close_epoch`` **之后** —— 那次 final 调用会投递最后
             # 一轮的 delta（``respond()`` 返回前保证投递完），先把新确认的
             # 文本切完，再把尾巴兜底提交。
-            self._tr_flush()
+            self._sent_flush()
             # 换段 ⇒ 切句器的**文本记账**归零（句子序号继续，见
             # ``_SentenceSplitter.reset_epoch``）。
             self._splitter.reset_epoch()
+            # 换段 ⇒ 本 epoch 的已确认文本也归零（``committed`` 是**段内**
+            # 累积的 ⇒ 新段从头数，尾巴按新段算）。
+            with self._lock:
+                self._sent_committed = ""
             # 换段 ⇒ 时间表也归零（段内坐标，不能跨段用）
             self._tr_time_reset()
             # ⚠️ 回看的文本长度归零（**在收尾之后** —— 收尾那次 final
@@ -1717,8 +1861,8 @@ class _AsrManager:
         # 否则最后几个 token 不会被确认（末块要标 is_last）。
         await _close_epoch("final")
         # ⚠️ **收尾也要切一刀** —— 最后一句通常没有句末标点（说话说到
-        # 一半就停了）⇒ 不主动提交，它就永远拿不到译文。
-        self._tr_flush()
+        # 一半就停了）⇒ 不主动切出来，它就永远不成句（也就永远没有译文）。
+        self._sent_flush()
         if epoch_errors and not segments:
             # 一段文本都没产出 → 报错比交一份空结果有用（见 ``_close_epoch``）。
             if last_error is not None:
@@ -1861,32 +2005,51 @@ class _AsrManager:
                 self._pause_rounds = 1
             self._last_unfixed = utxt
             self._pause_hit = self._pause_rounds >= _PAUSE_ROUNDS_LIMIT
-        # 音轨起点（容器里音轨可能晚于画面起点）——前端要靠它换算
-        # 「播放头时间 → 音频时间」才能让字幕跟着画面走。
-        # 常见情况是 0，就不带这个键（省一点带宽）。
-        if abs(origin) > 1e-6:
-            frame["audio_origin_sec"] = origin
-        self._broadcast({"type": "round", **frame})
-        # ---- 实时翻译（文件 / 视频路径）：自己断句 -------------------- #
+        # ---- 断句（**总是**做） ---------------------------------------- #
         #
         # 文件路径**没有** endpoint 帧（那是实时路径的端点检测）⇒ 只能拿
-        # ``committed``（当前 epoch 内累积的已确认文本）自己切句，切出
-        # 完整句就送去翻译。
+        # ``committed``（当前 epoch 内累积的已确认文本）自己切句。
+        #
+        # ⚠️ **切句不看翻译开关** —— 前端的结果框按「一句一句」排版
+        # （原文 + 译文成对）⇒ 句子边界必须一直有；开关只管「送不送去
+        # 翻译」（见 ``_sent_emit``）。
         #
         # ⚠️ 这一步在 **cshim 读线程**上（delta 是从 DDS 那边过来的），
         # 而 ``_rotate_epoch`` 的 flush 在**识别线程**上 —— 两者不会撞：
         # ``respond()`` 返回前保证这一轮的 delta **已经投递完**
         # （见 ``wdndds/ai_session.py`` 的 ``bridge.done.wait``）⇒
         # flush 一定发生在本轮 feed 之后。
-        if self._tr_ctx is not None:
-            # 时间锚点：**先记再切** —— 这一轮的「已确认字数 → 结束时间」
-            # 是下一句换算时间的依据。
-            self._tr_time_note(frame["committed"], frame.get("unfixed") or "",
-                               frame.get("chunk_end_sec"))
-            try:
-                self._splitter.feed(frame["committed"], self._tr_emit)
-            except Exception as exc:  # noqa: BLE001 — 翻译是 best-effort
-                _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
+        #
+        # ⚠️ **必须在这一帧广播之前切完** —— 本轮新切出的句子要**跟着
+        # 这一帧**发给前端（``sentences``），前端才知道「哪句到哪了」。
+        # 时间锚点也是**先记再切** —— 这一轮的「已确认字数 → 结束时间」
+        # 是下一句换算时间的依据。
+        self._tr_time_note(frame["committed"], frame.get("unfixed") or "",
+                           frame.get("chunk_end_sec"))
+        # ⚠️ **先记下本轮的已确认文本** —— 「尾巴」按它算（见
+        # :meth:`_sent_tail_text`）。
+        with self._lock:
+            self._sent_committed = frame["committed"] or ""
+        try:
+            self._splitter.feed(frame["committed"], self._sent_emit)
+        except Exception as exc:  # noqa: BLE001 — 切句是 best-effort
+            _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
+        with self._lock:
+            pending = self._sent_pending
+            self._sent_pending = []
+        if pending:
+            frame["sentences"] = pending
+        # 「**已确认但还没成句**」的尾巴 —— **服务端算好**再发。
+        #
+        # ⚠️ 不让前端自己切：``committed`` 是**段内**累积文本（换 epoch 就
+        # 从头数）⇒ 前端切不对（理由见 :meth:`_sent_tail_text`）。
+        frame["sentence_tail"] = self._sent_tail_text()
+        # 音轨起点（容器里音轨可能晚于画面起点）——前端要靠它换算
+        # 「播放头时间 → 音频时间」才能让字幕跟着画面走。
+        # 常见情况是 0，就不带这个键（省一点带宽）。
+        if abs(origin) > 1e-6:
+            frame["audio_origin_sec"] = origin
+        self._broadcast({"type": "round", **frame})
 
     def _run(
         self,
@@ -1950,13 +2113,22 @@ class _AsrManager:
                 "elapsed_sec": elapsed,
             }
             self._set_state(self.STATE_DONE)
-        self._broadcast({
+        # 收尾时切出来的最后一句（没有下一帧可以搭便车了）—— 跟着
+        # ``done`` 帧发给前端，否则那句话永远不出现。
+        with self._lock:
+            pending = self._sent_pending
+            self._sent_pending = []
+        done_frame = {
             "type": "done",
             "request_id": rid,
             "language": language or self._language,
             "text": body,
             "elapsed_sec": elapsed,
-        })
+            "sentence_tail": self._sent_tail_text(),
+        }
+        if pending:
+            done_frame["sentences"] = pending
+        self._broadcast(done_frame)
         self._broadcast({"type": "state", "state": self.snapshot()})
 
     def _fail(self, rid: int, detail: str) -> None:

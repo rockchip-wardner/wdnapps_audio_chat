@@ -412,6 +412,35 @@
   display: none;
 }
 
+/* ⚠️ **音频文件来源** ⇒ 结果框里画的是「**句子流**」（原文 + 译文成对）
+ * ⇒ 那两个「镜像」span（连续文本）要藏起来 —— 否则同一段内容在框里
+ * 出现两遍（句子流一份、连续文本一份）。
+ *
+ * ⚠️ **隐藏 ≠ 不更新** —— 回归脚本仍从 `#asr-live-committed` 读最终文本
+ * （见 ``verify_asr_wizard.py`` 的 ``dom_transcript``）。 */
+.asr-live.asr-live-file .asr-live-committed,
+.asr-live.asr-live-file .asr-live-unfixed {
+  display: none;
+}
+
+/* ⚠️ **麦克风来源**同理 —— 句子流（`#asr-rt-sentences`）取代了那两个
+ * 镜像 span（同一段内容不出现两遍）。 */
+#asr-rt-text .asr-live-committed,
+#asr-rt-text .asr-live-unfixed {
+  display: none;
+}
+
+/* ⚠️ **装句子流的这两个框要 `white-space: normal`** ——
+ * `.asr-live` 默认是 `pre-wrap`（单行模式要保留模型给的换行）⇒ 模板里
+ * 那些缩进与换行会**渲染成空行**（实测：结果框顶部凭空多出 ~110 px 空白）。
+ *
+ * 视频来源早就处理过（见上面的 `.asr-live.asr-live-video`）—— 现在
+ * 「音频文件」与「麦克风」两个框里装的也是逐块排版的内容 ⇒ 一并处理。 */
+.asr-live.asr-live-file,
+#asr-rt-text {
+  white-space: normal;
+}
+
 .asr-transcript {
   padding: 10px 14px 12px;
   /* 同上：模板里的换行 + 缩进在 pre-wrap 下会变成空行 */
@@ -593,7 +622,7 @@
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .asr-tr-switch {
@@ -604,35 +633,65 @@
   color: #374151;
 }
 
-.asr-tr-out {
-  max-height: 16rem;
-  overflow-y: auto;
-  padding-top: 8px;
-  border-top: 1px dashed #bfdbfe;
-}
-
-.asr-tr-item {
-  margin-bottom: 10px;
-}
-
-.asr-tr-src {
+/* 一行说明 —— 告诉用户「译文去哪了」。
+   ⚠️ 这一块**只有控制条**，译文在下方「实时结果」框里（原文 + 译文成对）
+   ⇒ 不再单独列一份译文（那样同一句话会出现两遍）。 */
+.asr-tr-note {
   font-size: 0.85rem;
-  color: #6b7280;
-  line-height: 1.35;
+  color: #4b5563;
+  line-height: 1.5;
 }
 
-.asr-tr-dst {
+/* ------------------------------------------------------------------ *
+ * 句子流（结果框按句排版）
+ *
+ * 一句一句，**原文 + 译文成对** —— 译文挂在它自己的原文下面 ⇒
+ * 一一对应，不重复。
+ * ------------------------------------------------------------------ */
+.asr-sentences {
+  /* ⚠️ `.asr-live` 是 `white-space: pre-wrap`（单行模式要保留模型给的换行）
+     —— 句子是**逐块**排的，pre-wrap 会把模板里的换行变成空行 ⇒ normal。 */
+  white-space: normal;
+  line-height: 1.6;
+}
+
+.asr-sent {
+  margin: 0 0 10px;
+  padding: 0 0 8px;
+  border-bottom: 1px dashed var(--border, #e5e7eb);
+}
+
+/* 原文 */
+.asr-sent-src {
   font-size: 1rem;
   color: #111827;
-  line-height: 1.45;
+  line-height: 1.55;
 }
 
-.asr-tr-dst.is-muted {
+/* 译文 —— 缩进 + 左侧竖线，挂在它自己的原文下面 */
+.asr-sent-dst {
+  font-size: 0.95rem;
+  color: #374151;
+  line-height: 1.5;
+  margin-top: 3px;
+  padding-left: 10px;
+  border-left: 2px solid var(--accent, #2563eb);
+}
+
+.asr-sent-dst.is-muted {
   color: #9ca3af;
-  font-size: 0.9rem;
-}
-
-.asr-tr-empty {
   font-size: 0.85rem;
-  color: #9ca3af;
+  border-left-color: #e5e7eb;
+}
+
+/* 尾巴：已确认但**还没成句**（模型正在说的话） */
+.asr-sent-tail {
+  color: #111827;
+  line-height: 1.55;
+}
+
+/* 未确认的尾巴 —— 蓝色（与 C demo 的 ANSI_COLOR_BLUE 对应） */
+.asr-sent-live {
+  color: #1d4ed8;
+  line-height: 1.55;
 }

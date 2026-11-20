@@ -233,15 +233,19 @@ async def get_asr_snapshot() -> dict:
 async def get_asr_rounds() -> dict:
     """本次识别的逐轮明细（页面刷新后恢复）。
 
-    响应形状：``{"rounds": [...], "source": {...}}``。
+    响应形状：``{"rounds": [...], "source": {...}, "sentences": [...]}``。
 
     ``source`` —— 这批轮次**归属的来源**（``{"kind", "name", "path"}``）。
     ⚠️ 必须由**服务端**给，不能让前端自己猜：前端只知道「当前停在
     哪个页签」，刷新后那个页签是**默认值**（音频文件）→ 猜出来的
     归属会把**视频**的轮次画到音频页签下（或反之）= 串台。
+
+    ``sentences`` —— 本次识别切出来的**句子**（原文 + 译文成对的那份原文）。
+    ⚠️ 轮次能恢复、句子也得能恢复 ⇒ 否则刷新后结果框是空的。
     """
     svc = get_asr_service()
-    return {"rounds": svc.rounds(), "source": svc.rounds_source()}
+    return {"rounds": svc.rounds(), "source": svc.rounds_source(),
+            "sentences": svc.sentences()}
 
 
 @router.post("/upload")
