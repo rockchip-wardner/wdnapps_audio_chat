@@ -2204,6 +2204,33 @@ const Qwen3Asr = {
     }
   },
 
+  /** 音频文件来源 → 起播（同传的「跟播放」需要播放头在走）。 */
+  _playAudioIfAny() {
+    if (this._source !== "file") return;
+    const a = document.getElementById("asr-audio-player");
+    if (!a || !a.src) return;
+    // ⚠️ **已经播完就别再 play()** —— HTML5 规定：媒体 ``ended`` 之后
+    // 再 ``play()`` 会**从头重播** ⇒ 播放头回到 0 ⇒「源已结束」被清掉
+    // ⇒ 跟播放又得从头等 ⇒ 后面识别出来的句子又被压住
+    // ⇒ **「只播放了第一句」**（实测，用户报）。
+    //
+    // ⇒ 源已经播完了 ⇒ 剩下的译文靠「源已结束 ⇒ 直接补播」那条路
+    //    （服务端知道），**不需要**把媒体倒回去重播。
+    //
+    // ⚠️ **2026-11-22 实测过「倒回 0 再播」**：会把「源已结束」清掉
+    // ⇒ 跟播放又从头等 ⇒ 回归第三场（「源结束后开始识别 ⇒ 全部放行
+    // + source_done」）**失败** ⇒ 保持现状（不倒带）。
+    if (a.ended) return;
+    const p = a.play();
+    if (p && typeof p.catch === "function") {
+      p.catch((e) => {
+        // 自动播被浏览器策略拦下（点「开始识别」是用户手势 ⇒ 正常不该
+        // 发生；真发生了用户手动点一下播放键即可）。
+        console.info("[qwen3-asr] 音频自动播放未执行:", e && e.name);
+      });
+    }
+  },
+
   /* ------------------------------------------------------------------ *
    * 板载麦克风（设备端 ALSA → 独立采集进程）
    * ------------------------------------------------------------------ */
@@ -4269,6 +4296,20 @@ const Qwen3Asr = {
       if (this._trMode === "line") fd.append("translate_mode", "line");
       // 不带 online_* 参数 → SDK 用 ONLINE_*_DEFAULT（= C demo 常量）
 
+      // ⚠️⚠️ **媒体必须在 ``await`` 之前起播**（实测 2026-11-23）：
+      //
+      // 「点开始识别」这个**用户手势**只在**当前任务**里有效 → 一旦
+      // ``await fetch(...)`` 把控制权交出去，手势就**过期**了 → 浏览器
+      // 的 autoplay 策略会**拦下带声音的自动播放** → 媒体**根本没播**
+      // → 播放头**一动不动** →「跟播放」永远等不到 → 全部句子只能靠
+      // 10 秒的兜底放行 → 用户看到的是「译文慢半拍、甚至不出声」
+      // （实测：journal 里整个会话只有**一次** ``interp/playhead`` 上报
+      // —— 媒体压根没动过）。
+      //
+      // → 先起播（**同步**，还在手势里），再发识别请求。
+      this._playVideoIfAny();
+      this._playAudioIfAny();
+
       const r = await fetch(API_PREFIX + "/qwen3-asr/transcribe", {
         method: "POST", body: fd,
       });
@@ -4280,33 +4321,6 @@ const Qwen3Asr = {
         return false;
       }
       if (data.snapshot) this._applySnapshot(data.snapshot);
-      // 视频来源 → 跟着播起来。
-      //
-      // 点「开始识别」本身就是**用户手势** → 浏览器允许带声音自动播
-      // （没有手势的话会被 autoplay 策略拦掉）。
-      this._playVideoIfAny();
-      // 音频文件来源 → 同样跟着播起来（同传的「跟播放」需要播放头在走；
-      // 点「开始识别」是用户手势 ⇒ 浏览器允许带声音自动播）。
-      if (this._source === "file") {
-        const a = document.getElementById("asr-audio-player");
-        // ⚠️ **已经播完就别再 play()** —— HTML5 规定：媒体 ``ended`` 之后
-        // 再 ``play()`` 会**从头重播** ⇒ 播放头回到 0 ⇒「源已结束」被清掉
-        // ⇒ 跟播放又得从头等 ⇒ 后面识别出来的句子又被压住
-        // ⇒ **「只播放了第一句」**（实测，用户报）。
-        //
-        // ⇒ 源已经播完了 ⇒ 剩下的译文靠「源已结束 ⇒ 直接补播」那条路
-        //    （服务端知道），**不需要**把媒体倒回去重播。
-        //
-        // ⚠️ **2026-11-22 实测过「倒回 0 再播」**：会把「源已结束」清掉
-        // ⇒ 跟播放又从头等 ⇒ 回归第三场（「源结束后开始识别 ⇒ 全部放行
-        // + source_done」）**失败** ⇒ 保持现状（不倒带）。
-        if (a && a.src && !a.ended) {
-          try {
-            const p = a.play();
-            if (p && typeof p.catch === "function") p.catch(() => { /* noop */ });
-          } catch (e) { /* noop */ }
-        }
-      }
       return true;
     } catch (e) {
       this._showError("识别请求失败: " + e);

@@ -388,6 +388,14 @@ class _Counters:
     last_peak: float = 0.0
     #: 最近一句**缩放前**（模型原始）的峰值 —— 用来算「本来该多大」。
     last_raw_peak: float = 0.0
+    #: **真正送进 aplay 的峰值**（最近一句）—— 「出声了没有」的**硬证据**。
+    #:
+    #: ⚠️ **为什么要有它**（实测 2026-11-23，用户报「再开始识别就不在
+    #: 播放了」）：``AplayWriter.write()`` 在 ``_alive=False``（死管道）时
+    #: **静默 return** ⇒ **连峰值都不更新** ⇒ ⇒ 这个数 **> 0** 就说明
+    #: PCM **真的进了活着的管道** ⇒ **真的出声了**；
+    #: **= 0** ⇒ 写进了死管道 ⇒ **一声不响**（日志也没有告警）。
+    last_out_peak: float = 0.0
     #: 最近播完的一句的**可听滞后**（译文出声 − 源话开口，秒）。
     last_a_lag: float = 0.0
 
@@ -742,6 +750,51 @@ class TTSQueue:
             except Exception as exc:  # noqa: BLE001
                 LOG.debug("tts-queue: 关 aplay 失败: %s", exc)
 
+    @staticmethod
+    def _writer_alive(writer) -> bool:
+        """这个 aplay **还活着**吗？（死管道 ⇒ 写进去的 PCM 没人放）
+
+        ⚠️ **``ok`` 的两种形态都要认**：SDK 里它是 **property**
+        （``AplayWriter.ok``），但也可能被换成**方法** ⇒
+        ``getattr(writer, "ok", True)`` 拿到 bound method 时**恒为真**
+        ⇒ 死管道**永远不会被发现** ⇒ 音频全写进死管道 ⇒ **一声不响**
+        且**日志一条告警都没有**（实测 2026-11-23）。
+
+        ⚠️ **为什么必须主动判活**：``AplayWriter.write()`` 在
+        ``_alive=False`` 时是**静默 return**（不抛异常）⇒ 死管道
+        **没有任何报错** ⇒ 只能靠这里核对。
+        """
+        if writer is None:
+            return False
+        try:
+            flag = getattr(writer, "ok", True)
+        except Exception:  # noqa: BLE001
+            return False
+        if callable(flag):
+            # ``ok`` 是**方法**的形态 ⇒ 调它（bound method 恒为真 ⇒ 判错）
+            try:
+                flag = flag()
+            except Exception:  # noqa: BLE001
+                return False
+        return bool(flag)
+
+    def _writer_is_current(self, writer) -> bool:
+        """这个 writer 还是**队列当前那个**、而且**还活着**吗？
+
+        ⚠️ **为什么要核对「是不是当前那个」**（实测 2026-11-23，用户报
+        「播放完一次之后，再开始识别就不在播放了」）：
+        ``clear()`` 在**没人播**时会把 aplay 关掉（释放 ALSA 独占设备）⇒
+        队列里 ``self._writer`` 被置空 ⇒ **播放线程手里的局部变量**还
+        指着那个**已经关掉**的 writer ⇒ 它**不是当前那个**了。
+        """
+        if writer is None:
+            return False
+        with self._cond:
+            current = self._writer
+        if current is not writer:
+            return False
+        return self._writer_alive(writer)
+
     def flush_by_position(self, pos_sec: float, direction: str = "") -> dict:
         """**seek 之后**：把与新位置不匹配的音频全部丢掉。
 
@@ -900,6 +953,9 @@ class TTSQueue:
             # **电平探针**（诊断「没播」vs「播得太小」）
             "last_peak": round(c.last_peak, 4),
             "last_raw_peak": round(c.last_raw_peak, 4),
+            # ⚠️ **真正送进 aplay 的峰值**（> 0 ⇒ 真的出声了）
+            # （死管道**不更新**它 ⇒ = 0 ⇒ 写进了死管道 ⇒ 一声响不）。
+            "last_out_peak": round(c.last_out_peak, 4),
             # **分段计时**（诊断滞后明细）
             "timings": list(self._played_timings),
         }
@@ -1218,6 +1274,29 @@ class TTSQueue:
                         self._inflight.remove(job)
                     self._cond.notify_all()
                 continue
+            # ⚠️⚠️ **writer 可能被「播放线程背后」关掉**（实测 2026-11-23，
+            # 用户报「选『音频文件』有翻译，但播放完一次之后，再开始识别就
+            # 不在播放了」）：
+            #
+            # * ``clear()`` 在**没人播**时会把 aplay 关掉（释放 ALSA 独占
+            #   设备 —— 同传停下来就得让出来）⇒ **新一轮识别**正好走这条路
+            #   （``interp.on_new_stream`` → ``queue_clear()``）；
+            # * 但**播放线程手里的局部变量**还指着那个**已经关掉**的
+            #   writer ⇒ ``AplayWriter.write()`` 在 ``_alive=False`` 时
+            #   **静默 return**（不抛异常）⇒ 音频**写进死管道** ⇒
+            #   **不出声、日志一条告警都没有**；
+            # * 局部变量**非 None** ⇒ 播放线程**永远不会新建 aplay**
+            #   ⇒ 这一轮之后**全程无声**（实测：journal 里新一轮识别之后
+            #   再没有 ``aplay-writer`` 日志 ⇒ 正是这个；只有等
+            #   ``_WRAPPER_IDLE_CLOSE_SEC`` 的空闲关闭把它置空，下一轮
+            #   才恢复 —— 实测用户端**哑了 3 分多钟**）。
+            #
+            # ⇒ 写之前核对：局部 writer 是不是**队列当前那个**、而且
+            #   **还活着** ⇒ 不是就丢掉它 ⇒ 下面那段会**重开**一个。
+            if writer is not None and not self._writer_is_current(writer):
+                LOG.info("tts-queue: aplay 已被关闭（新一轮识别？）⇒ 重开管道")
+                writer = None
+                writer_tempo = None
             # ⚠️ **变速变了 ⇒ aplay 管道得重开**（sox 的 tempo 是 spawn
             # 时定死的）。
             if writer is not None and writer_tempo != job.tempo:
@@ -1235,7 +1314,7 @@ class TTSQueue:
                         AplayWriter,
                     )
                     writer = AplayWriter(volume=job.volume, tempo=job.tempo)
-                    if not getattr(writer, "ok", True):
+                    if not self._writer_alive(writer):
                         raise RuntimeError("aplay 启动失败")
                     writer_tempo = job.tempo
                     with self._cond:
@@ -1278,7 +1357,7 @@ class TTSQueue:
                     self._cond.notify_all()
             except Exception as exc:  # noqa: BLE001
                 LOG.warning("tts-queue: 播放失败: %s", exc)
-                if writer is not None and not getattr(writer, "ok", True):
+                if writer is not None and not self._writer_alive(writer):
                     writer = None
                 with self._cond:
                     self._c.failed += 1
@@ -1319,6 +1398,13 @@ class TTSQueue:
             self._c.last_a_lag = float(getattr(job, "a_lag", 0.0) or 0.0)
             self._c.last_peak = float(job.peak or 0.0)
             self._c.last_raw_peak = float(job.raw_peak or 0.0)
+            # ⚠️ **真正送进 aplay 的峰值** —— 「出声了没有」的硬证据。
+            # ⚠️ **死管道不更新峰值**（``write()`` 在 ``_alive=False`` 时
+            # 直接 return）⇒ **= 0** ⇒ PCM 写进了死管道 ⇒ **一声不响**。
+            try:
+                self._c.last_out_peak = float(getattr(writer, "peak", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                self._c.last_out_peak = 0.0
             self._played.append(job.text)
             # ⚠️ **分段计时**（诊断同传滞后明细）：这几句分别卡在哪一段
             self._played_timings.append({
