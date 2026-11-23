@@ -102,7 +102,7 @@ DEFAULT_MODEL = MODEL_IDS[0]
 
 #: 模型**没装**时（manifest 不存在 ⇒ 算力页上根本没有这张卡）的兜底标签。
 _FALLBACK_LABELS = {
-    "intern-decision-4b": "[JEV]图像文字决策模型4B",
+    "intern-decision-4b": "[DM]图像文字决策模型4B",
     "intern-decision-0.8b": "[JEV]图像文字决策模型0.8B",
 }
 
