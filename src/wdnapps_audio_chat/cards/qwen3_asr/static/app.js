@@ -501,6 +501,38 @@ const Qwen3Asr = {
     language: "",
   },
 
+  /* ---------------- 同声传译状态（2026-11-21） ---------------- */
+  _interp: {
+    running: false,      // 同传引擎在跑吗
+    mode: "steady",      // 切句档位：fast | steady
+    gate: "now",         // 播放时机：now | follow
+    targetLang: "zh-CN", // 目标语言（provider 的语言 key）
+    speaker: "",         // 内置音色（SDK 的 SPK_ID）
+    refSpeaker: "",      // 参考音色（voice-clone）—— 本板只有这类可用
+    gateTouched: false,  // 用户**自己**选过播放时机吗（没选过才用默认）
+    // ⚠️ **默认 0.5**（振幅倍率）—— 板端实测：0.1 ⇒ 出声峰值只有
+    // 0.025（≈ −32 dBFS）⇒ 板载小喇叭上基本听不见 ⇒ 用户会报
+    // 「有翻译，但是没有播放」。与 TTS 卡的默认值一致。
+    volume: 0.5,
+    source: "live",      // live | file —— 决定滞后口径
+    tts: true,           // TTS 可用吗（不可用 ⇒ 降级为仅字幕）
+    status: {},          // 最近一次后端状态
+    loaded: false,       // 下拉选项拉过了
+    phTimer: null,       // 播放头上报的定时器
+    lastPh: -1,          // 上次上报的播放头（没变就不报）
+    lastPlaying: null,
+    lastEnded: false,    // 上次上报的「媒体已播完」
+    lastFailed: false,   // 上次上报的「媒体出错」
+    timer: null,         // 状态轮询的定时器
+    streamId: "",        // 当前流 id（播放头按流上报）
+    audioSrc: "",        // 音频播放器的当前 src（换了才 reload）
+    // 媒体**为什么没在放**（空 = 没有已知原因）——
+    // ⚠️ 面板提示每秒被 _interpSyncUi() 刷一遍 ⇒ 光在 play() 的
+    // catch 里写一句，下一秒就没了 ⇒ 用户只看到泛泛的提示，
+    // 不知道**到底为什么没声音** ⇒ 记成状态。
+    mediaBlocked: "",
+  },
+
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
   _tr: {
     enabled: false,      // 「实时翻译」开关
@@ -634,6 +666,7 @@ const Qwen3Asr = {
       this._setFileBlob(f);            // 视频来源要用 blob URL 播
       this._syncSourceUi();
       this._syncVideoPlayer();
+      this._syncAudioPlayer();          // 音频文件源（2026-11-21）
     });
 
     $("asr-source")?.addEventListener("input", (e) => {
@@ -644,6 +677,7 @@ const Qwen3Asr = {
       //   不跟着走的话：用户填了 .mp4、页签还停在「音频文件」⇒ 前端按
       //   音频播、后端按视频记 ⇒ 播放器不出现，两边口径也对不上。
       this._applyKindFromPath(this._path);
+      this._syncAudioPlayer();          // 音频文件源（2026-11-21）
     });
 
     // 设备端文件浏览（与 vtl / vd 共用 FSModal）
@@ -723,6 +757,48 @@ const Qwen3Asr = {
     $("asr-tr-model-btn")?.addEventListener("click", () => this._trEnableModel());
     // 预览播放器的收尾守卫（向导卸载 / 离开卡片时停掉播放）
     this._bindPreviewGuards();
+
+    // ---- 同声传译（2026-11-21） ------------------------------------- //
+    $("asr-interp-start")?.addEventListener("click", () => this._interpStart());
+    $("asr-interp-stop")?.addEventListener("click", () => this._interpStop());
+    $("asr-interp-mode")?.addEventListener("change", (e) => {
+      this._interp.mode = e.target.value;
+      this._interpSettings({ mode: e.target.value });
+    });
+    $("asr-interp-gate")?.addEventListener("change", (e) => {
+      this._interp.gate = e.target.value;
+      this._interp.gateTouched = true;     // 用户选过了 ⇒ 不再用默认值
+      this._interpSettings({ gate: e.target.value });
+    });
+    $("asr-interp-target")?.addEventListener("change", (e) => {
+      this._interp.targetLang = e.target.value;
+      this._interpSettings({ target_lang: e.target.value });
+    });
+    $("asr-interp-speaker")?.addEventListener("change", (e) => {
+      // ⚠️ **音色分两类，必须分开传给后端**：
+      // * ``kind === "ref"``     ⇒ **参考音色**（voice-clone）⇒ ``ref_speaker``；
+      // * ``kind === "builtin"`` ⇒ **内置音色**（SDK 的 SPK_ID）⇒ ``speaker``。
+      //
+      // ⇒ 混用 ⇒ SDK 打印「not in SPK_ID, skipping」⇒ **没有音色条件**
+      // ⇒ 模型每次自由发挥 ⇒ **每句话音色都不一样**（用户实测报的现象）。
+      const id = e.target.value || "";
+      const kind = e.target.dataset.kind === "builtin" ? "builtin" : "ref";
+      this._interp.speaker = (kind === "builtin") ? id : "";
+      this._interp.refSpeaker = (kind === "ref") ? id : "";
+      this._interpSettings({
+        speaker: this._interp.speaker,
+        ref_speaker: this._interp.refSpeaker,
+      });
+    });
+    $("asr-interp-volume")?.addEventListener("change", (e) => {
+      // ⚠️ **别用 `|| 10` 这种写法** —— 音量 0（静音）是合法值，
+      // 兜底值应该跟默认档一致（0.5）。
+      const v = Number(e.target.value);
+      this._interp.volume = Number.isFinite(v) ? v / 100 : 0.5;
+      this._interpSettings({ volume: this._interp.volume });
+    });
+    this._interpLoadOptions();
+    this._interpSyncUi();
 
     // 输入来源切换（音频文件 / 含音轨的视频 / 板载麦克风 / 浏览器麦克风）
     document.querySelectorAll("#asr-source-tabs .asr-source-tab")
@@ -870,6 +946,8 @@ const Qwen3Asr = {
     this._syncSourceUi();
     this._syncLiveUi();          // 实时区块的显隐由「flag + 当前来源」共同决定
     this._syncVideoPlayer();     // 视频来源才有播放器
+    this._syncAudioPlayer();     // 音频文件源的播放器（2026-11-21，同传的播放头）
+    this._interpSyncUi();        // 播放时机的可用性跟着来源走
     // 显示模式要跟着来源走：视频来源下「文字显示框」是字幕同款转写框，
     // 音频文件来源下才是原来的单行「实时结果」。
     this._applyMode();
@@ -1063,8 +1141,35 @@ const Qwen3Asr = {
     });
     window.addEventListener("hashchange", () => {
       const cur = (location.hash || "").replace(/^#/, "");
-      if (cur !== "qwen3-asr") this._previewClose();
+      if (cur !== "qwen3-asr") {
+        this._previewClose();
+        // ⚠️ 离开卡片 ⇒ **同传必须停**（否则板载扬声器还在播译文）。
+        this._interpLeaveGuard();
+      }
     });
+  },
+
+  /**
+   * 离开卡片时的同传收尾（停引擎 + 清 TTS 队列）。
+   *
+   * ⚠️ 用 ``sendBeacon`` 兜底（页面正在卸载，普通 fetch 可能发不出去）。
+   */
+  _interpLeaveGuard() {
+    if (!this._interp.running) return;
+    this._interp.running = false;
+    this._interpStopPlayhead();
+    this._interpStopTimer();
+    try {
+      const blob = new Blob([JSON.stringify({})],
+        { type: "application/json" });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon("/api/qwen3-asr/interp/stop", blob);
+      }
+    } catch (e) { /* noop */ }
+    try {
+      fetch("/api/qwen3-asr/interp/stop", { method: "POST",
+        keepalive: true }).catch(() => { /* noop */ });
+    } catch (e) { /* noop */ }
   },
 
   /**
@@ -2084,6 +2189,11 @@ const Qwen3Asr = {
     if (this._source !== "video") return;
     const video = document.getElementById("asr-video");
     if (!video || !video.src) return;
+    // ⚠️ **已经播完就别再 play()** —— HTML5 规定：媒体 ``ended`` 之后
+    // 再 ``play()`` 会**从头重播** ⇒ 播放头回到 0 ⇒「源已结束」被清掉
+    // ⇒ 跟播放又得从头等 ⇒ 后面识别出来的句子又被压住
+    // ⇒ **「只播放了第一句」**（实测，用户报）。
+    if (video.ended) return;
     const p = video.play();
     if (p && typeof p.catch === "function") {
       p.catch((e) => {
@@ -4175,6 +4285,28 @@ const Qwen3Asr = {
       // 点「开始识别」本身就是**用户手势** → 浏览器允许带声音自动播
       // （没有手势的话会被 autoplay 策略拦掉）。
       this._playVideoIfAny();
+      // 音频文件来源 → 同样跟着播起来（同传的「跟播放」需要播放头在走；
+      // 点「开始识别」是用户手势 ⇒ 浏览器允许带声音自动播）。
+      if (this._source === "file") {
+        const a = document.getElementById("asr-audio-player");
+        // ⚠️ **已经播完就别再 play()** —— HTML5 规定：媒体 ``ended`` 之后
+        // 再 ``play()`` 会**从头重播** ⇒ 播放头回到 0 ⇒「源已结束」被清掉
+        // ⇒ 跟播放又得从头等 ⇒ 后面识别出来的句子又被压住
+        // ⇒ **「只播放了第一句」**（实测，用户报）。
+        //
+        // ⇒ 源已经播完了 ⇒ 剩下的译文靠「源已结束 ⇒ 直接补播」那条路
+        //    （服务端知道），**不需要**把媒体倒回去重播。
+        //
+        // ⚠️ **2026-11-22 实测过「倒回 0 再播」**：会把「源已结束」清掉
+        // ⇒ 跟播放又从头等 ⇒ 回归第三场（「源结束后开始识别 ⇒ 全部放行
+        // + source_done」）**失败** ⇒ 保持现状（不倒带）。
+        if (a && a.src && !a.ended) {
+          try {
+            const p = a.play();
+            if (p && typeof p.catch === "function") p.catch(() => { /* noop */ });
+          } catch (e) { /* noop */ }
+        }
+      }
       return true;
     } catch (e) {
       this._showError("识别请求失败: " + e);
@@ -4598,6 +4730,474 @@ const Qwen3Asr = {
     }, delay);
   },
 
+  /* ================================================================ *
+   * 同声传译（2026-11-21）
+   *
+   * 流程：ASR 出句（实时 endpoint / 文件标点）→ 翻译 → 播报（板载扬声器）。
+   * 服务端在 ``cards/qwen3_asr/interp.py``；这里只管**面板**和**播放头**。
+   * ================================================================ */
+
+  /** 这一路是「实时流」还是「文件流」？ */
+  _interpSource() {
+    const src = this._source || "file";
+    return (src === "board" || src === "browser") ? "live" : "file";
+  },
+
+  /** 有播放头的源（文件 / 视频）才能「跟播放」。 */
+  _interpHasPlayhead() {
+    const src = this._source || "file";
+    return src === "file" || src === "video";
+  },
+
+  /** 拉「能出声的目标语言」和音色列表。 */
+  async _interpLoadOptions() {
+    if (this._interp.loaded) return;
+    this._interp.loaded = true;
+    const sel = document.getElementById("asr-interp-target");
+    if (sel) {
+      try {
+        const r = await fetch("/api/qwen3-asr/interp/languages",
+          { cache: "no-store" });
+        const data = r.ok ? await r.json() : null;
+        const items = (data && data.items) || [];
+        sel.innerHTML = "";
+        items.forEach((it) => {
+          const opt = document.createElement("option");
+          opt.value = it.id || "";
+          opt.textContent = it.name || it.label || it.id || "";
+          sel.appendChild(opt);
+        });
+        if (this._interp.targetLang) sel.value = this._interp.targetLang;
+      } catch (e) {
+        console.warn("[qwen3-asr] 同传目标语言拉取失败:", e);
+      }
+    }
+    const spk = document.getElementById("asr-interp-speaker");
+    if (spk) {
+      try {
+        const r = await fetch("/api/tts/voices", { cache: "no-store" });
+        const data = r.ok ? await r.json() : null;
+        const voices = (data && data.voices) || [];
+        spk.innerHTML = "";
+        voices.forEach((v) => {
+          const opt = document.createElement("option");
+          const id = v.id || "";
+          // ⚠️ **标明音色类别** —— 参考音色和内置音色是**两个不同的 SDK
+          // 参数** ⇒ 用户看得见自己选的是哪一类 ⇒ 也不会传错。
+          // （板端**没有符号字体** ⇒ 只用普通汉字，不用分隔符。）
+          const kind = v.kind === "builtin" ? "builtin" : "ref";
+          opt.dataset.kind = kind;
+          opt.value = id;
+          opt.textContent = (kind === "ref" ? "参考音色 " : "内置音色 ") + id;
+          spk.appendChild(opt);
+        });
+        // ⚠️ 默认选中**当前生效**的那个（参考音色优先 —— 本板只有这类可用）
+        const want = this._interp.refSpeaker || this._interp.speaker;
+        if (want) spk.value = want;
+        if (!want && spk.options.length) {
+          spk.selectedIndex = 0;
+          const opt = spk.options[0];
+          const kind = opt.dataset.kind === "builtin" ? "builtin" : "ref";
+          this._interp.speaker = (kind === "builtin") ? opt.value : "";
+          this._interp.refSpeaker = (kind === "ref") ? opt.value : "";
+        }
+      } catch (e) {
+        console.warn("[qwen3-asr] 同传音色拉取失败:", e);
+      }
+    }
+  },
+
+  /** 开始同传。 */
+  async _interpStart() {
+    // ⚠️⚠️ **自动播放必须放在最前面（同步执行）** ——
+    //
+    // 浏览器的自动播放策略：**没有用户手势**时 ``el.play()`` 会被拒绝。
+    // 「开始同传」这个**按钮点击本身就是用户手势** ⇒ 必须在**同一个
+    // 同步调用栈**里调 ``play()``。
+    //
+    // ⚠️ 之前是 ``await fetch(...)`` **之后**才自动播放 ⇒ 手势早就失效了
+    // ⇒ 媒体一直暂停 ⇒ 播放头永远 0 ⇒ 「跟播放」把**所有**句子压住 ⇒
+    // **用户看到译文却一声不响**（实测：用户报「有翻译，但是没有播放」，
+    // 日志里播放头只上报过 1 次就再没有）。
+    if (this._interpHasPlayhead()) {
+      // ⚠️ 每次开始都**重置**「媒体没在放」的原因（上一轮的结论不能
+      // 带到这一轮 —— 媒体这次可能正常播了）。
+      this._interp.mediaBlocked = "";
+      this._interpAutoPlay();
+    }
+    const body = {
+      mode: this._interp.mode,
+      gate: this._interpHasPlayhead() ? this._interp.gate : "now",
+      target_lang: this._interp.targetLang,
+      // ⚠️ 内置音色 / 参考音色**分开传**（两个不同的 SDK 参数）
+      speaker: this._interp.speaker,
+      ref_speaker: this._interp.refSpeaker,
+      volume: this._interp.volume,
+      source: this._interpSource(),
+    };
+    try {
+      const r = await fetch("/api/qwen3-asr/interp/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
+      this._interp.running = true;
+      this._interp.status = data;
+      this._interpSyncUi();
+      this._interpStartPlayhead();
+      this._interpPoll();
+    } catch (e) {
+      this._interp.running = false;
+      const el = document.getElementById("asr-interp-status");
+      if (el) el.textContent = "同传启动失败：" + (e.message || e);
+      this._interpSyncUi();
+    }
+  },
+
+  /** 停止同传（并清 TTS 队列）。 */
+  async _interpStop() {
+    try {
+      await fetch("/api/qwen3-asr/interp/stop", { method: "POST" });
+    } catch (e) {
+      console.warn("[qwen3-asr] 同传停止失败:", e);
+    }
+    this._interp.running = false;
+    this._interpStopPlayhead();
+    this._interpStopTimer();
+    this._interpSyncUi();
+  },
+
+  /** 改设置（不重启引擎）。 */
+  async _interpSettings(patch) {
+    try {
+      const r = await fetch("/api/qwen3-asr/interp/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch || {}),
+      });
+      const data = await r.json();
+      if (r.ok) {
+        this._interp.status = data;
+        this._interpSyncUi();
+      }
+    } catch (e) {
+      console.warn("[qwen3-asr] 同传设置失败:", e);
+    }
+  },
+
+  /** 每秒拉一次状态（面板上的滞后 / 队列 / 变速）。 */
+  _interpPoll() {
+    if (this._interp.timer) return;
+    this._interp.timer = setInterval(async () => {
+      if (!this._interp.running) {
+        this._interpStopTimer();
+        return;
+      }
+      try {
+        const r = await fetch("/api/qwen3-asr/interp/status",
+          { cache: "no-store" });
+        if (!r.ok) return;
+        const data = await r.json();
+        this._interp.status = data;
+        this._interpSyncUi();
+      } catch (e) {
+        /* 网络问题不打扰用户 */
+      }
+    }, 1000);
+  },
+
+  _interpStopTimer() {
+    if (this._interp.timer) {
+      clearInterval(this._interp.timer);
+      this._interp.timer = null;
+    }
+  },
+
+  /** 面板渲染。 */
+  _interpSyncUi() {
+    const st = this._interp.status || {};
+    const btnStart = document.getElementById("asr-interp-start");
+    const btnStop = document.getElementById("asr-interp-stop");
+    const el = document.getElementById("asr-interp-status");
+    const hint = document.getElementById("asr-interp-hint");
+    const gateSel = document.getElementById("asr-interp-gate");
+    // 播放时机：没有播放头的源 ⇒ 置灰 + 强制「不等播放」
+    const hasPh = this._interpHasPlayhead();
+    if (gateSel) {
+      gateSel.disabled = !hasPh;
+      if (!hasPh) {
+        this._interp.gate = "now";
+        gateSel.value = "now";
+      } else if (!this._interp.gateTouched) {
+        // ⚠️ **有播放头的源（文件 / 视频）默认「跟播放」**。
+        //
+        // 为什么：「不等播放」在文件源上是**错的** —— 译文比源短（或源里有
+        // 停顿）⇒ 译文会**跑到源前面**，而且越播越前；反过来，若译文比
+        // 源长（翻译后的音更啰嗦），「不等播放」又会让**音频越落越远**
+        // （实测：源 15 s 的文件，译文字频播完要 44 s ⇒ 落后 18 秒以上）。
+        //
+        // ⇒ 「跟播放」= 译文贴着源走 ⇒ 既有播放头可对齐 ⇒ 默认用它。
+        this._interp.gate = "follow";
+        gateSel.value = "follow";
+      }
+    }
+    if (btnStart) btnStart.disabled = this._interp.running;
+    if (btnStop) btnStop.disabled = !this._interp.running;
+    if (el) {
+      if (!this._interp.running) {
+        el.textContent = "同传未开启";
+      } else if (st.playhead_stalled && Number(st.pending || 0) > 0
+                 && !st.source_done) {
+        // ⚠️ **播放头卡住** —— 媒体没在放（自动播放被拦 / 用户暂停）
+        // ⇒ 「跟播放」压着句子不放 ⇒ 用户看不到译文出声。
+        // ⇒ **说清楚**，并给出两条可操作的路。
+        el.textContent = `等播放头：播放头卡住（媒体没在放 / 卡在缓冲），`
+          + `${st.pending} 段译文压着没播 `
+          + `· 点媒体的播放键，或把「播放时机」改成「不等播放」`;
+      } else {
+        const tts = st.tts === false ? "（仅字幕：TTS 未启用）" : "";
+        // ⚠️ **优先显示「可听滞后」**（译文出声 − 源话开口）——
+        // 那是用户**真正感受到**的那一口；``lag_sec`` 在跟播模式下是
+        // 另一个口径（「源话比最后一句已提交的译文前进了多少」）。
+        const audible = Number(st.audible_lag_sec || 0);
+        const lag = audible > 0 ? audible : Number(st.lag_sec || 0);
+        const lagTag = audible > 0 ? "可听滞后" : "滞后";
+        const depth = Number(st.queue_depth || 0);
+        const tempo = Number(st.tempo || 1);
+        // ⚠️ **并行合成的卡数**（实测 2026-11-23）—— 本板 **npu2 是禁区**
+        // ⇒ 只有一个 TTS 卡位 ⇒ 队列恒为**单 worker 串行** ⇒ 这里不显示
+        // 任何并行字样（显示了就是骗人）。
+        const par = "";
+        // ⚠️ **兜底放行**的提示：播放头一直没动 ⇒ 句子被强行放行了 ⇒
+        // 译文比画面/声音**超前**，得让用户知道。
+        const stall = Number(st.stalled_released || 0) > 0
+          ? "（播放头没动，已兜底放行）" : "";
+        // ⚠️ **电平探针**：播了但峰值很低 ⇒ 小喇叭上基本听不见 ⇒
+        // 用户会当成「没播放」⇒ 明确告诉他「是太小不是没播」。
+        const peak = Number((st.tts_status || {}).last_peak || 0);
+        const quiet = (peak > 0 && peak < 0.05)
+          ? `（音量偏小：出声峰值 ${peak.toFixed(2)}）` : "";
+        // ⚠️ **刚拖过进度条 ⇒ 告诉用户「已经跟上了」**（实测 2026-11-22，
+        // 用户报「多次拖动进度条，没和字幕的翻译同声播放出来」⇒ 用户需要
+        // 一个可见的反馈确认「拖动被识别了、译文已重新对齐」）。
+        const sk = st.last_seek || null;
+        const skAge = sk && sk.ts ? (Date.now() / 1000 - Number(sk.ts)) : 1e9;
+        const aligned = (sk && skAge >= 0 && skAge < 20)
+          ? `（已跟随进度条重新对齐${Number(sk.replayed || 0) > 0
+              ? `，重播 ${Number(sk.replayed)} 句` : ""}）` : "";
+        el.textContent = `正在播报${stall}${quiet}${aligned} · ${lagTag} ${lag.toFixed(1)} 秒 · `
+          + `队列 ${depth} 段 · 变速 ${tempo.toFixed(2)}${par}${tts}`;
+      }
+    }
+    if (hint) {
+      const src = this._source || "file";
+      let text = "同传把识别结果翻译后从板载扬声器播报。一句话都不会丢。";
+      if (this._interp.running) {
+        if (src === "board" || src === "browser") {
+          text = "实时流：说完一句即译即播。";
+        } else if (this._interp.gate === "follow") {
+          if (this._interp.mediaBlocked) {
+            // ⚠️ **具体原因优先**（比泛泛的「译文跟着播放头走」有用得多）：
+            // 浏览器拒了自动播放 / 媒体加载失败 ⇒ 媒体不动 ⇒ 播放头不动
+            // ⇒ 句子被压住。
+            text = this._interp.mediaBlocked;
+          } else if (st.source_done) {
+            // ⚠️ **源已经播完** ⇒ 不会再有新的源内容 ⇒ 剩下的译文**补播**。
+            text = "源已播完 · 剩下的译文正在补播（识别比播放慢时会晚一点）。";
+          } else if (st.playhead_stalled && Number(st.pending || 0) > 0) {
+            text = "播放头卡住（媒体没在放 / 卡在缓冲）⇒ 译文压着不播。"
+              + "点播放键，或把播放时机改成「不等播放」。";
+          } else {
+            text = "译文跟着播放头走；若媒体没在放，译文不会出声（可切「不等播放」）。";
+          }
+        } else {
+          text = "不等播放：识别一句就播一句。";
+        }
+      }
+      hint.textContent = text;
+    }
+  },
+
+  /* ---------------- 播放头（跟播放模式） ---------------- */
+
+  /** 当前播放头（秒，音频时间轴）；没有播放头 ⇒ null。 */
+  _interpPlayhead() {
+    const src = this._source || "file";
+    if (src === "video") {
+      const v = document.getElementById("asr-video");
+      if (!v) return null;
+      const t = (v.currentTime || 0) - (this._audioOriginSec || 0);
+      return {
+        sec: Math.max(0, t),
+        playing: !v.paused && !v.ended,
+        // ⚠️ **源播完了**（媒体 ended）⇒ 源不会再往前走 ⇒ 放行器不再等
+        // （不然剩下的句子被永久压住 ⇒ 用户只听到第一句）。
+        ended: !!v.ended,
+        failed: !!(v.error),
+      };
+    }
+    if (src === "file") {
+      const a = document.getElementById("asr-audio-player");
+      if (!a) return null;
+      return {
+        sec: Math.max(0, a.currentTime || 0),
+        playing: !a.paused && !a.ended,
+        ended: !!a.ended,
+        failed: !!(a.error),
+      };
+    }
+    return null;
+  },
+
+  /** 每 250 ms 上报一次播放头（只在「跟播放」且有播放头时）。 */
+  _interpStartPlayhead() {
+    this._interpStopPlayhead();
+    this._interp.phTimer = setInterval(() => {
+      if (!this._interp.running) return;
+      if (this._interp.gate !== "follow") return;
+      if (!this._interpHasPlayhead()) return;
+      const ph = this._interpPlayhead();
+      if (!ph) return;
+      // ⚠️ 媒体**真的在播**了 ⇒ 「没在放」不再成立 ⇒ 清原因。
+      if (ph.playing) this._interp.mediaBlocked = "";
+      // ⚠️ **「结束 / 失败」也算变化** —— 媒体播完的那一刻 ``playing``
+      // 会从 true 变 false（会被上报），但「源结束了」这个状态必须
+      // **单独**让服务端知道 ⇒ 不然它只会看到「暂停」⇒ 以为还能等。
+      if (Math.abs(ph.sec - this._interp.lastPh) < 0.05
+          && ph.playing === this._interp.lastPlaying
+          && !!ph.ended === !!this._interp.lastEnded
+          && !!ph.failed === !!this._interp.lastFailed) return;
+      this._interp.lastPh = ph.sec;
+      this._interp.lastPlaying = ph.playing;
+      this._interp.lastEnded = !!ph.ended;
+      this._interp.lastFailed = !!ph.failed;
+      // ⚠️ **带上引擎当前的流 id** —— 播放头是**按流**存的 ⇒ id 对不上
+      // ⇒ 放行器配不上这句 ⇒「跟播放」把它永久压住 ⇒「有翻译没声音」
+      // （实测：前端之前一直报空 id ⇒ 必然配不上）。
+      const sid = (this._interp.status && this._interp.status.stream_id)
+        || this._interp.streamId || "";
+      fetch("/api/qwen3-asr/interp/playhead", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          stream_id: sid,
+          playhead_sec: ph.sec,
+          playing: ph.playing,
+          // ⚠️ **「源结束了 / 媒体坏了」必须一起报** —— 服务端据此判断
+          // 「不会再有新的源内容了」⇒ 剩下的译文**直接补播**
+          // （不然媒体播完之后识别出来的句子会被永久压住 ⇒
+          //  **用户只听到第一句**，实测踩过）。
+          ended: !!ph.ended,
+          failed: !!ph.failed,
+        }),
+      }).catch(() => { /* 上报失败不影响播放 */ });
+    }, 250);
+  },
+
+  _interpStopPlayhead() {
+    if (this._interp.phTimer) {
+      clearInterval(this._interp.phTimer);
+      this._interp.phTimer = null;
+    }
+  },
+
+  /** 文件 / 视频源：开始同传时**自动播放**媒体（播放头不动 ⇒ 跟播放放不出声）。 */
+  _interpAutoPlay() {
+    const src = this._source || "file";
+    const el = src === "video"
+      ? document.getElementById("asr-video")
+      : document.getElementById("asr-audio-player");
+    if (!el) return;
+    const hint = document.getElementById("asr-interp-hint");
+    const play = () => {
+      try {
+        const p = el.play();
+        if (p && typeof p.catch === "function") {
+          p.catch(() => {
+            // 两种可能：**自动播放被浏览器策略拦了**，或者**媒体本身加载失败**。
+            // ⚠️ 后者更隐蔽（元素一直 paused ⇒ 播放头不动 ⇒ 跟播放压住
+            // 所有句子 ⇒ 「有翻译但没声音」）⇒ 分开说清楚。
+            //
+            // ⚠️ **记成状态**（不是只写一句）—— 面板提示每秒会被
+            // ``_interpSyncUi`` 刷一遍 ⇒ 只在这里写的话下一秒就没了。
+            const e = el.error;
+            this._interp.mediaBlocked = e
+              ? "媒体加载失败（code " + e.code + "）—— 换个浏览器能放的格式。"
+              : "浏览器拦了自动播放 —— 点媒体的播放键，译文才会跟着走。";
+            if (hint) hint.textContent = this._interp.mediaBlocked;
+          });
+        }
+      } catch (e) { /* noop */ }
+    };
+    play();
+    // ⚠️ **媒体还没加载完时 play() 可能无效**（src 后到 / 缓冲中）⇒
+    // 补一次「加载完就播」。这次调用**没有**用户手势 ⇒ 若策略仍拦，
+    // 上面的 catch 会给出提示。
+    if (el.readyState < 3) {
+      const once = () => {
+        el.removeEventListener("loadeddata", once);
+        el.removeEventListener("canplay", once);
+        play();
+      };
+      el.addEventListener("loadeddata", once);
+      el.addEventListener("canplay", once);
+    }
+  },
+
+  /* ---------------- 音频文件源的播放器（2026-11-21） ---------------- */
+
+  /** 音频文件源的 URL（本机上传 ⇒ blob；设备端路径 ⇒ media 端点）。 */
+  _audioUrl() {
+    if (this._file && this._fileBlobUrl) return this._fileBlobUrl;
+    const p = (this._path || "").trim();
+    if (!p) return "";
+    return API_PREFIX + "/qwen3-asr/media?path=" + encodeURIComponent(p);
+  },
+
+  /**
+   * 同步音频播放器（文件源专用）。
+   *
+   * ⚠️ **不能用向导的 ``#asr-preview-audio``** —— 那个只在点「预览播放」
+   * 时加载、只吃设备端路径、还会被向导框架搬来搬去 ⇒ 拿它当播放头不可靠。
+   */
+  _syncAudioPlayer() {
+    const wrap = document.getElementById("asr-audio-wrap");
+    const el = document.getElementById("asr-audio-player");
+    const hint = document.getElementById("asr-audio-hint");
+    if (!wrap || !el) return;
+    const isFile = this._source === "file";
+    wrap.classList.toggle("hidden", !isFile);
+    if (!isFile) {
+      try {
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+      } catch (e) { /* noop */ }
+      this._interp.audioSrc = "";
+      if (hint) hint.textContent = "";
+      return;
+    }
+    const url = this._audioUrl();
+    if (!url) {
+      if (hint) {
+        hint.textContent = "选一个音频文件，这里会同步播放，译文跟着它走。";
+      }
+      return;
+    }
+    if (url !== this._interp.audioSrc) {
+      this._interp.audioSrc = url;
+      el.src = url;
+      try { el.load(); } catch (e) { /* noop */ }
+    }
+    if (hint) {
+      hint.textContent = this._file
+        ? "正在播本机上传的音频（同传译文跟着它走）。"
+        : "正在播设备端的音频（同传译文跟着它走）。";
+    }
+  },
+
   _onFrame(msg) {
     const pre = document.getElementById("data-qwen3-asr");
     if (pre) pre.textContent = JSON.stringify(msg, null, 2);
@@ -4819,6 +5419,29 @@ const Qwen3Asr = {
             ? ` · 已识别 ${msg.audio_sec.toFixed(1)} s` : "";
           hint.textContent = `已停止${audio} —— 已识别的内容保留在下方，`
             + "要重跑点「开始识别」。";
+        }
+        break;
+      }
+      case "interp_status": {
+        // 同传的指标（每秒一帧）。
+        this._interp.status = { ...(this._interp.status || {}), ...msg };
+        this._interpSyncUi();
+        break;
+      }
+      case "interp_segment": {
+        // 成句（还没播）—— 面板上记一句。
+        this._interp.lastSegment = msg;
+        break;
+      }
+      case "interp_spoken": {
+        // 播完一句。
+        this._interp.lastSpoken = msg;
+        break;
+      }
+      case "interp_error": {
+        const hint = document.getElementById("asr-interp-status");
+        if (hint && msg.reason) {
+          hint.textContent = "同传提示：" + msg.reason;
         }
         break;
       }

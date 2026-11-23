@@ -843,6 +843,173 @@ def post_translate_disable() -> dict:
 # --------------------------------------------------------------------------- #
 # WebSocket —— push 流式增量 + 状态变更
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 同声传译（2026-11-21）
+# --------------------------------------------------------------------------- #
+#
+# 同传是 ASR 卡里的一个**模式**（与「实时翻译」并列）⇒ 切句 → 翻译 → 播报。
+# 播报走**宿主桥**（``app.core.audio.tts_bridge``）⇒ 卡片之间不直接 import
+# （AGENTS 铁律：卡片只能 import ``app.core.*``）。
+
+class InterpStartPayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    #: 切句档位："fast"（快）/ "steady"（稳）
+    mode: Optional[str] = None
+    #: 播放时机："now"（不等播放）/ "follow"（跟播放头）
+    gate: Optional[str] = None
+    #: 目标语（provider 的语言 key，如 "zh-CN"）
+    target_lang: Optional[str] = None
+    #: **内置音色**（SDK 的 SPK_ID，如 serena / vivian）。
+    speaker: Optional[str] = None
+    #: **参考音色**（voice-clone，如 news_female / baby_girl）——
+    #: 本板只有这类音色 ⇒ 面板选中参考音色时走这里。
+    #:
+    #: ⚠️ **和 ``speaker`` 是两个不同的 SDK 参数**，混用 ⇒ 音色不生效。
+    ref_speaker: Optional[str] = None
+    #: 音量 0.0–1.0
+    volume: Optional[float] = None
+    #: 来源标签："live" / "file" —— 只影响面板提示与滞后口径
+    source: Optional[str] = None
+
+
+class InterpSettingsPayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    mode: Optional[str] = None
+    gate: Optional[str] = None
+    target_lang: Optional[str] = None
+    speaker: Optional[str] = None
+    #: 参考音色（voice-clone）—— 见 :class:`InterpStartPayload` 的说明。
+    ref_speaker: Optional[str] = None
+    volume: Optional[float] = None
+
+
+class InterpPlayheadPayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    #: 哪条流（文件流是 ``file-<rid>#<epoch>``；实时流没有播放头）
+    stream_id: Optional[str] = None
+    #: 播放头位置（秒，音频时间轴）
+    playhead_sec: float = 0.0
+    #: 播放器是不是在放（暂停 ⇒ 译文也该停）
+    playing: bool = True
+    #: **媒体已经播完**（``<audio>.ended``）⇒ 源**不会再往前走**
+    #: ⇒ 剩下的译文**直接补播**（不然会被永久压住 ⇒「只播放了第一句」）。
+    ended: bool = False
+    #: **媒体加载/播放失败** ⇒ 同样源不会再往前走 ⇒ 直接补播。
+    failed: bool = False
+
+
+@router.get("/interp/languages")
+async def get_interp_languages() -> dict:
+    """同传**能出声**的目标语言（MT 能翻 ∩ TTS 能出声 = 10 种）。
+
+    ⚠️ 为什么单独一个端点：字幕翻译能给 36 种目标语言，但 TTS 只会说
+    11 种（含 auto）⇒ 同传的下拉**只列交集**，免得用户选了一个「播不出来」
+    的语言还以为功能坏了。
+    """
+    from app.core.translate.npu_provider import LANG_CODES, LANG_NAMES
+    from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+        _TTS_LANG_BY_PROVIDER,
+    )
+
+    items = []
+    for key in LANG_CODES:
+        if key == "zh-TW":
+            continue
+        tts_lang = _TTS_LANG_BY_PROVIDER.get(key)
+        if not tts_lang:
+            continue          # TTS 说不了 ⇒ 不列
+        items.append({"id": key, "name": LANG_NAMES.get(key, key),
+                      "tts": tts_lang})
+    return {"items": items}
+
+
+@router.post("/interp/start")
+async def post_interp_start(payload: Optional[InterpStartPayload] = Body(None)) -> dict:
+    """起同传。
+
+    Body: ``{mode, gate, target_lang, speaker, volume, source}``
+    ⇒ ``{ok, mode, gate, source, tts, ...}``
+    """
+    import asyncio
+
+    from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
+
+    data = payload or InterpStartPayload()
+    engine = get_interp_engine()
+    # ⚠️ 广播要切回**主事件循环**（同传引擎是工作线程 ⇒ ``asyncio.Queue``
+    # 不是线程安全的）⇒ 把当前循环记给引擎。
+    engine.set_loop(asyncio.get_running_loop())
+    status = engine.start(
+        mode=data.mode or "steady",
+        gate=data.gate or "now",
+        target_lang=data.target_lang or "zh-CN",
+        # ⚠️ **音色 / 音量原样透传**（可能是 None）——
+        # None 的意思是「这次不改」⇒ 引擎**保留**面板上已经选好的值。
+        # （之前写死 ``or ""`` ⇒ start 请求没带音色字段时会把用户选的
+        # 音色抹掉 ⇒ 每句话音色都不一样。）
+        speaker=data.speaker,
+        ref_speaker=data.ref_speaker,
+        volume=data.volume,
+        source=data.source or "live",
+    )
+    return {"ok": True, **status}
+
+
+@router.post("/interp/stop")
+async def post_interp_stop() -> dict:
+    """停同传 + 清 TTS 队列（**正在合成的那句跑完**）。"""
+    from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
+
+    status = get_interp_engine().stop()
+    return {"ok": True, **status}
+
+
+@router.get("/interp/status")
+async def get_interp_status() -> dict:
+    """同传指标（切句 / 翻译 / 播报 / 滞后 / 队列 / 变速）。"""
+    import asyncio
+
+    from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
+
+    engine = get_interp_engine()
+    if engine.loop_missing():
+        engine.set_loop(asyncio.get_running_loop())
+    return engine.status()
+
+
+@router.post("/interp/settings")
+async def post_interp_settings(payload: Optional[InterpSettingsPayload] = Body(None)) -> dict:
+    """改档位 / 播放时机 / 目标语 / 音色 / 音量（**不重启引擎**）。"""
+    from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
+
+    data = payload or InterpSettingsPayload()
+    status = get_interp_engine().settings(
+        mode=data.mode,
+        gate=data.gate,
+        target_lang=data.target_lang,
+        speaker=data.speaker,
+        ref_speaker=data.ref_speaker,
+        volume=data.volume,
+    )
+    return {"ok": True, **status}
+
+
+@router.post("/interp/playhead")
+async def post_interp_playhead(payload: Optional[InterpPlayheadPayload] = Body(None)) -> dict:
+    """**前端上报播放头**（250 ms 一次）。
+
+    ⚠️ 为什么走 REST 而不是 WS：ASR 卡的 ``/ws`` 是**服务端 → 浏览器**的
+    单向广播；播放头是**浏览器 → 服务端** ⇒ 走 POST 最省事。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
+
+    data = payload or InterpPlayheadPayload()
+    return get_interp_engine().on_playhead(
+        str(data.stream_id or ""), float(data.playhead_sec or 0.0),
+        bool(data.playing), bool(data.ended), bool(data.failed),
+    )
+
+
 @router.websocket("/ws")
 async def asr_ws(ws: WebSocket) -> None:
     """WS handler：snapshot hydrate + 流式增量推送。"""

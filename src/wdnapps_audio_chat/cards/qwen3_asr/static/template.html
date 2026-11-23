@@ -128,6 +128,25 @@
               </div>
 
               <!--
+                音频文件源的**卡片页播放器**（2026-11-21，同声传译用）。
+
+                ⚠️ **不要**用向导的 ``#asr-preview-audio``：那个是**向导**
+                的预览播放器 —— 只在点「预览播放」时加载、只吃**设备端路径**
+                （上传的本机音频它没有源）、而且会被向导框架**搬进 / 搬出**
+                向导面板 ⇒ 拿它当播放头不可靠。
+
+                ⇒ 这里给同传一个**卡片页自己的**播放器：
+                * 本机上传 ⇒ ``blob:`` URL（``_fileBlobUrl``）；
+                * 设备端路径 ⇒ ``/api/qwen3-asr/media?path=…``；
+                * 纯音频 ⇒ 音轨起点 = 0 ⇒ ``currentTime`` 与字幕时间轴同轴。
+              -->
+              <div class="asr-audio-wrap hidden" id="asr-audio-wrap">
+                <audio id="asr-audio-player" class="asr-preview asr-preview-audio"
+                       controls preload="metadata"></audio>
+                <div class="asr-hint" id="asr-audio-hint"></div>
+              </div>
+
+              <!--
                 ③ 板载麦克风 + ④ 浏览器麦克风。
                 这一整块由 feature flag ``asr.live.enabled`` 门控 ——
                 关掉时整块隐藏，文件 / 视频路径不受影响。
@@ -226,6 +245,49 @@
               -->
               <div class="asr-tr-note">
                 译文显示在下方「实时结果」框里，与原文一句一句对应。
+              </div>
+            </div>
+
+            <!--
+              同声传译（2026-11-21）
+              ======================
+              ASR 卡里的一个**模式**（与「实时翻译」并列）⇒ 切句 → 翻译 → 播报。
+
+              * 切句档位：**稳**（实时流用 endpoint 静音 1200 ms；文件流用标点）
+                / **快**（实时流用稳定前缀；文件流用更短的强制切句）。
+              * 播放时机：**不等播放** / **跟播放**（只有文件 / 视频源有播放头
+                ⇒ 板载麦 / 浏览器麦这两项自动置灰）。
+
+              ⚠️ 板端**没有 emoji / 符号字体** ⇒ 图标一律用内联 SVG，
+              文字只用普通汉字。
+            -->
+            <div class="asr-block asr-tr-block asr-interp-block" id="asr-interp-block">
+              <div class="asr-tr-title">同声传译</div>
+              <div class="asr-tr-head">
+                <label class="asr-file-label" for="asr-interp-mode">切句</label>
+                <select id="asr-interp-mode" class="tts-select">
+                  <option value="steady">稳</option>
+                  <option value="fast">快</option>
+                </select>
+                <label class="asr-file-label" for="asr-interp-gate">播放</label>
+                <select id="asr-interp-gate" class="tts-select">
+                  <option value="now">不等播放</option>
+                  <option value="follow">跟播放</option>
+                </select>
+                <label class="asr-file-label" for="asr-interp-target">目标语言</label>
+                <select id="asr-interp-target" class="tts-select"></select>
+                <label class="asr-file-label" for="asr-interp-speaker">音色</label>
+                <select id="asr-interp-speaker" class="tts-select"></select>
+                <label class="asr-file-label" for="asr-interp-volume">音量</label>
+                <input type="range" id="asr-interp-volume" min="0" max="100" value="50" />
+              </div>
+              <div class="asr-tr-head">
+                <button type="button" class="vd-btn vd-btn-primary" id="asr-interp-start">开始同传</button>
+                <button type="button" class="vd-btn" id="asr-interp-stop" disabled>停止同传</button>
+                <span class="asr-live-status" id="asr-interp-status">同传未开启</span>
+              </div>
+              <div class="asr-tr-note" id="asr-interp-hint">
+                同传把识别结果翻译后从板载扬声器播报。一句话都不会丢。
               </div>
             </div>
 

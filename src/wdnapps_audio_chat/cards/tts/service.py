@@ -31,7 +31,7 @@ import numpy as np
 # 播放目标常量 + TTSRequest + default_ref_speaker 已迁至 app.core.audio.tts_bridge,
 # 此处仅 re-export 以保持旧 import 路径兼容。
 from app.core.audio.tts_bridge import (  # noqa: F401  (re-export)
-    PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH, PLAY_TARGETS,
+    PLAY_DEVICE, PLAY_BROWSER, PLAY_BOTH, PLAY_QUEUE, PLAY_TARGETS,
     TTSRequest,
     default_ref_speaker,
 )
@@ -62,9 +62,35 @@ class AplayWriter:
     thread, the SDK worker never blocks on aplay."""
 
     def __init__(self, sample_rate: int = 24000, channels: int = 1,
-                 volume: float = 0.5, device: str = "plughw:1,0") -> None:
+                 volume: float = 0.5, device: str = "plughw:1,0",
+                 tempo: float = 1.0) -> None:
         self._volume = float(volume)
+        self._tempo = float(tempo or 1.0)
+        #: **真实采样率**（记账用 —— 之前写死 24000 ⇒ 换采样率就错）。
+        self._sample_rate = int(sample_rate or 24000)
         self._alive = True
+        self._sink = None          # 我们真正往里写的那个 stdin
+        self._upstream = None      # sox 进程（变速管道时才有）
+        #: **电平探针**：缩放前（模型原始）/ 缩放后（真正出声）的峰值。
+        self._peak = 0.0
+        self._raw_peak = 0.0
+        #: **已写入的音频秒数**（变速前）+ **第一块写入的时刻** ——
+        #: 用来估算「这一句什么时候播完」（writer 跨句复用 ⇒ 不能靠
+        #: ``close()`` 测了，见 :meth:`playback_end`）。
+        self._written_sec = 0.0
+        self._first_write_ts = 0.0
+        #: **最后一次写入**的时刻（wall clock）。
+        self._last_write_ts = 0.0
+        #: **上一次「消费位置」推进**的时刻 —— ``_tick`` 从它起算
+        #: （⚠️ **不能**从 ``_last_write_ts`` 起算 ⇒ 会重复扣减 ⇒ 管道
+        #: 被误判成「空了」⇒ 报出来的断音全是假的）。
+        self._last_tick_ts = 0.0
+        #: **已写入但还没播出去的音频秒数**（变速前）—— 播放头的估算要用
+        #: 它（aplay 是**实时消费**的 ⇒ 写进去 ≠ 播出来）。
+        self._backlog_sec = 0.0
+        #: **估算的「已消费」音频秒数**（变速前）—— 按墙钟推的
+        #: （aplay 每墙钟秒消费 ``tempo`` 秒的变速前音频）。
+        self._play_pos = 0.0
         # Best-effort: 板载 ES8388 codec 的 ``Speaker`` PA 默认 mute,
         # 用户首次启用 TTS 时听不到声音。play_to 启动 aplay 前 un-mute。
         # ``-c 1`` 选 ES8388 板载 codec(``amixer sset`` 在 default card
@@ -88,14 +114,33 @@ class AplayWriter:
         if device:
             cmd += ["-D", device]
         cmd.append("-")
-        try:
-            self._proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            _tts_log(f"aplay-writer: pid={self._proc.pid} cmd={' '.join(cmd)}")
-        except Exception as exc:
-            LOG.warning("aplay-writer: failed to start aplay: %s", exc)
+        # ⚠️ **重试**：ALSA 的 hw 设备是**独占**的 —— 同板两个 aplay
+        # （同传队列在播 + TTS 卡自己的页面也在播）⇒ 后者会
+        # 「Device or resource busy」**起来又立刻退出**（Popen 不会抛，
+        # 是 aplay 自己退）⇒ 那条路就哑了，而且**毫无提示**。
+        #
+        # ⇒ 起 5 次，每次失败等 0.4 s（给前一个播完的机会）；
+        # 每次起完都探一下进程还活着没（探活要 0.12 s —— 相对
+        # 首窗延迟 4 s 可忽略）。
+        last = ""
+        ok = False
+        self._proc = None
+        for attempt in range(5):
+            try:
+                self._spawn(sample_rate, channels, device)
+            except Exception as exc:                   # noqa: BLE001
+                last = str(exc)
+            else:
+                time.sleep(0.12)
+                if self._proc.poll() is None:
+                    ok = True
+                    break
+                last = "aplay 启动后立刻退出（ALSA 设备可能被占用）"
+                self._kill_spawned()
+            if attempt < 4:
+                time.sleep(0.4)
+        if not ok:
+            LOG.warning("aplay-writer: failed to start aplay: %s", last)
             self._alive = False
             self._proc = None
             return
@@ -105,14 +150,204 @@ class AplayWriter:
                                         name="aplay-writer", daemon=True)
         self._thread.start()
 
-    def write(self, audio) -> None:
-        if not self._alive or self._proc is None or self._proc.stdin is None:
+    def _kill_spawned(self) -> None:
+        """把刚起但立刻退的 aplay/sox 清干净（重试前必须清）。"""
+        for proc in (self._proc, self._upstream):
+            if proc is None:
+                continue
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        self._proc = None
+        self._upstream = None
+        self._sink = None
+
+    @property
+    def ok(self) -> bool:
+        """aplay 进程是否真的起来了（起不来 ⇒ 写进去的 PCM 没人放）。
+
+        同传队列用它判断「这句到底播出去没有」—— 起不来时如果照样
+        记「播完」，滞后会被算成一个假的漂亮数字。
+        """
+        return bool(self._alive and self._proc is not None)
+
+    def set_volume(self, volume: float) -> None:
+        """改音量（**不用重开进程**）—— 音量是写 PCM 时乘的。
+
+        ⚠️ **为什么需要**：aplay 管道现在**跨句复用**（消句间静音）⇒
+        逐句的音量变化不能再靠「重新 spawn 一个 writer」实现。
+        """
+        try:
+            self._volume = float(volume)
+        except (TypeError, ValueError):
+            pass
+
+    def reset_peaks(self) -> None:
+        """电平探针**逐句复位**（writer 跨句复用 ⇒ 峰值会串到下一句）。"""
+        self._peak = 0.0
+        self._raw_peak = 0.0
+
+    def written_sec(self) -> float:
+        """**累计**已写入的音频秒数（变速前）—— 逐句取差值 = 这句多长。"""
+        with self._cond:
+            return float(self._written_sec)
+
+    def last_write_ts(self) -> float:
+        """**最后一次写入**的时刻（wall clock）。"""
+        with self._cond:
+            return float(self._last_write_ts)
+
+    def backlog_sec(self) -> float:
+        """**已写入但还没播出去**的音频秒数（变速前）= 管道里的存货。
+
+        ⚠️ **这是「播放器会不会断音」的唯一真实指标**：
+        * ``> 0`` ⇒ aplay 手里有货 ⇒ 合成再慢也**断不了**；
+        * ``== 0`` ⇒ aplay 正在**等下一块** ⇒ 这时候合成一慢就是
+        #:   **断音**（用户报的「播放中途卡顿断音」）。
+        """
+        with self._cond:
+            self._tick(time.time())
+            return float(self._backlog_sec)
+
+    def _tick(self, now: float) -> None:
+        """按墙钟推进「已消费」的位置（**调用方必须持有锁**）。
+
+        ⚠️ aplay 是**实时**消费 post-tempo 音频的 ⇒ 每墙钟秒消费
+        ``tempo`` 秒的**变速前**音频 ⇒ 变速前音频的「消费位置」按
+        ``tempo`` 推进，而**管道存货**（``_backlog_sec``）就是两者之差。
+
+        ⚠️⚠️ **必须从「上一次 tick」起算，不能从「最后一次写入」起算**
+        （实测 2026-11-22）：否则每次 tick 都会把「上次写入到现在的整段
+        时间」**再扣一遍** ⇒ 存货被**高估消耗**（实测 1.0 s 的墙钟扣掉
+        1.5 s 的音频）⇒ **管道被误判成「空了」** ⇒ 报出来的「断音」全是
+        假的（实测每句 1.4 s 的「断音」，其实一秒钟都没断）。
+        """
+        if self._last_tick_ts <= 0.0:
+            self._last_tick_ts = now
             return
-        chunk = np.clip(np.asarray(audio, dtype=np.float32) * self._volume,
-                        -1.0, 1.0)
+        dt = now - self._last_tick_ts
+        self._last_tick_ts = now
+        if dt <= 0.0:
+            return
+        consumed = min(self._backlog_sec, dt * self._tempo)
+        self._backlog_sec -= consumed
+        self._play_pos += consumed
+
+    def playback_end(self) -> float:
+        """这一句的音频**大概什么时候播完**（wall clock）。
+
+        ⚠️ **为什么需要**：writer 跨句复用 ⇒ **不能再靠 ``close()`` 的
+        「等 aplay 放完」来测「播完时刻」**（那会把整条管道关掉）⇒
+        改用「写进去多少 / 播出去多少」估算 —— aplay 是**实时**播放的
+        ⇒ 误差在几十毫秒量级。
+
+        ⚠️ **逐句**：调用方在**这句写完**的时刻调用 ⇒ ``_written_sec``
+        恰好是「到这句为止的累计」⇒ 减去「已消费」= 这句还没播完的部分
+        ⇒ 除以 ``tempo`` = 还要等多久 ⇒ 加上「现在」= 这句播完的时刻。
+        """
+        with self._cond:
+            if not self._last_write_ts:
+                return 0.0
+            now = time.time()
+            self._tick(now)
+            remain = self._written_sec - self._play_pos
+            if remain <= 0.0:
+                return now
+            return now + remain / max(self._tempo, 0.01)
+
+    @property
+    def peak(self) -> float:
+        """真正送进 aplay 的 PCM 峰值（0~1）。"""
+        return float(self._peak)
+
+    @property
+    def raw_peak(self) -> float:
+        """**缩放前**的 PCM 峰值（模型原始输出）。"""
+        return float(self._raw_peak)
+
+    # ------------------------------------------------------------------ #
+    # 起进程
+    # ------------------------------------------------------------------ #
+    def _spawn(self, sample_rate: int, channels: int, device: str) -> None:
+        """起播放进程链。
+
+        * ``tempo <= 1.001`` ⇒ **只有 aplay**（原路径，一字不改）。
+        * ``tempo > 1.001`` ⇒ ``sox(变速) → aplay`` 两段管道。
+
+        ⚠️ **本板 sox 14.4.2 的三个坑**（实测，别再踩）：
+
+        1. ``-D`` **不是**选设备，而是 ``--no-dither`` ⇒ ``play`` 只能用
+           **默认** ALSA 设备（板上是 card 0 = hdmiin，**只有采集**）⇒
+           变速必须 **sox 负责变速、aplay 负责出声**。
+        2. sox 的**效果参数放在输出文件之后** ⇒ ``sox ... - tempo 1.1``。
+        3. sox 读 stdin 写 stdout 时，**输入和输出各要一份格式参数**。
+        """
+        aplay_cmd = cmd = ["aplay", "-t", "raw", "-f", "FLOAT_LE",
+                           "-r", str(sample_rate), "-c", str(channels)]
+        if device:
+            cmd += ["-D", device]
+        cmd.append("-")
+
+        if self._tempo > 1.001:
+            sox_fmt = ["-t", "raw", "-e", "floating-point", "-b", "32",
+                       "-L", "-r", str(sample_rate), "-c", str(channels)]
+            sox_cmd = (["sox"] + sox_fmt + ["-"] + sox_fmt + ["-",
+                       "tempo", "%.3f" % self._tempo])
+            self._upstream = subprocess.Popen(
+                sox_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self._proc = subprocess.Popen(
+                aplay_cmd, stdin=self._upstream.stdout,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            # 父进程不读 sox 的 stdout ⇒ 关掉这份副本，
+            # 否则 aplay 永远等不到 EOF。
+            try:
+                self._upstream.stdout.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sink = self._upstream.stdin
+        else:
+            self._proc = subprocess.Popen(
+                aplay_cmd, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._sink = self._proc.stdin
+        _tts_log(f"aplay-writer: pid={self._proc.pid} cmd={' '.join(aplay_cmd)}"
+                 + (f" tempo={self._tempo}" if self._tempo > 1.001 else ""))
+
+    def write(self, audio) -> None:
+        if not self._alive or self._sink is None:
+            return
+        raw = np.asarray(audio, dtype=np.float32)
+        # ⚠️ **电平探针**（诊断用）：记下**缩放前**（模型原始输出）和
+        # **缩放后**（真正送到 aplay 的）的峰值。
+        #
+        # 为什么需要：``volume`` 是**振幅倍率**（不是 aplay 的硬件音量）⇒
+        # 面板默认 10% ⇒ 峰值只剩 1/10 ⇒ 板载小喇叭上可能**基本听不见**
+        # ⇒ 用户会报「有翻译，但是没有播放」—— 其实是「太小」。
+        # ⇒ 没有这个数就没法判断「是没播」还是「播得太小」。
+        if raw.size:
+            self._raw_peak = max(self._raw_peak,
+                                 float(np.max(np.abs(raw))))
+        chunk = np.clip(raw * self._volume, -1.0, 1.0)
+        if chunk.size:
+            self._peak = max(self._peak, float(np.max(np.abs(chunk))))
         with self._cond:
             if not self._alive:
                 return
+            # ⚠️ **记账**：写了多少音频 + 什么时候写的
+            # ⇒ :meth:`playback_end` 用它估「播完时刻」，
+            # :meth:`backlog_sec` 用它算「管道里还剩多少货」。
+            now = time.time()
+            self._tick(now)
+            if not self._first_write_ts:
+                self._first_write_ts = now
+            self._last_write_ts = now
+            self._written_sec += raw.size / float(self._sample_rate)
+            self._backlog_sec += raw.size / float(self._sample_rate)
             self._buf.extend(chunk.tobytes())
             self._cond.notify()
 
@@ -127,12 +362,12 @@ class AplayWriter:
                 # an arbitrary-long memcpy.
                 data = bytes(self._buf[:256 * 1024])
                 del self._buf[:256 * 1024]
-            if self._proc is None or self._proc.stdin is None:
+            if self._sink is None:
                 self._alive = False
                 break
             try:
-                self._proc.stdin.write(data)
-                self._proc.stdin.flush()
+                self._sink.write(data)
+                self._sink.flush()
             except (BrokenPipeError, OSError, ValueError, EOFError):
                 # ``ValueError`` / ``EOFError`` happen when ``close()``
                 # closed stdin while we were mid-write.
@@ -152,8 +387,22 @@ class AplayWriter:
             self._thread.join(timeout=drain_timeout)
         if self._proc is None:
             return
+        # ⚠️ 关的是**我们写的那个** stdin（变速管道时是 sox 的）。
+        if self._sink is not None:
+            try:
+                self._sink.close()
+            except Exception:
+                pass
+            self._sink = None
+        # sox 收到 EOF ⇒ 冲完剩余音频 ⇒ 退出 ⇒ aplay 的 stdin 也就 EOF 了。
+        if self._upstream is not None:
+            try:
+                self._upstream.wait(timeout=drain_timeout)
+            except Exception:
+                pass
+            self._upstream = None
         try:
-            if self._proc.stdin is not None:
+            if self._proc.stdin is not None and self._proc.stdin is not self._sink:
                 self._proc.stdin.close()
         except Exception:
             pass
@@ -387,6 +636,20 @@ class TtsSession:
         # wdndds RPC pickle，此路径是 live audio 的唯一通道。
         self._pcm_sock: Optional[socket.socket] = None
         self._pcm_sock_path: str = ""
+        # 本次 run 的 UDS reader 线程（等它退出 ⇒ PCM 收齐了）。
+        self._pcm_thread: Optional[threading.Thread] = None
+
+        # **PCM 分片回调**（同传队列用）：``play_to=queue`` 时，会话只
+        # 产出 PCM、不自己播 ⇒ 由队列的播放器线程消费这些分片。
+        #
+        # 为什么需要它：``PLAY_BOTH`` 的播放是「边合成边播」⇒ 下一句的
+        # 合成必须等这一句的**合成**结束，而这一句的**播放**还没完 ⇒
+        # 每句白等一个首窗延迟（3.7 s）⇒ 吞吐 0.67× 实时。
+        # 拆开之后：合成完就把 PCM 交出去，播放线程接着播，下一句同时
+        # 开始合成 ⇒ 吞吐 ≈ 1× 实时。
+        self._chunk_sink: Optional[Callable[[np.ndarray, int], None]] = None
+        # 本轮第一块 PCM 的到达时刻（wall clock）—— 同传首窗延迟的度量。
+        self._run_first_pcm_t: Optional[float] = None
 
 # per-run PCM 累加器（重组 saved WAV 用）。worker 不再在 RPC reply
         # 里塞 WAV 字节（那条路径触发 LAN 120s 超时），这里从浏览器
@@ -686,6 +949,18 @@ class TtsSession:
             except Exception as exc:           # noqa: BLE001
                 LOG.debug("aplay-writer write failed: %s", exc)
 
+        # 同传队列的分片出口（``play_to=queue``）：会话只产出 PCM，播放
+        # 由队列自己的播放器线程做 ⇒ 下一句的合成可以和这一句的播放重叠。
+        sink = self._chunk_sink
+        if sink is not None:
+            try:
+                sink(audio, sr)
+            except Exception as exc:           # noqa: BLE001
+                LOG.debug("chunk sink raised: %s", exc)
+        # 本轮**第一块** PCM 的到达时刻（同传首窗延迟的度量）。
+        if self._run_first_pcm_t is None:
+            self._run_first_pcm_t = time.time()
+
         # 累加 PCM 用于合成结束后拼 WAV。worker 不再在 RPC reply 里塞 WAV，
         # 必须从浏览器正在听的同一 chunk 流重建。lock 短暂持有即可，
         # 让 _run_safe 能在推理完成后 snapshot + clear。
@@ -821,6 +1096,7 @@ class TtsSession:
             self._elapsed = 0.0
             self._output = None
             self._request = req
+            self._run_first_pcm_t = None
             with self._run_pcm_lock:
                 self._run_pcm_chunks = []
                 self._run_pcm_sr = 24000
@@ -846,7 +1122,9 @@ class TtsSession:
         self._aplay_writer = None
         if req.play_to == PLAY_BOTH:
             try:
-                self._aplay_writer = AplayWriter(volume=req.volume)
+                # ⚠️ ``tempo>1`` ⇒ sox 变速管道（sox→aplay）；1.0 ⇒ 原路径。
+                self._aplay_writer = AplayWriter(volume=req.volume,
+                                                 tempo=req.tempo)
             except Exception as exc:
                 LOG.warning("aplay-writer: could not be created: %s", exc)
 
@@ -868,6 +1146,73 @@ class TtsSession:
         # ``api.tts_output`` 的路径校验同源。
         from app.core.uploads import get_tts_output_root
         return get_tts_output_root() / f"tts-{int(time.time())}.wav"
+
+    def run_queued(self, job, sink=None) -> dict:
+        """**同传队列用**：同步跑完一句（队列线程串行调用）。
+
+        与 ``start()`` 的区别：
+
+        * ``start()`` = 「发起就返回」（页面用），忙的时候抛「正在运行」；
+        * ``run_queued()`` = 「**跑完才返回**」⇒ 队列线程天然串行 ⇒
+          不会两条流交错，也不用抢「忙不忙」。
+
+        ⚠️ ``save_wav=False`` ⇒ 不落 WAV（同传一次会议能写几百 MB）。
+        ⚠️ ``play_to=queue`` ⇒ **会话自己不播**，PCM 通过 ``sink`` 回调
+        交给队列的播放器线程 ⇒ 下一句的合成可以和这一句的播放**重叠**
+        （``PLAY_BOTH`` 做不到：合成和播放焊死在一句里 ⇒ 每句多付一个
+        3.7 s 的首窗延迟 ⇒ 吞吐只有 0.67× 实时）。
+
+        ``sink`` 签名 ``(audio: np.ndarray, sample_rate: int) -> None``，
+        在 **UDS reader 线程**上被调用（每个 decoder 窗口一次）。
+        """
+        if not self.available:
+            raise RuntimeError(f"TTS 不可用: {self._init_error}")
+        text = str(getattr(job, "text", "") or "").strip()
+        if not text:
+            raise ValueError("text 不能为空")
+        # ⚠️ TTS 卡自己的页面可能正在合成（``start()`` 忙时抛错）。
+        # 同传**不能因此丢句子** ⇒ 先等它空出来（最多 60 s）。
+        deadline = time.time() + 60.0
+        while time.time() < deadline:
+            with self._lock:
+                busy = self._state in (self.STATE_LOADING, self.STATE_RUNNING)
+            if not busy:
+                break
+            time.sleep(0.2)
+        req = TTSRequest(
+            text=text,
+            language=str(getattr(job, "language", "auto") or "auto"),
+            speaker=str(getattr(job, "speaker", "") or ""),
+            # ⚠️ **参考音色走 ``ref_speaker``**（与内置音色 ``speaker`` 是
+            # 两个不同的 SDK 参数）—— 混用 ⇒ SDK 打印「not in SPK_ID,
+            # skipping」⇒ **没有音色条件** ⇒ 每句话音色都不一样。
+            ref_speaker=str(getattr(job, "ref_speaker", "") or ""),
+            volume=float(getattr(job, "volume", 0.1) or 0.1),
+            # ⚠️ **PLAY_QUEUE**（不是 PLAY_BOTH）⇒ 会话只产出 PCM，播放
+            # 交给队列的播放器线程 ⇒ 合成与播放可以重叠。
+            play_to=PLAY_QUEUE,
+            tempo=float(getattr(job, "tempo", 1.0) or 1.0),
+            save_wav=False,
+            # ⚠️ **首窗帧数**（同传用）—— 上游首窗硬等 50 帧 ⇒ 实测
+            # 「合成首窗」≈ 3.0 s（同传链路上最大的一段固定延迟）。
+            # decoder 是因果的 ⇒ 攒 25 帧即可开声 ⇒ 首声提前 ~1.5 s。
+            first_window_frames=int(getattr(job, "first_window_frames", 0) or 0),
+        )
+        # ⚠️ sink 必须在 ``start()`` **之前**挂上 —— ``start()`` 会立刻
+        # 起 worker 线程，PCM 分片随时可能到。
+        self._chunk_sink = sink
+        try:
+            self.start(req)
+            deadline = time.time() + 180.0
+            while time.time() < deadline:
+                with self._lock:
+                    state = self._state
+                if state not in (self.STATE_LOADING, self.STATE_RUNNING):
+                    break
+                time.sleep(0.05)
+        finally:
+            self._chunk_sink = None
+        return self.snapshot()
 
     def stop(self) -> dict:
         with self._lock:
@@ -953,7 +1298,7 @@ class TtsSession:
             # so we tell the SDK to skip its own (blocking) aplay
             # path. ``play_to=device`` keeps the SDK's original
             # behaviour; ``play_to=browser`` already needs ``no_play``.
-            no_play = req.play_to in (PLAY_BROWSER, PLAY_BOTH)
+            no_play = req.play_to in (PLAY_BROWSER, PLAY_BOTH, PLAY_QUEUE)
 
             async def _run() -> TTSResult:
                 kwargs = dict(
@@ -967,6 +1312,12 @@ class TtsSession:
                     no_play=no_play,
                     non_streaming_mode=req.non_streaming_mode,
                                     )
+                # ⚠️ **首窗帧数**透传给 SDK（0 = SDK 默认 25 帧）。
+                # ⚠️ **必须显式带上** —— 不带的话 SDK 用默认 50 帧 ⇒
+                # 首声要多等 ~1.5 s（同传链路最大的固定延迟）。
+                _fw = int(getattr(req, "first_window_frames", 0) or 0)
+                if _fw > 0:
+                    kwargs["first_window_frames"] = _fw
                 # **只传路径，不传回调。** 推理在另一个进程，callable
                 # 无法 JSON 序列化；worker 收到这个路径后自己 connect
                 # 并装 ``on_audio_chunk``，把 PCM 推回本进程在
@@ -1004,7 +1355,7 @@ class TtsSession:
             # decoder thread produces its first window. ``play_to=
             # device`` skips this path entirely (SDK owns the audio
             # output; no WS feed needed).
-            if req.play_to in (PLAY_BROWSER, PLAY_BOTH):
+            if req.play_to in (PLAY_BROWSER, PLAY_BOTH, PLAY_QUEUE):
                 sock_path = (
                     f"/tmp/wdnwebui-tts-{os.getpid()}-{time.time_ns()}.sock"
                 )
@@ -1055,12 +1406,12 @@ class TtsSession:
                         except Exception:
                             pass
 
-                threading.Thread(
+                self._pcm_thread = threading.Thread(
                     target=_pcm_reader,
                     name="tts-pcm-reader",
                     daemon=True,
-                ).start()
-
+                )
+                self._pcm_thread.start()
             # LAN fallback：worker 连不上 UDS 就改发
             # wdndds/audio/tts_chunk/qwen3-tts；本机无 DDS writer
             # 所以 reader 一直 idle、回调不触发。
@@ -1074,6 +1425,18 @@ class TtsSession:
             try:
                 result = self._infer_one(req)
             finally:
+                # ⚠️ **等 UDS reader 线程把 socket 里的 PCM 收完** ——
+                # worker 在 RPC 结束时 close socket ⇒ reader 读到 EOF 退出。
+                #
+                # 为什么必须等：``respond`` 返回 ≠ 最后一块 PCM 已被读走
+                # （reader 可能还卡在 socket 缓冲上）⇒ 不等的话**最后
+                # 一块分片会丢**（同传队列的播放尾巴被削掉）。
+                # ``PLAY_BOTH`` 原来的「drain aplay」顺手给了几秒，
+                # 这里显式等 ⇒ 两条路径的 PCM 完整性一致。
+                th = self._pcm_thread
+                if th is not None:
+                    th.join(timeout=3.0)
+                    self._pcm_thread = None
                 # Always signal EOF to browser-side subscribers so the
                 # AudioContext stops scheduling further chunks even if
                 # the inference raised.
@@ -1127,18 +1490,24 @@ class TtsSession:
                     )
 
             if wav_bytes:
-                output_path = Path(req.output)
-                with open(output_path, "wb") as f:
-                    f.write(wav_bytes)
-                try:
-                    size = output_path.stat().st_size
-                except OSError:
-                    size = 0
+                # ⚠️ ``save_wav=False``（同传队列）⇒ **不落盘**：
+                # 同传一次会议能写几百 MB WAV，eMMC 扛不住，也没人要听回放。
+                # 但**时长照样要算**（滞后记账要用）。
+                audio_sec = _wav_duration_seconds(wav_bytes)
+                elapsed = time.time() - t0
+                output_path = None
+                size = 0
+                if req.save_wav:
+                    output_path = Path(req.output)
+                    with open(output_path, "wb") as f:
+                        f.write(wav_bytes)
+                    try:
+                        size = output_path.stat().st_size
+                    except OSError:
+                        size = 0
                 # 顺序很重要：先写盘，再在 lock 下 publish self._output ——
                 # 否则 200 ms 的 snapshot poll 会读到还没落盘的
                 # output_url → 404。
-                audio_sec = _wav_duration_seconds(wav_bytes)
-                elapsed = time.time() - t0
                 with self._lock:
                     self._audio_sec = audio_sec
                     self._elapsed = elapsed
@@ -1149,8 +1518,9 @@ class TtsSession:
                         "text":       req.text,
                         "language":   req.language,
                         "speaker":    req.ref_speaker or req.speaker,
-                        "output":     str(output_path),
-                        "output_url": self._output_url_for(output_path),
+                        "output":     str(output_path) if output_path else "",
+                        "output_url": (self._output_url_for(output_path)
+                                       if output_path else ""),
                         "play_to":    req.play_to,
                         "size":       size,
                         "audio_sec":  round(audio_sec, 3),
@@ -1159,7 +1529,10 @@ class TtsSession:
                     while len(self._history) > self.HISTORY_MAX:
                         self._history.pop(0)
 
-                self._set_state(self.STATE_DONE, f"saved {output_path}")
+                self._set_state(
+                    self.STATE_DONE,
+                    f"saved {output_path}" if output_path else "done (no wav)",
+                )
             else:
                 with self._lock:
                     self._audio_sec = 0.0
@@ -1193,6 +1566,18 @@ class TtsSession:
                 except Exception as exc:           # noqa: BLE001
                     LOG.debug("DDS chunk reader close failed: %s", exc)
                 self._dds_chunk_reader = None
+            if req.play_to == PLAY_QUEUE:
+                # 同传路径的**一行**计时（合成耗时 / 首块 PCM 延迟）。
+                # 首块 PCM 的延迟 = Qwen3-TTS 的**首窗延迟**（decoder 首窗
+                # 要 50 帧 ⇒ talker 先吐 50 个 token ⇒ 实测 ~3.7 s）⇒
+                # 这是同传滞后里**唯一**的固定开销，队列流水线就是把它
+                # 从「每句」摊成「每轮一次」。
+                _first = getattr(self, "_run_first_pcm_t", None)
+                _tts_log(
+                    "tts-timing: infer=%.2fs first_pcm=%.2fs"
+                    % (time.time() - t0,
+                       (0.0 if _first is None
+                        else max(0.0, _first - self._last_started))))
 
     def _set_state(self, state: str, message: str = "") -> None:
         with self._lock:
@@ -1290,6 +1675,19 @@ def _user_voice_entries() -> list:
 # --------------------------------------------------------------------------- #
 _session: Optional[TtsSession] = None
 _session_lock = threading.Lock()
+
+
+def close_all() -> None:
+    """关掉**默认会话**。
+
+    ⚠️ ``cards/tts/__init__.py::register_shutdown`` 会按名字找
+    ``close`` / ``stop`` / ``shutdown`` / ``close_all`` ⇒ 用 ``close_all``
+    这个名字 ⇒ 关机钩子能自动调到它。
+    """
+    try:
+        get_session().close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def get_session() -> TtsSession:

@@ -20,6 +20,7 @@ from typing import Optional
 
 from fastapi import (
     APIRouter,
+    Body,
     File,
     Form,
     HTTPException,
@@ -30,6 +31,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 
 from wdnapps_audio_chat.cards.tts.service import (
+    PLAY_BOTH,
     PLAY_DEVICE,
     PLAY_TARGETS,
     TTSRequest,
@@ -733,6 +735,9 @@ async def tts_start(payload: Optional[dict] = None) -> dict:
         play_to=play_to,
         output=str(payload.get("output", "") or ""),
         non_streaming_mode=bool(payload.get("non_streaming_mode", False)),
+        # ⚠️ **首窗帧数**（诊断用）—— 0 = SDK 默认（见
+        # ``wdnai.backends.tts.FIRST_WINDOW_FRAMES``）。50 = 上游行为。
+        first_window_frames=int(payload.get("first_window_frames", 0) or 0),
     )
 
     try:
@@ -747,6 +752,87 @@ async def tts_start(payload: Optional[dict] = None) -> dict:
 @router.post("/stop")
 async def tts_stop() -> dict:
     return get_session().stop()
+
+
+# --------------------------------------------------------------------------- #
+# 同传队列（2026-11-21）
+# --------------------------------------------------------------------------- #
+#
+# ⚠️ 这 4 个路由**只给同传用**；TTS 卡自己的页面**不用**（继续走
+# ``/start`` 单发）。同传是**另一个卡片**在调 ⇒ 它必须经宿主
+# ``app.core.audio.tts_bridge`` 过来（卡片之间不能直接 import）。
+
+@router.post("/queue/submit")
+async def tts_queue_submit(payload: Optional[dict] = Body(None)) -> dict:
+    """把一句译文排队（同传引擎的唯一入口）。
+
+    Body: ``{text, language, speaker, ref_speaker, volume, tempo,
+    src_end_ts, stream_id, play_to}`` ⇒ ``{seq, queued, est_audio_sec,
+    depth}``。
+
+    ⚠️ **``speaker``（内置音色）和 ``ref_speaker``（参考音色）是两个不同的
+    SDK 参数** —— 本板只有参考音色 ⇒ 必须走 ``ref_speaker``。
+    """
+    payload = payload or {}
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text 不能为空")
+    from wdnapps_audio_chat.cards.tts import queue as q
+
+    # ⚠️ **不传 tempo ⇒ 继承队列当前的变速**（``/queue/tempo`` 设的那个值）
+    # ⇒ 传了才覆盖。给了 1.0 会被当成「显式覆盖成原速」。
+    _tempo = payload.get("tempo")
+    try:
+        # ⚠️ **音量 0 是「静音」**（合法）⇒ 不能用 ``or 0.5`` 那种写法
+        # （会把 0 变成 0.5）。
+        _vol = payload.get("volume")
+        try:
+            _vol = 0.5 if _vol is None else float(_vol)
+        except (TypeError, ValueError):
+            _vol = 0.5
+        return q.submit_queued(
+            text=text,
+            language=str(payload.get("language") or "auto"),
+            speaker=str(payload.get("speaker") or ""),
+            ref_speaker=str(payload.get("ref_speaker") or ""),
+            volume=_vol,
+            tempo=(float(_tempo) if _tempo is not None else None),
+            src_end_ts=float(payload.get("src_end_ts", 0.0) or 0.0),
+            stream_id=str(payload.get("stream_id") or ""),
+            play_to=str(payload.get("play_to") or PLAY_BOTH),
+        )
+    except ValueError as exc:
+        # 目标语不可出声 ⇒ 400（调用方据此降级为仅字幕）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/queue/status")
+async def tts_queue_status() -> dict:
+    """队列快照：深度 / 积压秒数 / 当前变速 / 滞后统计。"""
+    from wdnapps_audio_chat.cards.tts import queue as q
+
+    return q.snapshot()
+
+
+@router.post("/queue/clear")
+async def tts_queue_clear() -> dict:
+    """清空**未开始**的 job（正在合成的那句跑完）。"""
+    from wdnapps_audio_chat.cards.tts import queue as q
+
+    return q.clear()
+
+
+@router.post("/queue/tempo")
+async def tts_queue_tempo(payload: Optional[dict] = Body(None)) -> dict:
+    """改**未开始** job 的变速（积压一降就自动回落 1.0）。"""
+    payload = payload or {}
+    from wdnapps_audio_chat.cards.tts import queue as q
+
+    try:
+        tempo = float(payload.get("tempo", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="tempo 必须是数字") from None
+    return q.set_tempo(tempo)
 
 
 @router.get("/history")

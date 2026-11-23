@@ -137,8 +137,15 @@ def _find_agent() -> Optional[Path]:
 class BoardMicController:
     """板载采集子进程的管理者（进程内单例）。"""
 
-    def __init__(self, *, base_url: str = "http://127.0.0.1:8000",
+    def __init__(self, *, base_url: str = "https://127.0.0.1:8000",
                  agent_path: Optional[Path] = None) -> None:
+        # ⚠️ **必须是 https**（2026-11-16 起 8000 端口只提供 HTTPS）：
+        # agent 用 ``http://`` 打过来 ⇒ 服务端按「明文撞 HTTPS 端口」处理
+        # ⇒ 直接把连接掐掉 ⇒ agent 收到 ``RemoteDisconnected`` ⇒ 退出码 1
+        # （症状：板载麦「能起来」但**一秒后就死**，U8 断言
+        # 「agent 优雅退出」失败）。
+        # ⇒ agent 自己用标准库 urllib 的默认 SSL 上下文（本机根证书已在
+        # 系统信任库里）⇒ 不用关校验。
         self._base_url = base_url.rstrip("/")
         self._agent_path = agent_path or _find_agent()
         self._lock = threading.Lock()

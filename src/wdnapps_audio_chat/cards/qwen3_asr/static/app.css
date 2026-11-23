@@ -109,6 +109,15 @@
   display: none;
 }
 
+/* 音频文件源的播放器（2026-11-21，同声传译的播放头来源） */
+.asr-audio-wrap {
+  margin: 10px 0 14px;
+}
+
+.asr-audio-wrap.hidden {
+  display: none;
+}
+
 /* ---- 向导「预览播放」的播放器 ----
    这个 wrap 会被向导框架**搬进向导面板**（wizard.json 的 canvas_id），
    搬走时外面那层 holder 的 hidden 就失效了 ⇒ 向导里照常显示；向导卸载

@@ -711,10 +711,28 @@ class _SentenceSplitter:
     记账是安全的。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_chars: int = 0) -> None:
         self._done = 0        # 当前 epoch 内已提交的字符数
         self._last = ""       # 上一轮的 committed
         self._index = 0       # 本次识别的句子序号（1 起，跨 epoch 递增）
+        #: **强制切句长度**（0 = 用全局 :data:`_TR_MAX_SENTENCE_CHARS`）。
+        #:
+        #: ⚠️ 为什么要做成参数（2026-11-21）：同传的「快档」要**更早出句**
+        #: （24 字而不是 60 字 ⇒ 跟播滞后更小）⇒ 需要一个**独立的**切句器
+        #: 用更短的长度 ⇒ **不能改全局常量**（会影响字幕翻译的切句）。
+        self._max_chars = int(max_chars or 0)
+
+    @property
+    def limit(self) -> int:
+        """本次实际用的强制切句长度。"""
+        return self._max_chars or _TR_MAX_SENTENCE_CHARS
+
+    def set_max_chars(self, max_chars: int) -> None:
+        """改强制切句长度（0 = 用全局 :data:`_TR_MAX_SENTENCE_CHARS`）。
+
+        ⚠️ 同传的档位会切（快档 24 / 稳档 60）⇒ 每轮喂之前按当前档位调。
+        """
+        self._max_chars = int(max_chars or 0)
 
     def reset_request(self) -> None:
         """**新一次识别**开始（句子序号归零）。"""
@@ -750,7 +768,7 @@ class _SentenceSplitter:
                 return
             cut = _first_sentence_end(rest)
             if cut < 0:
-                if len(rest) < _TR_MAX_SENTENCE_CHARS:
+                if len(rest) < self.limit:
                     # 还没攒够一个长句 ⇒ 等下一轮
                     return
                 # 兜底 2：太长还没标点 ⇒ 强制切（保证「实时」）
@@ -759,7 +777,12 @@ class _SentenceSplitter:
                 #    ⇒ 界面看到半个词、译文也跟着错位。
                 #    ⇒ `_soft_sentence_end` 优先切在**子句标点**上，其次切在
                 #    **词边界**上 ⇒ 绝不把词劈开。
-                cut = _soft_sentence_end(rest, _TR_MAX_SENTENCE_CHARS)
+                #
+                # ⚠️ **用 `self.limit` 而不是全局常量** —— 同传的「快档」要
+                #    **更早出句**（24 字而不是 60 字 ⇒ 跟播滞后更小）⇒ 用
+                #    **独立的切句器实例** + 更短的长度 ⇒ **不改全局常量**
+                #    （改了会影响字幕翻译那条链的切句）。
+                cut = _soft_sentence_end(rest, self.limit)
                 if cut < 0:
                     # ⚠️ 末尾就是句末标点 ⇒ **等下一轮**（见
                     #    `_soft_sentence_end` 的说明）⇒ 这一轮不切。
@@ -896,6 +919,11 @@ class _AsrManager:
 
         #: **切句器**（文件 / 视频路径的实时翻译用，见 :class:`_SentenceSplitter`）。
         self._splitter = _SentenceSplitter()
+        #: **同传专用**的切句器 —— 与字幕翻译那套**分开**，两条互不干扰
+        #: （同传的快档要用更短的强制切句长度 ⇒ 不能共用一个）。
+        self._interp_splitter = _SentenceSplitter(max_chars=0)
+        #: 当前这次文件识别对应的流 id（同传引擎按它对播放头）。
+        self._interp_stream_id = ""
         #: **主事件循环** —— 译文要广播给 WS 订阅者，而订阅队列属于
         #: **主循环**（WS handler 在那儿）。
         #:
@@ -1408,6 +1436,59 @@ class _AsrManager:
         return bool(end_sec is not None and lb_until >= 0.0
                     and end_sec <= lb_until + 1e-6)
 
+    def _interp_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> None:
+        """**同传引擎**的句子出口（文件 / 视频路径）。
+
+        与字幕翻译的出口（:meth:`_sent_emit`）**分开**：同传要的是
+        「更早出句 + 带时间轴」，字幕翻译要的是「按标点成句」。
+
+        ⚠️ 没开同传时**直接返回**（不打扰识别，也不占内存）。
+        """
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                get_interp_engine,
+            )
+            engine = get_interp_engine()
+            if not engine.running:
+                return
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            # ⚠️ **记 WARNING 不记 DEBUG** —— DEBUG 在生产日志里看不到
+            # ⇒ best-effort 的钩子一旦抛异常，整条同传链路会**静默失效**
+            # （踩过：文件源同传一条句子都没进来，日志里 0 行痕迹）。
+            _LOG.warning("同传出口取引擎失败（best-effort）: %s", exc)
+            return
+        start_sec = self._tr_time_at(c0)
+        end_sec = self._tr_time_at(c1)
+        with self._lock:
+            stream_id = self._interp_stream_id
+            # ⚠️ **带上这一轮 ASR 报的语种** —— 文件路径的语种要等
+            # ``asr_final`` 才最终确定，而句子是**识别过程中**就切出来
+            # 的 ⇒ 不带语种的话，翻译会在「认不出源语言」上失败。
+            lang = self._language
+        engine.on_file_segment(
+            text, seq,
+            start_sec if start_sec is not None else -1.0,
+            end_sec if end_sec is not None else -1.0,
+            stream_id, time.time(),
+            lang=lang,
+        )
+
+    def current_text(self, stream_id: str) -> str:
+        """这条流**当前**的公开文本（播前复核用）。
+
+        * 实时流（``live-...``）⇒ 那个会话的 ``committed + unfixed``；
+        * 文件流 ⇒ 当前 epoch 的公开文本（``_epoch_text``）。
+        """
+        if not stream_id:
+            return ""
+        if stream_id.startswith("live-"):
+            sess = get_live_asr_service().get(stream_id)
+            if sess is None:
+                return ""
+            return sess.public_text()
+        with self._lock:
+            return self._epoch_text or ""
+
     def _sent_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> None:
         """切出来的一句 ⇒ ① 记进「本轮新增句子」 ②（开了翻译）送去翻译。
 
@@ -1493,6 +1574,11 @@ class _AsrManager:
             self._splitter.flush(self._sent_emit)
         except Exception as exc:  # noqa: BLE001 — 切句是 best-effort
             _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
+        try:
+            self._interp_splitter.flush(self._interp_emit)
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            # ⚠️ **记 WARNING 不记 DEBUG**（理由同 ``_interp_emit``）。
+            _LOG.warning("同传切句收尾失败（best-effort）: %s", exc)
 
     def _sent_tail_text(self) -> str:
         """当前 epoch 里「**已确认但还没成句**」的尾巴。
@@ -1695,6 +1781,23 @@ class _AsrManager:
             # 序号落在不同区间（见 :data:`_TR_FILE_INDEX_BASE`）⇒ 不会和
             # 上一次识别的译文撞车（前端是**按序号覆盖**同一条译文的）。
             self._splitter.reset_request()
+            self._interp_splitter.reset_request()
+            with self._lock:
+                self._interp_stream_id = "file-{}#0".format(rid)
+            # ⚠️ **新一轮识别 ⇒ 同传里上一轮的待播/在队译文作废**
+            # （实测 2026-11-22：用户又点了一次「开始识别」⇒ 同一个文件
+            # 再转写一遍 ⇒ **同一批句子再进一次队列** ⇒ 实测一轮 4 句的
+            # 文件按 3~4 次「开始识别」⇒ 同传收到 14 句（10 句重复）⇒
+            # TTS 队列堆了 3.5 倍音频 ⇒ 面板显示「滞后 13.9 秒」）。
+            try:
+                from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                    get_interp_engine,
+                )
+                _eng = get_interp_engine()
+                if _eng.running:
+                    _eng.on_new_stream(self._interp_stream_id)
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                _LOG.debug("同传: 新一轮识别复位失败（best-effort）: %s", exc)
             # 新的一次识别 ⇒ 上一轮的句子作废（前端会拿到新一轮的句子）。
             with self._lock:
                 self._sent_pending = []
@@ -2109,6 +2212,9 @@ class _AsrManager:
                 self._lookback_committed_len = 0
             epoch += 1
             stream_id = "file-{}#{}".format(rid, epoch)
+            # 同传引擎按流 id 对播放头 ⇒ 换段要跟着换。
+            with self._lock:
+                self._interp_stream_id = stream_id
             # ⚠️ **回看**：新会话的音频历史是空的 ⇒ 零上下文 ⇒ 语种判错、
             # 文本脱节 ⇒ 把最近 ``_LOOKBACK_SEC`` 秒**再喂一遍**。
             #
@@ -2549,6 +2655,19 @@ class _AsrManager:
             self._splitter.feed(pub_text, self._sent_emit)
         except Exception as exc:  # noqa: BLE001 — 切句是 best-effort
             _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
+        try:
+            # 同传**独立**的切句器（快档用更短的强制切句长度）。
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                INTERP_FAST_MAX_CHARS,
+                get_interp_engine,
+            )
+            _eng = get_interp_engine()
+            self._interp_splitter.set_max_chars(
+                INTERP_FAST_MAX_CHARS if _eng.mode == "fast" else 0)
+            self._interp_splitter.feed(pub_text, self._interp_emit)
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            # ⚠️ **记 WARNING 不记 DEBUG**（理由同 ``_interp_emit``）。
+            _LOG.warning("同传切句失败（best-effort）: %s", exc)
         with self._lock:
             pending = self._sent_pending
             self._sent_pending = []
@@ -2829,6 +2948,13 @@ class _LiveAsrSession:
         self._language = ""
         self._final_text = ""
         self._segments: List[str] = []
+        #: **同传稳档**的切句器 —— **标点断句**（与文件路径同一口径）。
+        #:
+        #: ⚠️ **为什么不用 endpoint（静音 1200 ms）**：连续讲话时**永远**
+        #: 触发不了 ⇒ 稳档一句都出不来（实测：25 s 连续音频 ⇒
+        #: ``segments=0``，译文要等到整段结束才出来 ⇒ 滞后几十秒）。
+        #: ⇒ 改成「句末标点一出现就成句」⇒ 滞后 ≈ 0.5~1 s。
+        self._interp_splitter = _SentenceSplitter()
         #: 当前 SDK 会话里**有没有说过话**。
         #:
         #: 纯静音的会话，模型会吐 ``language None`` —— 那不是转写内容，
@@ -3232,6 +3358,73 @@ class _LiveAsrSession:
             self._language = lang
         self._rounds.append(frame)
         self._publish(frame)
+        # ---- 同传（快档）：把「稳定前缀」喂给同传引擎 ------------------- #
+        # ⚠️ 必须在**回看轮次过滤之后**、退化时 ``unfixed=""`` 之后 ⇒
+        # 自动继承「不播回看 / 不播胡话」。
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                get_interp_engine,
+            )
+            get_interp_engine().on_unfixed(
+                frame["unfixed"], self._language, self.stream_id, time.time())
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            _LOG.warning("同传快档钩子失败（best-effort）: %s", exc)
+        # ---- 同传（稳档）：**标点断句** ⇒ 句末标点一出现就成句 ------- #
+        # ⚠️ 用**已确认文本**（``committed``）而不是「假设」⇒ 句子完整。
+        # ⚠️ **不要用 endpoint** —— 它要等 1200 ms 静音 ⇒ 连续讲话时永远
+        # 不触发 ⇒ 稳档一句都出不来（用户实测：滞后 18.5 秒）。
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                get_interp_engine,
+            )
+            if get_interp_engine().mode == "steady":
+                self._interp_splitter.feed(
+                    self._committed, self._interp_steady_emit)
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            _LOG.warning("同传稳档切句失败（best-effort）: %s", exc)
+
+    def _interp_steady_emit(self, text: str, seq: int, c0: int = 0,
+                            c1: int = 0) -> None:
+        """稳档切出的一句 ⇒ 交给同传引擎。"""
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                get_interp_engine,
+            )
+            engine = get_interp_engine()
+            if not engine.running:
+                return
+            engine.on_segment(text, self._language, self.stream_id,
+                              time.time(), mode="steady")
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            _LOG.warning("同传稳档出口失败（best-effort）: %s", exc)
+
+    def _interp_flush_steady(self, text: str = "") -> None:
+        """稳档收尾：把切句器里的**尾巴**（最后那句没标点的）交出去。
+
+        ⚠️ **不能**用 ``on_endpoint(self._final_text)`` —— 那是**整个会话
+        的文本** ⇒ 会把已经播过的句子**再播一遍**。
+        """
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                get_interp_engine,
+            )
+            engine = get_interp_engine()
+            if not engine.running:
+                return
+            if text:
+                self._interp_splitter.feed(text, self._interp_steady_emit)
+            self._interp_splitter.flush(self._interp_steady_emit)
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            _LOG.warning("同传稳档收尾失败（best-effort）: %s", exc)
+
+    def public_text(self) -> str:
+        """这条流**当前**的公开文本（``committed`` + ``unfixed``）。
+
+        同传的「播前复核」要拿它 —— 译文回来前源文可能被模型改写 ⇒
+        不一致就重译。
+        """
+        with self._lock:
+            return (self._committed or "") + (self._unfixed or "")
 
     async def _finalize(self, *, reason: str) -> None:
         """收尾：尾巴喂给 SDK（final=True）→ 关会话 → 广播。"""
@@ -3268,6 +3461,14 @@ class _LiveAsrSession:
             })
             # 译文（流式同传）—— 送去做翻译，**不阻塞**这里。
             self._submit_translation()
+            # ---- 同传（稳档）：**静音 = 这句话说完了** ⇒ 把尾巴交出去 --- #
+            # ⚠️ 现有字幕翻译**保留不动**（它走自己的队列）；
+            # 同传是**另一条**通道（翻完还要播报）。
+            #
+            # ⚠️ **只 flush 尾巴，不交整段** —— 稳档的句子已经由「标点断句」
+            # 交出去了（见 ``_on_delta``）⇒ 再把 ``_final_text`` 整段交一次
+            # ⇒ **同一段话播两遍**。
+            self._interp_flush_steady(self._final_text)
             self._rotate()
             self._finished = False
         else:
@@ -3277,6 +3478,14 @@ class _LiveAsrSession:
             # 拿不到译文（``_rotate()`` 会把上一句的文本清掉，所以这里不会
             # 和端点分支重复提交）。
             self._submit_translation()
+            # ---- 同传（稳档）：**最后一句也要交出去** -------------------- #
+            # ⚠️ **必须补这一下** —— 用户「说完就停」（``finish``）时最后
+            # 一句可能**没有句末标点** ⇒ 不 flush ⇒ 那句话**永远不成句**
+            # ⇒ 同传**丢最后一句** ⇒ 直接违反「一句话都不能丢」。
+            #
+            # ⚠️ ``reason == "endpoint"`` 走的是上面的分支 ⇒ 这里**不会**
+            # 与它重复（不会把同一句交两次）。
+            self._interp_flush_steady(self._final_text)
             self._publish({
                 "type": "live_done",
                 "stream_id": self.stream_id,
