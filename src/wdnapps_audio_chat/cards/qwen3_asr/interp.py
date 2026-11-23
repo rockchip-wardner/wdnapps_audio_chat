@@ -282,6 +282,41 @@ MERGE_MIN_AUDIO_SEC = 18.0
 #: ⇒ 兜底只保证「不无限期压着」，不承担攒批的职责。
 MERGE_MAX_HOLD_SEC = 4.0
 
+#: **视频源**的攒批**下限**（秒的译文音频）—— 跟字幕节奏要紧 ⇒ 尽量小。
+#:
+#: ⚠️ **为什么视频源不能沿用「内容量攒批」**（实测 2026-11-23，M31；
+#: 用户报「含音轨的视频开始同传后，没有根据目标语音字幕的节奏播放」）：
+#:
+#: * **文件源是离线一次性转写** ⇒ 整个素材的句子**一次性到齐** ⇒ 攒
+#:   18 秒音频只多花「首句」的等待 ⇒ 后面几句**本来就没到点**；
+#: * **视频源是边播边识别**（解码比实时快，ASR 跑在播放头**前面**）⇒
+#:   字幕行**随播放实时到达** ⇒ 攒 18 秒 = **译文晚 18 秒才开口**，
+#:   而且一开口就是**一大块**（实测一批 **6 行 / 14.8 秒源话**）⇒
+#:   批内后面的行**比自己的字幕早十几秒**播出 ⇒ **完全不是字幕的节奏**；
+#: * ⇒ 视频源单独一套口径：**批次小 + 按积压自适应**（见
+#:   :meth:`InterpEngine._video_batch_ready`）。
+VIDEO_MERGE_MIN_AUDIO_SEC = 3.0
+
+#: **视频源**的攒批**上限**（秒的译文音频）—— 产能不够时靠它兜。
+#:
+#: ⚠️ **为什么需要上限**：TTS **每次开口有 ~1.33 s 的固定开销**（实测：
+#: 40 句逐句提交 ⇒ 估算音频 98.8 s / 墙钟 152 s ⇒ 吞吐只有 **0.65×**）
+#: ⇒ 批次太碎 ⇒ 产能追不上 ⇒ 语音**越落越远**（而且是**一直**落下去）。
+#: ⇒ 积压一大就放大批次 ⇒ 先保住「不落后」，节奏退让。
+VIDEO_MERGE_MAX_AUDIO_SEC = 20.0
+
+#: **视频源**：「TTS 还欠多少秒内容」⇒ 批次放大多少秒（自适应增益）。
+#:
+#: ⚠️ **为什么是「自适应」而不是固定值**：节奏与产能是**对立**的
+#: ⇒ 固定小批次 ⇒ 产能不够（落后）；固定大批次 ⇒ 节奏粗（早）。
+#: ⇒ 让批次**跟着「欠多少」走**：跟得上（欠 ≈ 0）⇒ 批次最小 ⇒ 节奏最紧；
+#: 跟不上（欠得多）⇒ 批次自动变大 ⇒ 先把欠的内容追回来。
+#:
+#: ⚠️ **「欠多少」不是「队列里堆了多少音频」** —— 视频源里 TTS
+#: **故意跑在播放前面** ⇒ 队列里堆着几十秒音频是**设计如此**（实测踩过：
+#: 拿它当反馈量 ⇒ 阈值一路涨到上限 ⇒ 批次又变成一大坨）。
+VIDEO_MERGE_BACKLOG_GAIN = 1.0
+
 
 def _estimate_audio_sec(text: str) -> float:
     """估算这段译文念出来有多长（秒）。
@@ -924,7 +959,7 @@ class InterpEngine:
         #: ⇒ 用户会报「有翻译，但是没有播放」—— 其实是「太小」。
         #: ⇒ 与 TTS 卡自己的默认（0.5）对齐。
         self._volume = 0.5
-        self._source = "live"            # live | file
+        self._source = "live"            # live | file | video
         self._seg_index = 0
         self._queue: "queue.Queue[InterpSegment]" = queue.Queue(
             maxsize=INTERP_QUEUE_MAX)
@@ -2092,6 +2127,14 @@ class InterpEngine:
         with self._lock:
             if self._counters.translated < self._counters.segments:
                 return False       # 还有句子没翻完 ⇒ 可能还会来
+        if self._source == "video":
+            # ⚠️⚠️ **视频源只看「媒体播完了」**（实测 2026-11-23，M31）——
+            # 视频的识别**跑在播放前面**（解码比实时快 ⇒ ASR 几十秒就把整
+            # 个视频识别完了，而视频才播了一半）⇒ 按 **ASR 的状态**放行
+            # ⇒ 译文**抢在画面前面**播出 ⇒ 不是「跟字幕节奏」。
+            # ⇒ 只认**媒体**结束（前端上报 ``ended``）⇒ 那时剩下的译文
+            # **补播**（跟文件源「源读完 ⇒ 全放」一个道理）。
+            return self._gate.source_done(self._source_stream_id())
         if self._source != "file":
             return False           # 实时流 ⇒ 用户可能还在说
         try:
@@ -2164,6 +2207,11 @@ class InterpEngine:
             if not self._batch_ready(pending, now):
                 continue
             batch = sorted(pending, key=lambda s: s.index)
+            # ⚠️ **视频源：这一批只取「刚好够阈值」的那几句** —— 否则攒批
+            # 会把**待播的全部**一次吞掉（实测一批 4~7 行 / 十几秒源话
+            # ⇒ 仍然不是字幕的节奏）。
+            if self._source == "video":
+                batch = batch[:self._video_batch_size(batch)]
             with self._lock:
                 for seg in batch:
                     if seg in self._pending:
@@ -2200,12 +2248,97 @@ class InterpEngine:
             # ⚠️ **兜底**：攒不满也不能永远不开口（源卡住 / 素材很稀疏）
             oldest = min(self._ready_since.get(s.index, now) for s in pending)
             return (now - oldest) >= MERGE_MAX_HOLD_SEC
+        # ②b **视频源** ⇒ 跟字幕节奏走（批次小 + 按积压自适应）
+        if self._source == "video":
+            return self._video_batch_ready(pending, now)
         # ③ 实时流（人在说话）⇒ **低延迟优先**：等合并窗口（≤ 1 秒）
         ready = [s for s in pending if self._gate.admit(s)]
         if not ready:
             return False
         oldest = min(self._ready_since.get(s.index, now) for s in ready)
         return (now - oldest) >= INTERP_MERGE_HOLD_SEC
+
+    def _video_batch_target(self) -> float:
+        """视频源：这一批攒到**多少秒音频**才放行（自适应）。
+
+        ⚠️ **反馈量是「TTS 还欠多少内容」**，不是「队列里堆了多少音频」
+        （实测踩过：视频源里 TTS **故意跑在播放前面** ⇒ 队列里堆着几十秒
+        音频是**设计如此** ⇒ 拿它当反馈量 ⇒ 阈值一路涨到上限 ⇒ 批次
+        又变成一大坨 ⇒ 又不是字幕的节奏）。
+
+        ⇒ 真正的反馈量 = **播放头已经走到哪** − **TTS 已经做到哪**
+        （``_last_src_end`` = 最后提交的那句的源话结束位置）：
+        * 正数 ⇒ TTS **落后**了 ⇒ 批次放大 ⇒ 先把欠的内容追回来；
+        * 零/负数 ⇒ TTS **跑在前面** ⇒ 批次取下限 ⇒ 节奏最紧。
+        """
+        behind = 0.0
+        try:
+            ph = self._gate.playhead(self._source_stream_id())
+            if ph is not None:
+                with self._lock:
+                    last_end = float(self._last_src_end or 0.0)
+                behind = max(0.0, float(ph) - last_end)
+        except Exception:  # noqa: BLE001
+            behind = 0.0
+        target = (VIDEO_MERGE_MIN_AUDIO_SEC
+                  + VIDEO_MERGE_BACKLOG_GAIN * behind)
+        return max(VIDEO_MERGE_MIN_AUDIO_SEC,
+                   min(VIDEO_MERGE_MAX_AUDIO_SEC, target))
+
+    def _video_batch_size(self, batch: list) -> int:
+        """这一批**只取够阈值的那几句**（别把待播的全吞了）。
+
+        ⚠️ **为什么必须限量**（实测 2026-11-23，M31）：阈值只是「够不够」
+        的判据 ⇒ 攒批时**待播的往往已经有很多句**（翻译比放行快）⇒
+        一次全吞 ⇒ 一批 4~7 行 / 十几秒源话 ⇒ **仍然不是字幕的节奏**。
+        ⇒ 只取「刚好够阈值」的那几句 ⇒ 一批 ≈ 一行。
+        """
+        target = self._video_batch_target()
+        acc = 0.0
+        n = 0
+        for seg in batch:
+            acc += _estimate_audio_sec(seg.translated or "")
+            n += 1
+            if acc >= target:
+                break
+        return max(1, n)
+
+    def _video_batch_ready(self, pending: list, now: float) -> bool:
+        """**视频源**：批次**跟着字幕节奏**走（而不是「内容量」攒批）。
+
+        ⚠️ **为什么视频源要单独一套口径**（实测 2026-11-23，M31；用户报
+        「含音轨的视频开始同传后，没有根据目标语音字幕的节奏播放」）：
+
+        * **文件源是离线一次性转写** ⇒ 句子一次性到齐 ⇒ 攒 18 秒音频只
+          多花「首句」的等待；
+        * **视频源是边播边识别** ⇒ 字幕行**随播放实时到达** ⇒ 攒 18 秒
+          ⇒ **译文晚十几秒才开口**，而且一开口就是一大块（实测一批
+          **6 行 / 14.8 秒源话**）⇒ 批内后面的行**比自己的字幕早十几秒**
+          播出 ⇒ **完全不是字幕的节奏**。
+
+        ⚠️ **批次大小按「TTS 欠多少内容」自适应**（节奏与产能是对立的）：
+
+        * TTS **每次开口的固定开销 ~1.33 s**（实测：40 句逐句提交 ⇒
+          估算音频 98.8 s / 墙钟 152 s ⇒ 吞吐 **0.65×**）⇒ 批次太碎 ⇒
+          产能追不上 ⇒ 语音**越落越远**；
+        * 批次太整 ⇒ 节奏粗（批内误差 ≤ 批次时长）⇒ 译文**早于字幕**；
+        * ⇒ **跟得上 ⇒ 批次小**（节奏紧）；**跟不上 ⇒ 批次大**（先追平）。
+
+        ⚠️ **不卡放行器**（跟文件源不同）—— 放行器会把句子压到「播放头
+        到达那一行」才放 ⇒ TTS 的首窗 + 推理就落在**字幕之后** ⇒ 恒定
+        滞后 ~2~3 秒。⇒ 视频源**译好就交** ⇒ 合成跑在播放前面 ⇒ 由
+        **播放时钟**（队列侧）把它对齐到那一行的位置 ⇒ **零滞后**
+        （这正是 M29「播放时钟负责对齐」的设计）。
+        """
+        # ① 攒够「自适应阈值」的译文音频 ⇒ 放（放多少由 _video_batch_size 定）
+        audio = 0.0
+        for seg in pending:
+            audio += _estimate_audio_sec(seg.translated or "")
+        if audio >= self._video_batch_target():
+            return True
+        # ② 兜底：攒不满也不能永远不开口（源很稀疏 / 字幕很碎）
+        oldest = min(self._ready_since.get(s.index, now) for s in pending)
+        return (now - oldest) >= MERGE_MAX_HOLD_SEC
 
     # ------------------------------------------------------------------ #
     # 指标
