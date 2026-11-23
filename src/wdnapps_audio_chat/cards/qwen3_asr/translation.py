@@ -294,7 +294,26 @@ class TranslationService:
         except Exception:  # noqa: BLE001
             src, tgt = item.lang, target
 
-        if src and tgt and src == tgt:
+        # ⚠️⚠️ **透传之前先校正源语**（实测 2026-11-23，用户报「ASR+翻译
+        # 中途中英夹杂」）：
+        # 这里的源语是**ASR 报的** ⇒ 它偶尔把中文判成 English（实测
+        # 《圆桌派》中文视频 **46/1015 轮**，其中 30 轮正文全是汉字）⇒
+        # 「源语 == 目标语 == English」⇒ 直接**透传** ⇒ **中文原文被当成
+        # 译文** ⇒ 字幕里中英夹杂，连 ``<font size="10"> </ font></``
+        # 这种网页垃圾都被原样显示（还会被 TTS 念出来）。
+        #
+        # ⇒ 用**文本文种**校正：文本是汉字 ⇒ 源语其实是中文 ⇒ 真翻译。
+        # ⚠️ **校正后的源语只用来判「要不要透传」** —— 真正交给管理器时
+        #    **仍然原样传 ASR 的语言名**（契约：归一在管理器内部做，
+        #    调用方不必知道 provider 的语言表长什么样；管理器内部**也会**
+        #    再校正一次，见 ``npu_manager.translate_sentence``）。
+        try:
+            from app.core.translate.npu_provider import resolve_source_language
+            src_eff = resolve_source_language(item.text, src, tgt)
+        except Exception:  # noqa: BLE001 — 校正失败就用原源语
+            src_eff = src
+
+        if src_eff and tgt and src_eff == tgt:
             status = "skipped"
             text = item.text
             reason = "源语与目标语相同"

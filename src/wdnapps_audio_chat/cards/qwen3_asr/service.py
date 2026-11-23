@@ -279,10 +279,94 @@ _CJK_LANGUAGES = frozenset((
     "japanese", "ja", "korean", "ko",
 ))
 
+#: 模型跑偏时吐出的**网页标记**（实测 2026-11-23，用户报「翻译中途冒出
+#: ``<font size="10"> </ font></``」）。
+#:
+#: ⚠️ **为什么单独判**：``_latin_cut`` 的阈值是「**连续 20 个**非中文字符」
+#: ⇒ 一段**短的**网页标记（``<font size="10">`` = **16 字**）**够不着**
+#: ⇒ 溜进公开文本 ⇒ 进字幕、进翻译、被 TTS 念出来（实测用户那轮 TTS
+#: 队列里就是 ``', approval by the boss. Now, Xu老师先说来开 徐老'``）。
+#:
+#: ⇒ **真人说话不会打出 ``<标签>``** ⇒ 见到就是模型在胡话 ⇒ 剪。
+#:
+#: ⚠️ **判据必须够窄**（不然会误伤数学讲座）：
+#:
+#: * **只认「完整标签」**（``<font size="10">``）—— 真人说话不会有
+#:   ``<`` 后面跟字母又紧跟 ``>``；
+#: * **只认「已知 HTML 标签名」或「带引号属性」** —— ``<b>`` / ``<i>`` /
+#:   ``<p>`` 这些**单字母**标签和数学式（``a<b>c``）撞车 ⇒ **不算**；
+#: * **「没闭合的标签头」（``<font``）一律不剪** —— 它和 ``a<b`` 没法
+#:   区分 ⇒ 宁可放过（真垃圾会被前一轮的完整标签判据带走）。
+_MARKUP_TAG_RE = re.compile(
+    r"<[A-Za-z/!?][A-Za-z0-9_:-]*"
+    r"(?:\s+[A-Za-z0-9_:-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))*"
+    r"\s*/?>")
+#: 已知 HTML 标签（**去掉单字母的** —— ``b`` / ``i`` / ``p`` / ``a`` 会和
+#: 数学式、英文缩写撞车）。
+_HTML_TAGS = frozenset((
+    "font", "img", "div", "span", "table", "thead", "tbody", "html", "body",
+    "script", "style", "meta", "link", "video", "audio", "source", "track",
+    "iframe", "canvas", "svg", "strong", "em", "code", "pre", "title", "head",
+    "center", "input", "button", "select", "option", "label", "ul", "ol",
+    "li", "td", "th", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "br", "hr",
+    "form", "section", "header", "footer", "nav", "aside", "main", "figure",
+    "small", "big", "sub", "sup", "cite", "kbd", "samp", "var", "dfn",
+    "ins", "del", "abbr", "address", "article", "blockquote", "caption",
+    "col", "colgroup", "dl", "dt", "dd", "fieldset", "legend", "optgroup",
+    "output", "progress", "meter", "details", "summary", "dialog",
+    "template", "picture", "data", "time", "mark", "ruby", "bdi", "bdo",
+))
+
 
 def _is_cjk_language(lang: str) -> bool:
     """这个语种是不是「以中文为主」的那一类。"""
     return (lang or "").strip().lower() in _CJK_LANGUAGES
+
+
+def _text_has_cjk(text: str) -> bool:
+    """正文里有没有**汉字**（用来判「模型把中文说成了英文」）。
+
+    ⚠️ **为什么要单独判**（实测 2026-11-23，用户报「翻译中途冒出
+    ``<font size="10"> </ font></``」）：模型跑偏时**自报的语种会跟着跑偏**
+    ⇒「自报 English + 正文全是汉字」就是跑偏的指纹 ⇒ 不能采信那个语种。
+    """
+    for ch in text or "":
+        if "一" <= ch <= "鿿":
+            return True
+    return False
+
+
+def _markup_cut(growth: str) -> Optional[int]:
+    """新增文本里有没有**网页标记**（模型跑偏的指纹）？返回它的起点。
+
+    ⚠️ **为什么要有**（实测 2026-11-23，用户报「ASR+翻译中途出现
+    ``<font size="10"> </ font></ 语言翻译，徐老师。」」）：模型跑偏时会把
+    **训练数据里的网页片段**吐出来 ⇒ 那不是人话 ⇒ 必须剪。
+
+    ⚠️ **为什么 ``_latin_cut`` 拦不住**：它判的是「**连续 20 个**非中文
+    字符」⇒ ``<font size="10">`` 只有 **16 字** ⇒ 够不着阈值 ⇒ 漏网
+    （而它的另一段 `` </ font></`` 是 11 字 ⇒ 拆到两轮更够不着）。
+
+    ⇒ 这里按「**标签**」判（不是按长度）⇒ 短标签也拦得住。
+
+    ⚠️ **判据要窄**（否则误伤数学讲座）：只认**完整标签**，且它的标签名
+    是**已知 HTML 标签**（去掉 ``b`` / ``i`` / ``p`` / ``a`` 这些会撞数学式
+    的单字母）或**带引号属性** ⇒ ``a<b>c`` / ``x<y`` 一律不动。
+    """
+    if not growth or "<" not in growth:
+        return None
+    for m in _MARKUP_TAG_RE.finditer(growth):
+        tag = m.group(0)
+        nm = re.match(r"</?([A-Za-z][A-Za-z0-9_:-]*)", tag)
+        if nm is None:
+            continue
+        name = nm.group(1).lower()
+        if name in _HTML_TAGS:
+            return m.start()
+        if '"' in tag or "'" in tag:
+            # 带引号属性（``size="10"`` / ``alt="https://…"``）⇒ 一定是标记
+            return m.start()
+    return None
 
 
 def _non_cjk_run(text: str) -> int:
@@ -2517,10 +2601,12 @@ class _AsrManager:
                     # 一个孤零零的 "."）⇒ 等换会话后重新开始说。
                     growth = ""
                 else:
-                    # ⚠️ **三种「模型跑偏」都要剪掉**（取**最早**的切点）：
+                    # ⚠️ **四种「模型跑偏」都要剪掉**（取**最早**的切点）：
                     #   ① **重复自己**（复述更早的内容）；
                     #   ② **说英文**（自报中文却吐一整段英文 —— 它在「回答」）；
-                    #   ③ **同一段里复读**（把同一句说了两遍）。
+                    #   ③ **吐网页标记**（``<font size="10"> </ font></`` ——
+                    #      实测 2026-11-23，用户报「翻译中途冒出这个」）；
+                    #   ④ **同一段里复读**（把同一句说了两遍）。
                     cuts = []
                     c = self._repeat_cut(growth, earlier)
                     if c is not None:
@@ -2531,6 +2617,11 @@ class _AsrManager:
                     # 用自报语种判 = 永远判不出来。
                     media_lang = self._language or frame["language"]
                     c = self._latin_cut(growth, media_lang)
+                    if c is not None:
+                        cuts.append(c)
+                    # ⚠️ **网页标记**（短标签也拦得住 —— ``_latin_cut`` 的
+                    # 20 字阈值拦不住 ``<font size="10">`` 这种 16 字的）。
+                    c = _markup_cut(growth)
                     if c is not None:
                         cuts.append(c)
                     c = self._self_repeat_cut(growth)
@@ -2553,8 +2644,32 @@ class _AsrManager:
                 # ⚠️ **退化那一轮不更新语种** —— 模型退化时常伴随「转成
                 #    英文」（实测退化里出现 "human rights violations"）
                 #    ⇒ 采信它会把**整段**结果标成英文。
-                if lang and not degenerate:
-                    self._language = lang
+                #
+                # ⚠️⚠️ **语种突变也不更新**（实测 2026-11-23，用户报
+                # 「ASR+翻译中途出现 ``<font size="10"> </ font></``、
+                # 中英夹杂」）：
+                # 模型跑偏时**自报的语种会跟着跑偏** —— 《圆桌派》中文视频
+                # 里连着 10 轮自报 English（而这段媒体明明是中文）⇒ 一旦
+                # 把 ``_language`` 改成 English ⇒ ``_latin_cut`` 的守卫
+                # （「这段媒体是中文」）**永久失效** ⇒ 模型吐的英文垃圾 /
+                # 网页标记（``<font size="10"> </ font></`` = **32 个连续
+                # 非中文字符**，早够 ``_LATIN_RUN_MIN`` = 20 的阈值）**再也
+                # 剪不掉** ⇒ 直接进公开文本 ⇒ 进字幕、进翻译、被 TTS 念
+                # 出来（实测用户那轮 TTS 队列里就是这一段：
+                # ``', approval by the boss. Now, Xu老师先说来开 徐老'``）。
+                #
+                # ⇒ ``_language`` 是「**这段媒体**的语种」⇒ **只填一次**，
+                #    之后单轮自报**不改它**（真换了素材会在新请求里重置 ⇒
+                #    见 :meth:`transcribe_stream` 的 ``not append`` 分支）。
+                if lang and not degenerate and not self._language:
+                    # ⚠️ **第一轮也要核对** —— 模型可能**一上来就跑偏**
+                    # （自报 English、正文却是汉字）⇒ 采信它 ⇒ 从一开始
+                    # 「这段媒体是中文」这个凭据就是错的。
+                    # ⇒ 矛盾时按**正文**来（正文有汉字 ⇒ 这段媒体是中文）。
+                    if growth and _text_has_cjk(growth) and not _is_cjk_language(lang):
+                        self._language = "Chinese"
+                    else:
+                        self._language = lang
             # **停滞检测**：已确认文本（epoch 内累积）连续 N 轮长度不变
             # → 模型输出卡住了（SDK 侧等价于 ``stable_count == 0``）。
             # 见 :data:`_STALL_ROUNDS_LIMIT`。

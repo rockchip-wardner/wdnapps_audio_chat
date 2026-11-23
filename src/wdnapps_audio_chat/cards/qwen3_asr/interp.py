@@ -101,6 +101,10 @@ SEEK_EPS_SEC = 0.25
 #: 同传引擎的**重播缓存**上限（句）—— seek 之后要把「新位置之后」的
 #: 句子重新武装（重新排队），缓存太大会占内存。
 SEEK_REPLAY_CACHE_MAX = 240
+#: 重播缓存**去重**的容差（秒）—— 同一处音频被重新识别出来时，时间戳
+#: 会有零点几秒的偏差 ⇒ 起点差这么点算「同一处」⇒ 只留最新的一条
+#: （否则 seek 重播时同一句话会播 N 遍，实测 3 遍）。
+SEEK_DUP_SEC = 0.75
 #: 跟播**兜底放行**（秒）—— 播放头一直不动 ⇒ 别把句子无限期压着。
 #:
 #: ⚠️ **为什么需要它**（实测踩过，用户报「有翻译，但是没有播放」）：
@@ -357,6 +361,30 @@ def _tts_text(text: str) -> str:
         return ""
     out = "".join(ch for ch in text if ch not in _TTS_PAUSE_PUNCT)
     return re.sub(r"\s+", " ", out).strip()
+
+
+def _order_key(seg):
+    """提交顺序 —— **媒体位置优先**，产生顺序兜底。
+
+    ⚠️⚠️ **为什么不能只按 index**（实测 2026-11-23，用户报「翻译串句、
+    重复、拼接错乱」）：``index`` 是**产生顺序**（全局自增）⇒ 用户拖动
+    进度条后**重开识别**时，新一段的句子 **index 更大、但媒体位置更小**
+    ⇒ 按 index 排 ⇒ **播放顺序 ≠ 源话顺序**。
+
+    ⇒ 实测（用户那轮 + M32 探针）：``idx=357`` 的 1030.75 s 排在
+    ``idx=356`` 的 1027.43 s **前面** ⇒ 译文顺序和字幕顺序对不上。
+
+    ⇒ 位置已知的（文件 / 视频源）按**位置**排；实时流没有位置（-1）⇒
+    退回 ``index``（本来就是产生顺序，行为不变）。
+
+    ⚠️ 顺带修好一件事：:meth:`InterpEngine._submit` 用**队首**的
+    ``src_start_sec`` 定位播放时钟 ⇒ 队首错了 ⇒ 整段译文**对错位置**
+    播出；按位置排之后队首 = **最早**的那句 ⇒ 对齐正确。
+    """
+    start = getattr(seg, "src_start_sec", -1.0)
+    if start is not None and start >= 0.0:
+        return (0, float(start), int(getattr(seg, "index", 0)))
+    return (1, 0.0, int(getattr(seg, "index", 0)))
 
 
 #: provider 的语言 key → TTS 的语言 id。
@@ -1876,9 +1904,7 @@ class InterpEngine:
             # 句子**重新武装**（用户拖回去 ⇒ 那些句子早就播过了 ⇒ 没有
             # 缓存就再也说不出来 ⇒ 字幕有译文却一声不响）。
             if seg.origin != "live" and seg.src_end_sec >= 0.0:
-                self._cache.append(seg)
-                if len(self._cache) > SEEK_REPLAY_CACHE_MAX:
-                    del self._cache[:-SEEK_REPLAY_CACHE_MAX]
+                self._cache_put(seg)
         # ⚠️ **一律进「待放行」队列**（不再就地提交）——
         # ⇒ 放行线程能**成批**放行 ⇒ 几句译文合成成一段 ⇒ 摊薄 TTS
         # 每句 ~2.9 s 的固定开销（见 :data:`INTERP_MERGE_HOLD_SEC`）。
@@ -1889,6 +1915,32 @@ class InterpEngine:
             # （跟播模式按「内容量」攒 ⇒ 兜底上界按它算；实时模式按它
             # 算合并窗口）。
             self._ready_since.setdefault(seg.index, time.time())
+
+    def _cache_put(self, seg: InterpSegment) -> None:
+        """进「重播缓存」—— **同一处只留最新的一条**。
+
+        ⚠️ **为什么必须去重**（实测 2026-11-23，用户报「翻译重复」）：
+        同一处音频被**识别多次**（用户反复拖进度条 / 多次点「开始识别」）
+        ⇒ 缓存里会有**多个副本** ⇒ seek 之后 :meth:`_resync_seek` 把它们
+        **一起**重新武装 ⇒ 同一句话**播 N 遍**（实测 TTS 历史里同一段
+        出现 3 次）。
+
+        ⇒ 判据用**起点**（± :data:`SEEK_DUP_SEC` 视作同一处 —— 重新识别
+        出来的时间戳会有零点几秒的偏差）⇒ **就地替换**旧的副本
+        （保住顺序）⇒ 缓存里每个位置只有一条。
+
+        ⚠️ 实时流没有位置 ⇒ 不进缓存（见调用点）。
+        """
+        with self._lock:
+            for i, old in enumerate(self._cache):
+                if abs(float(old.src_start_sec or 0.0)
+                       - float(seg.src_start_sec or 0.0)) <= SEEK_DUP_SEC:
+                    self._cache[i] = seg
+                    break
+            else:
+                self._cache.append(seg)
+            if len(self._cache) > SEEK_REPLAY_CACHE_MAX:
+                del self._cache[:-SEEK_REPLAY_CACHE_MAX]
 
     def _is_mt_missing(self, exc: BaseException) -> bool:
         """这个异常是不是「本机没有 MT 实例」？"""
@@ -1945,15 +1997,19 @@ class InterpEngine:
         ⇒ 这里把几句译文**拼成一段**送进去 ⇒ 开销只付一次 ⇒
         音频大幅缩短 ⇒ k 回到 1.0 上下 ⇒ 滞后不再增长、顿挫也少。
 
-        ⚠️ **顺序必须保持**（按 ``index`` 排）—— 播放顺序 = 提交顺序
+        ⚠️ **顺序必须保持**（按 **媒体位置** 排）—— 播放顺序 = 提交顺序
         = 源话顺序（用户报的「串句」就是这么来的）。
+
+        ⚠️⚠️ **为什么按位置而不是按 index**（实测 2026-11-23）：拖动进度条
+        后重开识别 ⇒ 新一段的句子 **index 更大、位置更小** ⇒ 按 index 排
+        ⇒ **播放顺序 ≠ 源话顺序**。详见 :func:`_order_key`。
         """
         if isinstance(segs, InterpSegment):
             segs = [segs]
         segs = [s for s in segs if (s.translated or "").strip()]
         if not segs:
             return
-        segs = sorted(segs, key=lambda s: s.index)
+        segs = sorted(segs, key=_order_key)
         first, last = segs[0], segs[-1]
         now = time.time()
         for s in segs:
@@ -2206,7 +2262,10 @@ class InterpEngine:
             now = time.time()
             if not self._batch_ready(pending, now):
                 continue
-            batch = sorted(pending, key=lambda s: s.index)
+            # ⚠️ **按媒体位置排**（不是 index）—— 拖动重开识别后 index 与
+            # 位置会**反序** ⇒ 按 index 排会把后面的句子先播出去（串句）。
+            # 详见 :func:`_order_key`。
+            batch = sorted(pending, key=_order_key)
             # ⚠️ **视频源：这一批只取「刚好够阈值」的那几句** —— 否则攒批
             # 会把**待播的全部**一次吞掉（实测一批 4~7 行 / 十几秒源话
             # ⇒ 仍然不是字幕的节奏）。
