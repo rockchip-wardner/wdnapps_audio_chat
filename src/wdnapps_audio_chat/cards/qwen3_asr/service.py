@@ -420,11 +420,38 @@ _TR_ABBREV = {
     "e.g", "i.e", "fig", "no", "vol", "inc", "ltd", "co", "approx", "dept",
 }
 
-#: **强制切句长度**（字符）。
+#: **强制切句长度**（字符）—— **上限**，不是目标。
 #:
 #: 一段话里连一个句末标点都没有时（口语、歌词、字幕）⇒ 攒够这么多字符
 #: 就先切一刀送去翻译 —— 宁可句子短一点，也不能「一直等下去」。
+#:
+#: ⚠️ **这只是一个上限** —— 实际切点由 :func:`_soft_sentence_end` 决定
+#: （优先切在**子句标点** / **词边界**上 ⇒ **绝不把一个词劈成两半**）。
 _TR_MAX_SENTENCE_CHARS = 60
+
+#: **子句标点**（句中标点）—— 兜底切句时**优先**切在这些标点之后。
+#:
+#: ⚠️ **集合与前端的画面字幕一致**（``static/app.js`` 的 ``SUB_SOFT_END``）
+#: —— 两边都是「句中标点够长就断句」⇒ 句子的粒度一致。
+_TR_CLAUSE_END = ",;:，；、"
+
+#: 兜底切句时，子句标点至少要在这个位置之后才认 —— 否则切出来的会是
+#: 「Hi, ok」这种两三个字的碎句（切太碎 ⇒ 译文也碎）。
+#:
+#: ⚠️ 与前端的 ``SUB_MIN_SOFT_CHARS``（10 **列**）不是同一个口径 ——
+#: 那边按**显示列**算（中文占两列），这边按**字符**算。
+_TR_MIN_CLAUSE_CHARS = 12
+
+#: **能结束一句话的标点**（比 :data:`_TR_SENTENCE_END` 多一个英文句点）。
+#:
+#: ⚠️ 英文句点单独用 :func:`_ascii_sentence_end` 那套带护栏的判定（要看到
+#: 后面是大写字母才知道是句末）⇒ 这里只在「**这个词是最后一个词**」
+#: 时才认（后面已经没有别的词了 ⇒ 不会再跟数字）。
+_TR_TRAILING_END = "。！？!?.…"
+
+#: 兜底切句时，为了「不把句末标点落在下一段」，最多往后多带这么多字符
+#: （一个词 + 它的句末标点）。
+_TR_MAX_EXTEND_CHARS = 24
 
 #: **文件 / 视频路径的译文序号基准**。
 #:
@@ -509,6 +536,132 @@ def _first_sentence_end(text: str) -> int:
     return -1
 
 
+def _ends_with_sentence_end(text: str) -> bool:
+    """``text`` 的末尾（去掉尾随空白 / 收尾符号后）是不是句末标点。
+
+    ⚠️ **用来判断「这一句其实已经说完了，只是后面还没有下一句」** ——
+    :func:`_ascii_sentence_end` 拒切的理由就是「后面还不知道有没有下一个
+    句子」（「3.」后面可能是「14」）⇒ 此时**不能硬切**，要**等下一轮**。
+    """
+    s = (text or "").rstrip()
+    while s and s[-1] in _TR_SENTENCE_CLOSE:
+        s = s[:-1]
+    return bool(s) and s[-1] in _TR_TRAILING_END
+
+
+def _safe_cut(text: str, cut: int) -> int:
+    """切点**别落在代理对中间**（emoji / 扩展汉字被劈成两半 ⇒ 乱码）。"""
+    if 0 < cut < len(text):
+        c = ord(text[cut - 1])
+        if 0xD800 <= c <= 0xDBFF:
+            cut -= 1
+    return cut
+
+
+def _extend_with_trailing_end(text: str, start: int) -> Optional[int]:
+    """``start`` 之后那个词**后面就是句末标点**时 ⇒ 返回「词 + 标点」一起
+    带上的新切点；否则返回 ``None``。
+
+    ⚠️ 只在「那个词是**最后一个**词」时才成立 —— 后面还有别的词，说明
+    句子还没结束，不该在这里切。
+
+    ⚠️ **为什么需要**：兜底切句落在**词边界**上时，**句末标点会落在下一段**
+    （「…for other people」| 「.」⇒ 下一段只剩一个句号 ⇒ 翻译出来是一句
+    莫名其妙的「嗯，」）⇒ 把「词 + 句末标点」一起带上。
+    """
+    n = len(text)
+    i = start
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n:
+        return None
+    j = i
+    while j < n and not text[j].isspace():
+        j += 1
+    word = text[i:j]
+    if not word or word[-1] not in _TR_TRAILING_END:
+        return None
+    stem = word[:-1]
+    # ⚠️ 小数不算句末（「3.」后面还有数字时是 3.14）
+    if stem.isdigit():
+        return None
+    # ⚠️ 缩写不算句末（「Mr.」「Dr.」）
+    if stem.lower() in _TR_ABBREV:
+        return None
+    k = j
+    # 收尾的引号 / 括号跟着这一句走
+    while k < n and text[k] in _TR_SENTENCE_CLOSE:
+        k += 1
+    # ⚠️ 带的太多就不带（保持「切出来的句子不要太长」）
+    if (k - start) > _TR_MAX_EXTEND_CHARS:
+        return None
+    return k
+
+
+def _soft_sentence_end(text: str, limit: int) -> int:
+    """``text`` 里找一个**不把词劈开**的切点（下标，相对 ``text``）。
+
+    切点 = 这一句到哪里为止（**含**标点本身）。找不到合适的切点时返回
+    ``limit``（按长度硬切 —— 和旧行为一样）；**该等下一轮**时返回 -1。
+
+    ⚠️ **为什么要有它**：旧的兜底是 ``cut = _TR_MAX_SENTENCE_CHARS`` ——
+    **纯按字符数切** ⇒ 切点常常落在**词中间**。实测（英文样本）：
+
+    .. code-block:: text
+
+        He wasn't even that big when I started listening to him, bu
+        t in his solo music, didn't do overly well, but he did very
+        well when he started writing for other people.
+
+    ⇒ ① 界面上看到的是**半个词**（「bu」/「t」）；② 送进翻译模型的是
+    **半个词** ⇒ 译文跟着错位（「well」被当成独立的一句 ⇒ 翻成「嗯，」）。
+
+    优先级：
+
+    1. **子句标点**（:data:`_TR_CLAUSE_END`）—— 语义完整，首选；
+    2. **词边界**（空白）—— 至少不劈开词；
+    3. 都没有 ⇒ 按 ``limit`` 硬切（没有边界的超长词 / 纯中文）。
+
+    ⚠️ **子句标点的集合与前端的画面字幕一致**（``static/app.js`` 的
+    ``SUB_SOFT_END``）—— 两边都是「按词 / 子句断」⇒ 粒度一致。
+
+    ⚠️ 文本末尾**就是**句末标点时返回 -1（**等下一轮**）—— 理由见
+    :func:`_ends_with_sentence_end`。
+    """
+    # ⚠️ **末尾就是句末标点 ⇒ 别硬切** ——
+    #    这一句其实已经说完了，只是后面还没有下一句（「3.」后面可能是
+    #    「14」）⇒ 硬切会把它劈开。⇒ 这一轮**等下一轮**：下一轮有更多
+    #    文本时句末判定自然生效；真的没有下一轮了，收尾 flush 会把整段
+    #    提交（**不会漏**）。
+    if _ends_with_sentence_end(text):
+        return -1
+    window = text[:limit]
+    # ① 子句标点（从后往前找最近的一个）
+    idx = -1
+    for i in range(len(window) - 1, -1, -1):
+        if window[i] in _TR_CLAUSE_END:
+            idx = i
+            break
+    if idx >= _TR_MIN_CLAUSE_CHARS:
+        return _safe_cut(text, idx + 1)
+    # ② 词边界（空白）—— 拉丁文按空格分词 ⇒ 不劈开词
+    idx = -1
+    for i in range(len(window) - 1, -1, -1):
+        if window[i].isspace():
+            idx = i
+            break
+    if idx >= _TR_MIN_CLAUSE_CHARS:
+        cut = idx + 1
+        # ⚠️ 别把**句末标点**落在下一段 ⇒ 词后面紧跟着句末标点时，
+        #    把那个词和标点一起带上。
+        ext = _extend_with_trailing_end(text, cut)
+        if ext is not None:
+            cut = ext
+        return _safe_cut(text, cut)
+    # ③ 没有边界（超长词 / 纯中文）⇒ 按上限硬切
+    return _safe_cut(text, limit)
+
+
 def _lcp(a: str, b: str) -> int:
     """两个字符串的**最长公共前缀**长度。
 
@@ -545,7 +698,12 @@ class _SentenceSplitter:
     * **兜底 1**：epoch 切换（decoder 重置）→ 把上一段剩下的尾巴切出来
       （否则那一段永远不成句 ⇒ 永远没有译文）；
     * **兜底 2**：超过 :data:`_TR_MAX_SENTENCE_CHARS` 还没切 → 强制切
-      （一段没标点的长音频也能边播边出译文）；
+      （一段没标点的长音频也能边播边出译文）。
+      ⚠️ **切点不是「数 60 个字符」** —— 那样会落在**词中间**
+      （实测英文：「…listening to him, bu」+「t in his solo music…」）
+      ⇒ 界面看到半个词、译文也跟着错位。
+      ⇒ 实际切点由 :func:`_soft_sentence_end` 决定：**子句标点**优先、
+      **词边界**其次 ⇒ **绝不把一个词劈成两半**；
     * **收尾**：识别结束时把剩余的提交。
 
     记账用「已提交的字符数」：``committed`` 是**当前 epoch 内**的累积
@@ -596,7 +754,17 @@ class _SentenceSplitter:
                     # 还没攒够一个长句 ⇒ 等下一轮
                     return
                 # 兜底 2：太长还没标点 ⇒ 强制切（保证「实时」）
-                cut = _TR_MAX_SENTENCE_CHARS
+                # ⚠️ **不能按字符数硬切** —— 那样会落在词中间（实测英文：
+                #    「…listening to him, bu」+「t in his solo music…」）
+                #    ⇒ 界面看到半个词、译文也跟着错位。
+                #    ⇒ `_soft_sentence_end` 优先切在**子句标点**上，其次切在
+                #    **词边界**上 ⇒ 绝不把词劈开。
+                cut = _soft_sentence_end(rest, _TR_MAX_SENTENCE_CHARS)
+                if cut < 0:
+                    # ⚠️ 末尾就是句末标点 ⇒ **等下一轮**（见
+                    #    `_soft_sentence_end` 的说明）⇒ 这一轮不切。
+                    #    （真的没有下一轮了 ⇒ 收尾 flush 会把整段提交。）
+                    return
             sentence = rest[:cut].strip()
             c0 = self._done
             self._done += cut
