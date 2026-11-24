@@ -537,6 +537,14 @@ _TR_TRAILING_END = "。！？!?.…"
 #: （一个词 + 它的句末标点）。
 _TR_MAX_EXTEND_CHARS = 24
 
+#: **强制切句的最小长度**（字符）—— 切点回退到词边界之后如果不足这么多
+#: ⇒ 说明这一刀正好落在短词后面 ⇒ 改成「**往前扩**到下一个词边界」。
+#:
+#: ⚠️ **为什么要有下限**（实测 2026-11-24，用户报「``ell`` 明显和 ``w``
+#: 连成一个词」）：切点回退到词边界后如果只剩两三个字符 ⇒ 那一切出来的是
+#: **碎片**（「w」）⇒ 碎片会被**单独翻译** ⇒ 听起来就是一个孤零零的词。
+_TR_MIN_CUT_CHARS = 12
+
 #: **文件 / 视频路径的译文序号基准**。
 #:
 #: 实时路径的句序号是 1、2、3……（每个 live 会话从 1 重新数）；文件路径
@@ -742,7 +750,19 @@ def _soft_sentence_end(text: str, limit: int) -> int:
         if ext is not None:
             cut = ext
         return _safe_cut(text, cut)
-    # ③ 没有边界（超长词 / 纯中文）⇒ 按上限硬切
+    # ③ 没有边界（超长词 / 纯中文）⇒ **往前扩**到下一个空白
+    #
+    # ⚠️ **为什么不是直接按上限硬切**（实测 2026-11-24，用户报「``ell``
+    #    明显和 ``w`` 连成一个词」）：硬切会落在**词中间** ⇒ 两段各自
+    #    翻译 ⇒ 译文里出现「嗯，」（"ell" 被翻成了语气词）。
+    #    ⇒ 宁可**多带一点**（超过 limit 一点点），也不要切在词中间。
+    #    ⚠️ 扩得太远（超过 :data:`_TR_MAX_EXTEND_CHARS`）就算了 ⇒ 硬切。
+    j = min(limit, len(text))
+    while j < len(text) and not text[j].isspace():
+        j += 1
+    if j < len(text) and (j - limit) <= _TR_MAX_EXTEND_CHARS:
+        return _safe_cut(text, j + 1)
+    # ④ 实在扩不动（纯中文 / 超长词）⇒ 硬切（但别劈开代理对）
     return _safe_cut(text, limit)
 
 
@@ -788,6 +808,8 @@ class _SentenceSplitter:
       ⇒ 界面看到半个词、译文也跟着错位。
       ⇒ 实际切点由 :func:`_soft_sentence_end` 决定：**子句标点**优先、
       **词边界**其次 ⇒ **绝不把一个词劈成两半**；
+      ⇒ 连词边界都找不到时，**往前扩**到下一个词边界（见该函数的 ③）
+      ⇒ 宁可多带一点，也不切在词中间；
     * **收尾**：识别结束时把剩余的提交。
 
     记账用「已提交的字符数」：``committed`` 是**当前 epoch 内**的累积
@@ -795,7 +817,7 @@ class _SentenceSplitter:
     记账是安全的。
     """
 
-    def __init__(self, max_chars: int = 0) -> None:
+    def __init__(self, max_chars: int = 0, hold_tail: bool = False) -> None:
         self._done = 0        # 当前 epoch 内已提交的字符数
         self._last = ""       # 上一轮的 committed
         self._index = 0       # 本次识别的句子序号（1 起，跨 epoch 递增）
@@ -805,6 +827,14 @@ class _SentenceSplitter:
         #: （24 字而不是 60 字 ⇒ 跟播滞后更小）⇒ 需要一个**独立的**切句器
         #: 用更短的长度 ⇒ **不能改全局常量**（会影响字幕翻译的切句）。
         self._max_chars = int(max_chars or 0)
+        #: **暂存最后一段**（等下一段 / 收尾再定）—— 见 :meth:`feed`。
+        #:
+        #: ⚠️ **只有「强制切」出来的段才暂存**（标点切出来的段是**确认**
+        #: 的 ⇒ 立刻交出去）；⚠️ **只给「离线一次性转写」的路径开**
+        #: （文件 / 视频源）⇒ 实时流**不暂存**（多等一句 = 多一秒滞后）。
+        self._hold_tail = bool(hold_tail)
+        #: **暂存的段** —— ``(text, index, c0, c1)``。
+        self._held: Optional[tuple] = None
 
     @property
     def limit(self) -> int:
@@ -823,11 +853,13 @@ class _SentenceSplitter:
         self._done = 0
         self._last = ""
         self._index = 0
+        self._held = None
 
     def reset_epoch(self) -> None:
         """**epoch 切换**（decoder 重置）—— 只清文本记账，句子序号继续。"""
         self._done = 0
         self._last = ""
+        self._held = None
 
     def feed(self, committed: str, emit) -> None:
         """喂一轮 ``committed``，切出的句子交给 ``emit(text, index, c0, c1)``。
@@ -851,6 +883,7 @@ class _SentenceSplitter:
             if not rest:
                 return
             cut = _first_sentence_end(rest)
+            forced = False
             if cut < 0:
                 if len(rest) < self.limit:
                     # 还没攒够一个长句 ⇒ 等下一轮
@@ -872,16 +905,52 @@ class _SentenceSplitter:
                     #    `_soft_sentence_end` 的说明）⇒ 这一轮不切。
                     #    （真的没有下一轮了 ⇒ 收尾 flush 会把整段提交。）
                     return
+                # ⚠️ **这一刀是「猜的」**（没有标点、靠长度兜底切出来的）
+                #    ⇒ 标记出来 ⇒ 「暂存」机制据此判断要不要先压住它
+                #    （见 :attr:`_hold_tail`）。
+                forced = True
             sentence = rest[:cut].strip()
             c0 = self._done
             self._done += cut
-            if sentence:
-                self._index += 1
-                emit(sentence, self._index, c0, self._done)
+            if not sentence:
+                continue
+            self._index += 1
+            if self._hold_tail and forced:
+                # ⚠️ **强制切出来的段是「猜的」** ⇒ **暂存** ⇒ 等下一段
+                # （或收尾）再定 —— 否则收尾时剩下的尾巴会变成**孤句**
+                # （实测 2026-11-24，用户报「最后一个 ``people`` 明显是和上
+                # 一个句子连成完整的话，为什么都单独再翻译了」）。
+                if self._held is not None:
+                    h_text, h_index, h_c0, h_c1 = self._held
+                    self._held = None
+                    emit(h_text, h_index, h_c0, h_c1)
+                self._held = (sentence, self._index, c0, self._done)
+                continue
+            if self._held is not None:
+                h_text, h_index, h_c0, h_c1 = self._held
+                self._held = None
+                emit(h_text, h_index, h_c0, h_c1)
+            emit(sentence, self._index, c0, self._done)
 
     def flush(self, emit) -> None:
-        """收尾 / epoch 切换：把剩下的尾巴提交。"""
+        """收尾 / epoch 切换：把剩下的尾巴提交。
+
+        ⚠️ **暂存的段与尾巴合并**（实测 2026-11-24）—— 强制切出来的最后
+        一段是「猜的」⇒ 它后面剩下的尾巴（常常只有几个字）**本来就是它
+        的一部分** ⇒ 分开提交 ⇒ 「尾巴」被**单独翻译**（用户报
+        「``people`` 单独再翻译」）。
+        ⇒ 合并成一段 ⇒ 尾巴不再独立成句。
+        """
         tail = (self._last or "")[self._done:].strip()
+        if self._held is not None:
+            h_text, h_index, h_c0, h_c1 = self._held
+            self._held = None
+            if tail:
+                emit("%s %s" % (h_text, tail), h_index, h_c0, len(self._last))
+            else:
+                emit(h_text, h_index, h_c0, h_c1)
+            self._done = len(self._last)
+            return
         if tail:
             self._index += 1
             emit(tail, self._index, self._done, len(self._last))
@@ -1002,10 +1071,15 @@ class _AsrManager:
         self._degenerate: bool = False
 
         #: **切句器**（文件 / 视频路径的实时翻译用，见 :class:`_SentenceSplitter`）。
-        self._splitter = _SentenceSplitter()
+        #:
+        #: ⚠️ ``hold_tail=True`` —— **暂存强制切出来的最后一段**（实测
+        #: 2026-11-24，用户报「最后一个 ``people`` 明显是和上一个句子连成
+        #: 完整的话，为什么都单独再翻译了」）：文件 / 视频源是**离线一次性
+        #: 转写** ⇒ 不怕多等 ⇒ 收尾时把尾巴并进最后一段 ⇒ 不出「孤句」。
+        self._splitter = _SentenceSplitter(hold_tail=True)
         #: **同传专用**的切句器 —— 与字幕翻译那套**分开**，两条互不干扰
         #: （同传的快档要用更短的强制切句长度 ⇒ 不能共用一个）。
-        self._interp_splitter = _SentenceSplitter(max_chars=0)
+        self._interp_splitter = _SentenceSplitter(max_chars=0, hold_tail=True)
         #: 当前这次文件识别对应的流 id（同传引擎按它对播放头）。
         self._interp_stream_id = ""
         #: **主事件循环** —— 译文要广播给 WS 订阅者，而订阅队列属于
