@@ -1822,7 +1822,16 @@ class _AsrManager:
             )
             return
 
-        language = result.get("language") or ""
+        # ⚠️ **语种要过滤**（「None」不是语种）——
+        #
+        # 模型在**纯静音 / 开头还没说话**上会吐 ``language = "None"`` ⇒
+        # 不滤掉的话 ``self._language`` 就变成字符串 ``"None"`` ⇒ 前端把它
+        # 原样发给翻译端点 ⇒ 翻译那边判「**认不出源语言: 'None'**」⇒
+        # 那一句**翻不出来**（译文 = 原文）⇒ **字幕上只有中文、没有译文**
+        # （用户报：「勾着实时翻译，字幕却只有中文」）。
+        #
+        # ⇒ 跟 round 帧那条路**同一个口径**（见 :func:`_valid_language`）。
+        language = _valid_language(result.get("language") or "")
         body = result.get("text") or ""
         with self._lock:
             self._language = language or self._language

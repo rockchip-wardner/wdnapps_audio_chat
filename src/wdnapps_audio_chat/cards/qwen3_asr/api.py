@@ -804,7 +804,13 @@ async def post_translate_line(payload: TranslateLinePayload) -> dict:
         end_sec=payload.end_sec,
         seq=seq,
     )
-    return {"ok": True, "seq": seq}
+    # ⚠️ **把队列深度回给前端** —— 前端拿它做**背压**（队列太深就先别
+    #    再塞 ⇒ 服务端的队列永远碰不到 ``QUEUE_MAX`` ⇒ **不会丢最旧的**）。
+    #
+    # ⚠️ 服务端队列满了会**丢最旧的**（``translation.py::submit``）⇒ 丢的
+    #    正是**先要的那几行**（= 播放头附近）⇒ 画面字幕上**永远只有中文**
+    #    （用户报）。
+    return {"ok": True, "seq": seq, "queue_depth": svc.queue_depth()}
 
 
 @router.post("/translate/enable")

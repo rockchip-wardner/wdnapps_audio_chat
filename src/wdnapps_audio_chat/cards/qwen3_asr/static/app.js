@@ -63,6 +63,41 @@
   const TR_REQ_BATCH = 2;             // 每轮最多发几个翻译请求
   const TR_REQ_TICK_MS = 600;         // 多久跑一轮（≈ 3.3 个/秒）
 
+  /**
+   * **服务端队列的「软上限」** —— 队列深到这个数就**先别再塞**。
+   *
+   * ⚠️ **为什么需要**：客户端的速率**只是上限**，不是承诺 —— 服务端这台
+   * 板子的翻译实例可能只有 **2.7 句/秒**（实测），比上限低 ⇒ 队列会
+   * **慢慢积压** ⇒ 积到 ``QUEUE_MAX``（256）就**丢最旧的** ⇒ 丢的正是
+   * **先要的那几行**（= 播放头附近）⇒ 画面字幕上**永远只有中文**
+   * （用户报：「勾着实时翻译，字幕却只有中文」）。
+   *
+   * ⇒ 队列深了就**停发** ⇒ 等它消化掉再继续（这就是**背压**）。
+   *
+   * ⚠️ 这个值离 ``QUEUE_MAX``（256）差得远 ⇒ 队列**永远碰不到上限**
+   * ⇒ **不会丢任何一句**。
+   * ------------------------------------------------------------------ */
+  const TR_QUEUE_SOFT_MAX = 48;
+
+  /**
+   * **「要了但一直没回来」多久算过期**（毫秒）。
+   *
+   * ⚠️ **为什么需要**：请求发出去了，但**没收到译文帧** ⇒ 那一行**永远
+   * 没有译文**。三种情况会这样：
+   *
+   * * 服务端**拒收**（``{"ok": false, "skipped": "翻译没开"}``）——
+   *   开关的本地状态与服务端状态不一致的那几十毫秒；
+   * * 服务端队列**满了**（``QUEUE_MAX``）⇒ 丢最旧的；
+   * * 网络失败（fetch reject）。
+   *
+   * ⇒ 过期了就**重要一次**（见 ``_trRequestLines``）⇒ 那一行最终一定有
+   *    译文（用户报：「勾着实时翻译，字幕却只有中文」）。
+   *
+   * ⚠️ 同时也是**退避**：服务端一直拒收时，不会每个 tick（600 ms）都重发
+   * ⇒ 5 秒一次，够狠又不至于刷屏。
+   */
+  const TR_REQ_STALE_MS = 5000;
+
   /* ------------------------------------------------------------------ *
    * 翻译目标语言：**中文名 + 本族名**（跟右上角「简体中文」下拉一个排法）
    *
@@ -516,8 +551,44 @@ const Qwen3Asr = {
   _trMode: "sentence",
   /** 行级翻译：给每行编的序号（前端自己编，后端原样带回）。 */
   _trLineSeq: 0,
-  /** 槽位号 → 已经要过的**文本**（文本没变就不重翻）。 */
+  /**
+   * 槽位号 → 已经要过的**文本** + **什么时候要的**。
+   *
+   * ⚠️ 带上时间戳是为了能判断「要了但**一直没回来**」⇒ 过期后**重要
+   * 一次**（否则那一行**永远没有译文** —— 见 :data:`TR_REQ_STALE_MS`）。
+   */
   _trLineReq: new Map(),
+  /**
+   * **全局翻译请求的闸门**（时间戳，毫秒）。
+   *
+   * ⚠️ **为什么要有**：``_trRequestLines`` 有**两个**调用者 ——
+   * 「节拍器」（每 600 ms）和「**round 帧驱动**」（**每来一轮识别就调
+   * 一次**）。识别是实时的 ⇒ 一集 98 分钟的访谈 ≈ **3.8 轮/秒** ⇒ 每轮
+   * 都发 ``TR_REQ_BATCH``（2）个 ⇒ **≈7.6 个/秒** + 节拍器的 3.3 ⇒
+   * **≈10 个/秒**。
+   *
+   * ⚠️ 而一台翻译实例只吃 **≈2.7~3.8 句/秒** ⇒ 队列**必然积压** ⇒ 满了
+   * **丢最旧的** ⇒ 丢的正是**先要的那几行**（= 播放头附近）⇒ 画面字幕上
+   * **永远只有中文**（用户报：「勾着实时翻译，字幕却只有中文」）。
+   *
+   * ⇒ 闸门放在**函数内部**（不是放在调用者里）⇒ **不管谁调**，600 ms 最多
+   *    发 2 个 ⇒ 速率封顶 ≈ 3.3 个/秒。
+   */
+  _trReqGateAt: 0,
+  /**
+   * 服务端翻译队列的深度（句数）—— **背压**用。
+   *
+   * ⚠️ 来源：每次 ``POST /translate/line`` 的响应里带着（服务端入队后
+   *    的实时深度）+ ``GET /translate/status`` 的轮询值。
+   */
+  _trQueueDepth: 0,
+  /**
+   * **本地刚改过、还没被服务端确认**的翻译设置。
+   *
+   * ⚠️ 用来防「5 秒一次的轮询把用户刚点的开关**撤销**」—— 详见
+   * :meth:`_trRefresh` 的说明。
+   */
+  _trPending: null,
   /** 行序号 → 槽位号（译文回来时据此对回是哪一行）。 */
   _trLineIdBySeq: new Map(),
   /** 槽位号 → 这一行当前的请求 {seq, item, text}。 */
@@ -533,6 +604,9 @@ const Qwen3Asr = {
    *
    * ⇒ 重新打开开关时，前端用这个表找出「还没翻过的句子」，再逐句要一次
    * （走同一个 ``/translate/line`` 端点 ⇒ 译文照样从 WS 回来）。
+   *
+   * ⚠️ 值 = ``{text, at}`` —— 带上时间戳才能判断「要了但一直没回来」
+   * ⇒ 过期后重要一次（见 :data:`TR_REQ_STALE_MS`）。
    */
   _trSentReq: new Map(),
   /** 句子级翻译的请求序号（前端自己编，后端原样带回）。 */
@@ -607,20 +681,37 @@ const Qwen3Asr = {
       this._tr.enabled = on;
       this._trSyncUi();
       if (!on) {
-        // ⚠️ **关掉 ⇒ 画面字幕上的译文也一起收掉** —— 已经收到的译文
-        // 留在 ``_tr.items`` 里 ⇒ 字幕会继续挂着旧译文（用户明明关了
-        // 「实时翻译」）。
-        this._tr.items = [];
-        this._trLineTr.clear();   // 行级译文也一样
-        this._trLineReq.clear();  // 重新打开时那几行要**重新**要一次
-        this._trLineSlot.clear();
-        this._trSentReq.clear();  // 句子级也一样
+        // ⚠️ **关掉 ⇒ 画面字幕上的译文收掉，但**数据留着** ——
+        //
+        // 以前是把译文**删掉**（``_tr.items`` / ``_trLineTr`` 清空）⇒
+        // 再勾选回来时**每一行都要重新翻一遍** ⇒ 一集 98 分钟 ≈ 1500 行
+        // ⇒ 按每轮 2 个的限速，要等 **40 秒以上**才轮得到播放头附近那几行
+        // ⇒ 用户看到的就是「**勾着实时翻译，字幕却只有中文**」
+        // （用户报：「有概率出现选中了实时翻译但还是……只有中文」）。
+        //
+        // ⇒ 改成**只隐藏、不删除**：译文还在（重新勾上**立刻**就有），
+        //    显示由 ``_tr.enabled`` 统一管（见 ``_trItemsForLine`` /
+        //    ``_renderSentences``）。
         this._trVer++;   // 版本号 +1 ⇒ 缓存失效
         this._trRender();
+        this._renderVideoSubtitle();
+        this._renderTranscript();
       }
       this._trSet({ enabled: on });
     });
     $("asr-tr-target")?.addEventListener("change", (e) => {
+      // ⚠️ **换目标语言 ⇒ 旧译文作废** —— 那些译文是**上一种语言**的
+      // （「中文→英语」的译文挂在字幕上，用户刚换成「日语」⇒ 字幕上还是
+      // 英文）⇒ 清掉译文与记账 ⇒ 重新按新语言翻一遍。
+      this._tr.items = [];
+      this._trLineTr.clear();
+      this._trLineReq.clear();
+      this._trLineSlot.clear();
+      this._trSentReq.clear();
+      this._trVer++;
+      this._trRender();
+      this._renderVideoSubtitle();
+      this._renderTranscript();
       this._trSet({ target_lang: e.target.value });
     });
     $("asr-tr-model-btn")?.addEventListener("click", () => this._trEnableModel());
@@ -2418,6 +2509,21 @@ const Qwen3Asr = {
   _trRequestLines(force) {
     if (this._trMode !== "line") return;
     if (!this._tr.enabled) return;
+    // ⚠️ **翻译模型没就绪 ⇒ 别要** —— 服务端会回「翻译模型未启用」
+    //    （``status=unavailable``）⇒ 白白占队列、还把「失败」计数刷上去。
+    //    ⇒ 模型就绪后 ``_trRefresh`` 会把还欠着的行补要一次。
+    if (!this._tr.modelReady) return;
+    // ⚠️ **全局闸门 + 背压**（见 ``_trReqGateAt`` / ``TR_QUEUE_SOFT_MAX``
+    //    的说明）—— **限速必须放在函数内部** ⇒ 「round 帧驱动」再怎么
+    //    频繁调用也突破不了这个上限。
+    const now = Date.now();
+    if (now - (this._trReqGateAt || 0) < TR_REQ_TICK_MS) return;
+    if ((this._trQueueDepth || 0) > TR_QUEUE_SOFT_MAX) {
+      // ⚠️ **队列太深 ⇒ 先别塞**（等它消化）—— 这就是**背压**。
+      // ⇒ 不消耗闸门：队列一浅下来就能立刻接着发。
+      return;
+    }
+    this._trReqGateAt = now;
     const rounds = this.rounds || [];
     if (!rounds.length) return;
     const lines = this._buildSubTimeline().lines;
@@ -2442,8 +2548,19 @@ const Qwen3Asr = {
       if (!text) continue;
       // ⚠️ 文本**没变** ⇒ 不用重翻（行 id 变了但只是标点/空格 ⇒ 译文一样）
       const prev = this._trLineReq.get(slot);
-      if (prev !== undefined && this._trNormText(prev) === this._trNormText(text)) {
-        continue;
+      if (prev !== undefined && this._trNormText(prev.text) === this._trNormText(text)) {
+        // ⚠️ **已经要过同样的文本** ⇒ 三种情况要分开看：
+        //
+        // ① 译文**已经回来了**（``done``）或**根本不用翻**（``skipped``）
+        //    ⇒ 不用重翻；
+        // ② 还在**路上**（没超时）⇒ 等；
+        // ③ **没回来**（服务端拒收 / 队列满了把它丢了 / 网络失败）**或**
+        //    **回来了但是翻失败**（``failed`` / ``unavailable``）⇒ 等够了
+        //    就**重要一次** —— 不重要的话这一行**永远没有译文**
+        //    （用户报：「勾着实时翻译，字幕却只有中文」）。
+        if (!this._trLineNeedRetry(slot)) continue;
+        if (now - (prev.at || 0) < TR_REQ_STALE_MS) continue;
+        // ⇒ 过期 ⇒ 下面重新要一次（``_trRequestLine`` 会覆盖记账）
       }
       const ep = this._trEpochOf(ln);
       const epIdx = parseInt(ep, 10);
@@ -2453,7 +2570,6 @@ const Qwen3Asr = {
         || (lastOfEpoch.get(ep) > i)
         || (!isNaN(epIdx) && epIdx < lastEpochIdx);
       if (!closed) continue;
-      this._trLineReq.set(slot, text);
       this._trRequestLine(ln, slot, text);
       sent++;
     }
@@ -2472,17 +2588,31 @@ const Qwen3Asr = {
    */
   _trLineOrder(lines) {
     const n = (lines && lines.length) || 0;
-    const cur = this._curSubIndex(lines);
-    const out = [];
-    if (cur < 0) {
-      for (let i = 0; i < n; i++) out.push(i);
-      return out;
+    if (!n) return [];
+    // ⚠️ **按「这一行离播放头有多远」排序** —— 而不是「从当前行往两边扩」。
+    //
+    // 为什么换：拖动进度条之后，**播放头常常不在已识别的区间里**
+    // （识别还没跟过去；或识别只跑到播放头前面）⇒ 「当前行」没有意义 ⇒
+    // 旧写法退化成「**从头排**」⇒ 前面几百行排在新位置前面 ⇒ 播放头附近
+    // 那几行要等**几十秒**才拿到译文 ⇒ 用户看到「勾着实时翻译，字幕却
+    // 只有中文」（用户报）。
+    //
+    // ⇒ 一律按**距离**排 ⇒ 最近的先要 ⇒ 屏幕上的那几行永远排在最前面
+    //    （不管播放头在不在区间里）。
+    const video = document.getElementById("asr-video");
+    const t = (video ? (video.currentTime || 0) : 0)
+      - (this._audioOriginSec || 0);
+    const order = [];
+    for (let i = 0; i < n; i++) {
+      const ln = lines[i];
+      const s = (ln && ln.start) || 0;
+      const e = (ln && ln.end) || 0;
+      // 距离 = 播放头到这一行**时间区间**的间隔（区间内 = 0）。
+      const d = (t < s) ? (s - t) : ((t > e) ? (t - e) : 0);
+      order.push({ i: i, d: d });
     }
-    for (let d = 0; d < n; d++) {
-      if (cur - d >= 0) out.push(cur - d);
-      if (d > 0 && cur + d < n) out.push(cur + d);
-    }
-    return out;
+    order.sort((a, b) => (a.d - b.d) || (a.i - b.i));
+    return order.map((x) => x.i);
   },
 
   /**
@@ -2568,26 +2698,86 @@ const Qwen3Asr = {
     this._trVer++;
   },
 
-  /** 要一行字幕的译文（走后端 → 译文走 WS 回来）。 */
+  /**
+   * **源语**认出来了**没有**。
+   *
+   * ⚠️ **为什么要单独判**：模型在**纯静音 / 开头还没说话**上会吐
+   * ``language = "None"`` ⇒ 服务端把翻译请求拿去做时判「**认不出源语言
+   * : 'None'**」⇒ 那一句**翻不出来**（译文 = 原文）⇒ **字幕上只有中文、
+   * 没有译文**（用户报：「勾着实时翻译，字幕却只有中文」）。
+   *
+   * ⇒ 语种还没认出来就**别要** ⇒ 等它认出来（第一轮 round 帧之后）再要
+   *    ⇒ 那一行的译文**不会**被这次失败**钉死**。
+   *
+   * @returns {string} 认出来的源语；没认出来返回空串。
+   */
+  _trSrcLang() {
+    const s = this.snapshot || {};
+    const lang = String(s.language || "").trim();
+    if (!lang) return "";
+    if (["none", "null", "unknown", "und", "n/a"]
+        .indexOf(lang.toLowerCase()) >= 0) return "";
+    return lang;
+  },
+
+  /**
+   * **这一行的译文**还要不要再要一次**？
+   *
+   * ⚠️ **三种结局，三种处理**：
+   *
+   * * ``done`` —— 翻好了 ⇒ **不用**再要；
+   * * ``skipped`` —— 源语 == 目标语（服务端透传）⇒ 再要也是这个 ⇒ **不用**；
+   * * ``failed`` / ``unavailable`` / **压根没回来** ⇒ **要重来一次**
+   *   （用户报：「那几行永远只有中文」）。
+   */
+  _trLineNeedRetry(slot) {
+    const it = this._trLineTr ? this._trLineTr.get(slot) : null;
+    if (!it) return true;                        // 压根没回来
+    if (it.status === "done") return false;      // 翻好了
+    if (it.status === "skipped") return false;   // 源语 == 目标语
+    return true;                                 // failed / unavailable
+  },
+
+  /** 要一整行字幕的译文（走后端 → 译文走 WS 回来）。 */
   _trRequestLine(ln, slot, text) {
     if (!text) return;
+    // ⚠️ **源语还没认出来 ⇒ 别要**（见 :meth:`_trSrcLang`）—— 服务端会判
+    //    「认不出源语言」⇒ 那一句翻不出来 ⇒ 字幕上只有中文。
+    const lang = this._trSrcLang();
+    if (!lang) return;
     const seq = this._trLineSeq++;
     this._trLineIdBySeq.set(seq, slot);
     // ⚠️ 这一行**之前**要过译文 ⇒ 旧的作废（模型改词了 ⇒ 旧译文是旧文本的）
     const old = this._trLineSlot.get(slot);
     if (old && old.item) this._trDropLineItem(old.item);
     this._trLineSlot.set(slot, { seq: seq, item: null, text: text });
+    // ⚠️ **记账带上时间戳** —— 「要了但一直没回来」要能过期重试
+    // （见 ``_trRequestLines`` 里的过期判定与 :data:`TR_REQ_STALE_MS`）。
+    this._trLineReq.set(slot, { text: text, at: Date.now() });
     const body = {
       text: text,
       start_sec: ln.start,
       end_sec: ln.end,
-      lang: (this.snapshot && this.snapshot.language) || "",
+      lang: lang,
       seq: seq,
     };
     fetch(API_PREFIX + "/qwen3-asr/translate/line", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }).then((r) => r.json().catch(() => ({}))).then((d) => {
+      // ⚠️ 服务端**拒收**（``{"ok": false, "skipped": "翻译没开"}``）⇒ 这一行
+      //    **没有**译文 ⇒ 记账里的时间戳留着 ⇒ 过期后自动重要一次
+      //    （见 ``_trRequestLines``）⇒ 不会出现「永远没有译文」的行。
+      if (d && d.ok === false) {
+        console.warn("[qwen3-asr] 行级翻译被拒:", d);
+        return;
+      }
+      // ⚠️ **队列深度**（服务端入队后的实时值）⇒ 拿它做**背压**
+      //    （见 ``TR_QUEUE_SOFT_MAX``）。
+      if (d && typeof d.queue_depth === "number") {
+        this._trQueueDepth = d.queue_depth;
+      }
     }).catch((e) => {
       // 翻译是**旁路** —— 请求失败不许打断识别
       console.warn("[qwen3-asr] 行级翻译请求失败:", e);
@@ -2611,13 +2801,24 @@ const Qwen3Asr = {
   _trRequestSentences() {
     if (this._trMode !== "sentence") return;
     if (!this._tr.enabled) return;
+    // ⚠️ **翻译模型没就绪 ⇒ 别要**（同 ``_trRequestLines``）。
+    if (!this._tr.modelReady) return;
+    // ⚠️ **全局闸门 + 背压**（与行级**共用一个**预算 ⇒ 两种单位**加
+    //    起来**也不会超速）—— 见 ``_trReqGateAt`` 的说明。
+    const now = Date.now();
+    if (now - (this._trReqGateAt || 0) < TR_REQ_TICK_MS) return;
+    if ((this._trQueueDepth || 0) > TR_QUEUE_SOFT_MAX) return;
+    this._trReqGateAt = now;
     const sents = this._sentences || [];
     if (!sents.length) return;
     // 已经有译文的句子 —— 按**原文文本**配对（与 ``_renderSentences`` 同口径）
+    // ⚠️ **只算「真的翻出来了」的**（``done``）—— 翻失败的（failed /
+    //    unavailable）广播出来的 text 是「原文（未翻译）」⇒ 不算它
+    //    「有译文」⇒ 它才有机会**重试**（见下面）。
     const have = new Set();
     for (const it of (this._tr.items || [])) {
       const src = (it.source || "").trim();
-      if (src) have.add(src);
+      if (src && (!it.status || it.status === "done")) have.add(src);
     }
     let sent = 0;
     for (const s of sents) {
@@ -2626,11 +2827,14 @@ const Qwen3Asr = {
       if (!text) continue;
       // 已经要过同样的文本 ⇒ 别重复要（译文可能还在路上）
       const prev = this._trSentReq.get(s.i);
-      if (prev !== undefined && this._trNormText(prev) === this._trNormText(text)) {
-        continue;
+      if (prev !== undefined && this._trNormText(prev.text) === this._trNormText(text)) {
+        // ⚠️ **要了但一直没回来** ⇒ 等够 ``TR_REQ_STALE_MS`` 就**重要一次**
+        // （同 ``_trRequestLines``：不然这一句**永远没有译文**）。
+        if (have.has(text)) continue;
+        if (now - (prev.at || 0) < TR_REQ_STALE_MS) continue;
       }
       if (have.has(text)) continue;
-      this._trSentReq.set(s.i, text);
+      this._trSentReq.set(s.i, { text: text, at: now });
       this._trRequestSentence(text);
       sent++;
     }
@@ -2639,18 +2843,32 @@ const Qwen3Asr = {
   /** 要一句（音频文件来源）的译文 —— 走同一个端点，译文从 WS 回来。 */
   _trRequestSentence(text) {
     if (!text) return;
+    // ⚠️ **源语还没认出来 ⇒ 别要**（见 :meth:`_trSrcLang`）。
+    const lang = this._trSrcLang();
+    if (!lang) return;
     const seq = this._trSentSeq++;
     const body = {
       text: text,
       start_sec: null,
       end_sec: null,
-      lang: (this.snapshot && this.snapshot.language) || "",
+      lang: lang,
       seq: seq,
     };
     fetch(API_PREFIX + "/qwen3-asr/translate/line", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }).then((r) => r.json().catch(() => ({}))).then((d) => {
+      // ⚠️ 服务端**拒收** ⇒ 这一句**没有**译文 ⇒ 记账里的时间戳留着 ⇒
+      //    过期后自动重要一次（见 ``_trRequestSentences``）。
+      if (d && d.ok === false) {
+        console.warn("[qwen3-asr] 句子翻译被拒:", d);
+        return;
+      }
+      // ⚠️ **队列深度** ⇒ 背压（见 ``TR_QUEUE_SOFT_MAX``）。
+      if (d && typeof d.queue_depth === "number") {
+        this._trQueueDepth = d.queue_depth;
+      }
     }).catch((e) => {
       // 翻译是**旁路** —— 请求失败不许打断识别
       console.warn("[qwen3-asr] 句子翻译请求失败:", e);
@@ -2679,8 +2897,28 @@ const Qwen3Asr = {
       if (!r.ok) return;
       const st = await r.json();
       const model = st.model || {};
-      this._tr.enabled = !!st.enabled;
+      // ⚠️ **本地刚改过、服务端还没确认的开关值 ⇒ 不要用它覆盖** ——
+      //
+      // 这个 5 秒一次的轮询**正好落在「用户点了开关」与「服务端处理完」
+      // 之间**时，读到的还是**旧值** ⇒ 把用户的选择**悄悄撤销** ⇒
+      // 表现为「勾上了『实时翻译』，但服务端其实还关着」。
+      //
+      // ⇒ 服务端一关 ⇒ 每一次行级请求都被**拒收**
+      //   （``{"ok": false, "skipped": "翻译没开"}``）⇒ 那几行**永远没有
+      //   译文**（用户报：「有概率出现选中了实时翻译，但字幕只有中文」）。
+      //
+      // ⇒ 本地有**待确认**的开关值时，保持用户的值（等服务端确认后，
+      //    ``_trSet`` 收尾会再刷新一次）。
+      const pendEnabled = this._trPending
+        && Object.prototype.hasOwnProperty.call(this._trPending, "enabled");
+      if (!pendEnabled) this._tr.enabled = !!st.enabled;
       this._tr.targetLang = st.target_lang || this._tr.targetLang;
+      // ⚠️ **队列深度** ⇒ 背压（见 ``TR_QUEUE_SOFT_MAX``）。
+      // ⇒ 这条是**兜底**信号（每次请求的响应里也有一个更准的）⇒ 万一
+      //    请求被拒收 / 响应丢了，这里还能把队列深度更新过来。
+      if (typeof st.queue_depth === "number") {
+        this._trQueueDepth = st.queue_depth;
+      }
       this._tr.modelReady = !!model.running;
       this._tr.modelId = model.model_id || this._tr.modelId || "";
       this._tr.modelStatus = model.running
@@ -2728,6 +2966,14 @@ const Qwen3Asr = {
   /** 改翻译设置。返回 true = 改成功。 */
   async _trSet(patch) {
     let ok = false;
+    // ⚠️ **记下「本地刚改过、还没被服务端确认」的设置** ——
+    // ⇒ ``_trRefresh``（5 秒一次的轮询）就不会用服务端的**旧值**把它
+    //    撤销（见那里的说明）。
+    const pend = Object.assign({}, this._trPending || {});
+    Object.assign(pend, patch || {});
+    const at = Date.now();
+    pend.at = at;
+    this._trPending = pend;
     try {
       const r = await fetch("/api/qwen3-asr/translate/settings", {
         method: "POST",
@@ -2740,6 +2986,14 @@ const Qwen3Asr = {
       }
     } catch (e) {
       console.warn("[qwen3-asr] 设置翻译失败:", e);
+    }
+    // ⚠️ 本地这次改动**已经落地**（成功或失败）⇒ 服务端的值现在说了算 ⇒
+    //    撤掉「待确认」标记（否则轮询会一直不采信服务端）。
+    //
+    // ⚠️ **只有最后一次改动**才撤（连点两次时，前一次收尾不能把后一次的
+    //    「待确认」标记抹掉 ⇒ 否则又会被轮询撤销）。
+    if (this._trPending && this._trPending.at === at) {
+      delete this._trPending.enabled;
     }
     await this._trRefresh();
     return ok;
@@ -2950,6 +3204,12 @@ const Qwen3Asr = {
   _trItemsForLine(lines, i) {
     const ln = lines[i];
     if (!ln) return [];
+    // ⚠️ **「实时翻译」关着 ⇒ 不显示译文** ——
+    //
+    // ⚠️ **只隐藏，不删除** —— 译文还在 ``_trLineTr`` / ``_tr.items`` 里
+    // ⇒ 重新勾上立刻就有（见开关的处理）⇒ 不会有一段时间「勾着开关，
+    // 字幕却只有中文」（用户报）。
+    if (!this._tr.enabled) return [];
     // ⚠️ **行级**（视频来源）⇒ 直接按**槽位号**对 —— 译文就是这一行的
     // 译文，**一一对应**。不用时间窗口（行的时间会随排版微调，对不上）。
     if (this._trMode === "line") {
@@ -4058,10 +4318,14 @@ const Qwen3Asr = {
     }
     // 译文按**原文**配对：服务端给的 ``source`` 就是那句原文 ⇒ 精确匹配
     // （句子序号在两次识别之间会重排，不能拿它当键）。
+    //
+    // ⚠️ **「实时翻译」关着 ⇒ 不配对**（只隐藏，不删除 —— 见开关的处理）
     const trBySrc = new Map();
-    for (const it of (this._tr.items || [])) {
-      const src = (it.source || "").trim();
-      if (src && !trBySrc.has(src)) trBySrc.set(src, it);
+    if (this._tr.enabled) {
+      for (const it of (this._tr.items || [])) {
+        const src = (it.source || "").trim();
+        if (src && !trBySrc.has(src)) trBySrc.set(src, it);
+      }
     }
     const on = !!this._tr.enabled;
     for (const s of (sentences || [])) {
@@ -4356,8 +4620,29 @@ const Qwen3Asr = {
           if (slot && info && info.seq === it.seq) {
             info.item = it;
             this._trLineTr.set(slot, it);
+            // ⚠️ **翻失败了**（``failed`` / ``unavailable``）⇒ 这一行
+            //    **没有**译文（服务端广播的 text 是「原文」）⇒ 它得
+            //    **再要一次** ⇒ 把**重试时间**推到现在 ⇒ 等够
+            //    ``TR_REQ_STALE_MS`` 才会重试（否则会热循环）。
+            //
+            // ⚠️ ``skipped``（源语 == 目标语）**不重试** —— 再要也是同一个。
+            if (it.status && it.status !== "done" && it.status !== "skipped") {
+              const req = this._trLineReq.get(slot);
+              if (req) this._trLineReq.set(slot, { text: req.text, at: Date.now() });
+            }
           } else {
             expired = true;
+          }
+        } else if (it.status && it.status !== "done" && it.status !== "skipped") {
+          // ⚠️ **句子级**翻失败了 ⇒ 同样把**重试时间**推到现在
+          //    （否则一句失败的话会**立刻**被重试 ⇒ 热循环）。
+          const src = (it.source || "").trim();
+          if (src) {
+            for (const [k, v] of this._trSentReq) {
+              if (v && this._trNormText(v.text) === this._trNormText(src)) {
+                this._trSentReq.set(k, { text: v.text, at: Date.now() });
+              }
+            }
           }
         }
         // ⚠️ **按句序号覆盖**，不是 append —— 翻译是**乱序完成**的

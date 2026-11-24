@@ -191,6 +191,19 @@ class TranslationService:
     # ------------------------------------------------------------------ #
     # 生产（ASR 的 endpoint 帧调它）
     # ------------------------------------------------------------------ #
+    def queue_depth(self) -> int:
+        """当前**排队待译**的句数。
+
+        ⚠️ **轻量** —— 前端拿它做**背压**（队列太深就先别再塞）。
+        别用 :meth:`status`：那个会去问一遍 NPU 实例的详细状态，重。
+
+        ⚠️ 这是**入队之后**的深度 ⇒ 前端据此判断「我是不是塞太多了」。
+        """
+        try:
+            return int(self._queue.qsize())
+        except Exception:  # noqa: BLE001
+            return 0
+
     def submit(self, *, index: int, text: str, lang: str, stream_id: str,
                loop: Any, start_sec: Optional[float] = None,
                end_sec: Optional[float] = None,
