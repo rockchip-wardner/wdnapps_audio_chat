@@ -128,6 +128,49 @@ _FILE_SESSION_MAX_SEC = 60.0
 #: 是「**确认过东西之后**停止增长」。
 _STALL_ROUNDS_LIMIT = 8
 
+#: **文件 / 视频源的回滚窗口**（SDK ``asr.py`` 的 ``online_rollback_*``）。
+#:
+#: ⚠️ **SDK 默认是「4 轮 / 5 token」** ⇒ **新会话的头 4 秒一个字都不提交**
+#: （``chunk_idx < rollback_rounds`` ⇒ ``stable_count = 0``）⇒ 那 4 秒
+#: 全是**假设** ⇒ 模型一改写，前一版的文字就被**替换**掉 ⇒
+#: **句首被吞**（实测 2026-11-24，用户报「实时结果一开始的一段识别给吞了」）。
+#:
+#: ⇒ 实测（英文素材 ``asr_en.wav``，整文件一次转写）：
+#:
+#: ==========  ==============================  ==========================
+#: 轮 / token  最终文本                        丢了什么
+#: ==========  ==============================  ==========================
+#: 4 / 5（默认） ``listening to him, …``        句首 **8 个词**
+#: 2 / 3        ``when I started listening …``  句首 4 个词
+#: 1 / 5        ``… didn't very well …``        **句中**丢了一截
+#: 1 / 4        ``… didn't do when …``          **句中**丢了一截
+#: 1 / 3        ``Uh huh. Oh yeah, yeah. …``    **完整** ✓（连跑两次逐字相同）
+#: ==========  ==============================  ==========================
+#:
+#: ⇒ **窗口越大，模型改写越多；而每次改写都可能「丢掉」而不是「修正」**
+#: ⇒ 文件源是**离线一次性转写**（没有第二轮机会）⇒ **小窗口反而更准**
+#: ⇒ 取 **1 轮 / 3 token**。
+#:
+#: ⚠️ 中文素材（``asr_zh_seek_test.mp4``）对比 (4/5) 与 (1/3) ⇒ 质量相当、
+#: **无回归**。
+#: ⚠️ **实时流不改**（麦克风要的是「低延迟 + 模型能自我纠正」⇒ 保留 SDK 默认）。
+_FILE_ROLLBACK_ROUNDS = 1
+_FILE_ROLLBACK_TOKENS = 3
+
+
+def _file_stream_options(options: Optional[Dict[str, Any]] = None
+                         ) -> Dict[str, Any]:
+    """文件 / 视频源的流式参数 —— **补上回滚窗口的默认口径**。
+
+    ⚠️ 调用方**显式传了**就不动（``/transcribe`` 的 form 字段
+    ``rollback_rounds`` / ``rollback_tokens`` 优先）。
+    """
+    out = dict(options or {})
+    out.setdefault("online_rollback_rounds", _FILE_ROLLBACK_ROUNDS)
+    out.setdefault("online_rollback_tokens", _FILE_ROLLBACK_TOKENS)
+    return out
+
+
 #: **停顿检测阈值**：连续多少轮「模型当前的假设文本**完全没变**」算说话停顿。
 #:
 #: 为什么需要它（声学检测不够用）：真实视频/录音的底噪往往很高 ——
@@ -1861,7 +1904,6 @@ class _AsrManager:
 
         ``lookback_sec`` —— **回看**（秒）：本次识别最前面这一段是
         **纯上下文**（调用方多解了它，但不算识别起点）。
-
         为什么需要它：拖动后重开识别 ⇒ 新会话**零上下文** ⇒ 模型会
         **重新判语种**（中文被判成 English / Russian）⇒ 头几轮的外文
         臆测还会让那一段的**译文**失败（源语种认不出来）。
@@ -1869,6 +1911,12 @@ class _AsrManager:
 
         ⚠️ 这一段**不参与**停滞 / 停顿检测，也不参与句子级翻译
         （它上一段已经翻过一遍了）—— 见 :data:`_LOOKBACK_SEC`。
+
+        ⚠️⚠️ **回滚窗口有本卡自己的默认口径**（:func:`_file_stream_options`）——
+        SDK 默认「4 轮 / 5 token」⇒ **新会话的头 4 秒一个字都不提交**
+        ⇒ 那 4 秒全是**假设** ⇒ 模型一改写就把**句首**丢掉
+        （实测 2026-11-24：英文素材的句首 8 个词整段消失）⇒
+        文件 / 视频源默认用 **1 轮 / 3 token**（调用方显式传了就不动）。
 
         ``source_info`` —— 这批轮次归属的来源（见 :attr:`_rounds_source`）：
         ``{"kind": "video"|"audio", "name": ..., "path": ...}``。
@@ -1917,7 +1965,13 @@ class _AsrManager:
                 #    仍然知道「这段媒体是中文」⇒ 那 10 轮会被剪掉 ✓。
                 self._language = ""
             self._last_result = None
-            self._options = dict(options or {})
+            # ⚠️⚠️ **回滚窗口的默认口径**（文件 / 视频源）—— 见
+            # :func:`_file_stream_options` 与 :data:`_FILE_ROLLBACK_ROUNDS`：
+            # SDK 默认「4 轮 / 5 token」⇒ **新会话的头 4 秒一个字都不提交**
+            # ⇒ 那 4 秒全是**假设** ⇒ 模型一改写就把**句首**丢掉
+            # （实测 2026-11-24，用户报「实时结果一开始的一段被吞了」）
+            # ⇒ 默认用 **1 轮 / 3 token**。调用方显式传了就不动。
+            self._options = _file_stream_options(options)
             self._cancel = False
             self._stop_reason = ""
             self._drop_frames = False  # 新的一批 → 轮次帧照收

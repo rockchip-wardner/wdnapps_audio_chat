@@ -1115,3 +1115,34 @@ provider**（后端 `list_supported_models()` 动态列）→ **③ 正在跑的
 回归（宿主仓）：`scripts/verify_interp_sentence_split.py`（14 条）；
 探针（宿主仓）：`tools/probes/interp/m34_file_sent_split.py`。
 板端：`starved` 2.33 s ⇒ **0**；切句 3 段碎片 ⇒ **2 段完整句**。
+
+### ⑦ 「实时结果」开头的一段被吞（M35，2026-11-24）
+
+用户报：「『音频文件』，开始识别后，为什么**实时结果一开始的一段识别给吞
+了**？」
+
+⚠️ **根因是 SDK 的流式回滚窗口**（不是我们的过滤器）：SDK `asr.py` 的策略
+`chunk_idx < rollback_rounds ⇒ stable_count = 0` ⇒ **新会话的头 4 轮一个字
+都不提交**（默认 `rollback_rounds=4` / `rollback_tokens=5`）⇒ 那 4 秒全是
+**假设** ⇒ 模型每轮改写一次 ⇒ **前一版的文字被替换掉**（不是被「修正」）
+⇒ 头几版**永久消失** ⇒ 面板上先显示假设、随后**整段消失** ⇒「被吞」。
+（插件里早有记录：「实测中文《圆桌派》**第 10 轮**才第一次提交」。）
+
+⇒ **实测（同一素材，只改窗口）**：4/5 丢句首 **8 个词**；2/3 丢 4 个词；
+1/5、1/4 **句中**丢一截；**1/3 完整**（连跑两次逐字相同）⇒
+**窗口越大 ⇒ 改写越多 ⇒ 每次改写都可能「丢字」** ⇒ 离线一次性转写
+**小窗口反而更准**。
+
+⇒ **改动**：`service.py` 新增 `_FILE_ROLLBACK_ROUNDS = 1` /
+`_FILE_ROLLBACK_TOKENS = 3` + `_file_stream_options()` ⇒
+**`transcribe_stream`（文件 / 视频源）**套用；调用方显式传了就不动。
+⚠️ **实时流（`_LiveAsrSession`）不改** —— 麦克风要「低延迟 + 模型能自我
+纠正」⇒ 保留 SDK 默认。
+⚠️ **别改 `_AsrManager.transcribe()`** —— 那是**裸 PCM 入口**、
+**全仓无调用者**；真正的文件源入口是 **`transcribe_stream`**（`api.py`
+只调它）⇒ 改错地方会「改了没效果」（踩过：改到 `transcribe()` ⇒ 默认
+没生效，`options` 还是空的）。
+
+回归（宿主仓）：`scripts/verify_asr_rollback_window.py`（9 条）。
+板端：首次提交 **t=7.0 s ⇒ t=2.0 s**；句首 8 个词回来了；中文素材首次提交
+**t=2.06 s**。
