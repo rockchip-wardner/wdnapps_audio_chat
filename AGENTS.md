@@ -1063,3 +1063,16 @@ provider**（后端 `list_supported_models()` 动态列）→ **③ 正在跑的
 探针（宿主仓）：`tools/probes/interp/m32_text_pollution.py`。
 ⚠️ **探针的两个坑**：引擎的 `_timings` 与队列的 `timings` 都是**累计**的
 ⇒ 必须记基线；「乱序」要量**提交顺序**（真播放顺序），不是到达顺序。
+
+### ⑤ MT 会把**提示词**当译文吐回来（M33，2026-11-24）
+
+模型**没东西可翻**时会把**指令**原样吐回来 ⇒ 质量闸只查文种 ⇒ 拉丁字母
+「合格」⇒ 当成译文 ⇒ 上屏 + **被念出来**。
+
+⇒ 插件侧：**只有标点的碎片不送去翻** —— `translation.py::_handle` 跳过
+（status=skipped「没有可译内容」）＋ `interp.py::_handle` **连 MT 都不等**
+（不翻译、不出声）。宿主侧（剥标签 + 质量闸）见宿主仓 AGENTS。
+
+⚠️ 判据都在宿主 `app/core/translate/npu_provider.py`
+（`has_translatable_content` / `_looks_like_instruction`）⇒ **别在卡片里
+另写一份**。

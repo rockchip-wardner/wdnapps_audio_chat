@@ -1807,6 +1807,22 @@ class InterpEngine:
                 self._queue.task_done()
 
     def _handle(self, seg: InterpSegment) -> None:
+        # ⚠️⚠️ **只有标点的碎片不翻**（实测 2026-11-24，用户报「译文里出现
+        # ``Translate the following text from zh to …``」）：模型**没东西可翻**
+        # 时会把**我们发给它的指令**原样吐回来 ⇒ 那是**胡话** ⇒
+        # 质量闸只查文种拦不住（指令也是拉丁字母）⇒ 指令被当成译文 ⇒
+        # **被 TTS 念出来**。
+        #
+        # ⇒ 从**源头**掐掉：这种碎片本来就不该出声 ⇒ 直接跳过
+        # （**连 MT 都不用等** —— 否则光等模型就白等好几秒）。
+        try:
+            from app.core.translate.npu_provider import has_translatable_content
+            if not has_translatable_content(seg.text):
+                LOG.info("interp: 跳过没有可译内容的片段（%r）",
+                         (seg.text or "")[:20])
+                return
+        except Exception:  # noqa: BLE001 — 判据失败不影响识别
+            pass
         # ⚠️ **先等翻译模型就绪** —— 冷启动时 MT 要 ~30 s 才起来
         # （本机实例被停掉又重新拉起）。等它 ⇒ 这 30 s 里产生的句子
         # **不丢**（不等 ⇒ 立刻报「翻译未启用」⇒ 整段同传哑掉）。

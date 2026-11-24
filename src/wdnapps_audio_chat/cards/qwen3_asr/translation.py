@@ -288,11 +288,15 @@ class TranslationService:
 
         # 源语 == 目标语 ⇒ 透传（不浪费一次推理）
         try:
-            from app.core.translate.npu_provider import normalize_language
+            from app.core.translate.npu_provider import (
+                has_translatable_content,
+                normalize_language,
+            )
             src = normalize_language(item.lang)
             tgt = normalize_language(target)
         except Exception:  # noqa: BLE001
             src, tgt = item.lang, target
+            has_translatable_content = lambda t: True  # noqa: E731
 
         # ⚠️⚠️ **透传之前先校正源语**（实测 2026-11-23，用户报「ASR+翻译
         # 中途中英夹杂」）：
@@ -313,7 +317,19 @@ class TranslationService:
         except Exception:  # noqa: BLE001 — 校正失败就用原源语
             src_eff = src
 
-        if src_eff and tgt and src_eff == tgt:
+        if not has_translatable_content(item.text):
+            # ⚠️⚠️ **只有标点的碎片不去翻**（实测 2026-11-24，用户报「译文里
+            # 出现 ``Translate the following text from zh to …``」）：
+            # 模型**没东西可翻**时会把**我们发给它的指令**原样吐回来 ⇒
+            # 那是**胡话** ⇒ 质量闸只查文种拦不住（指令也是拉丁字母）⇒
+            # 指令被当成译文 ⇒ 上屏 + **被 TTS 念出来**。
+            #
+            # ⇒ 从**源头**掐掉：这种碎片本来就不该有译文 ⇒ 直接跳过
+            # （不推理、不显示「未翻译」）。
+            status = "skipped"
+            text = item.text
+            reason = "没有可译内容"
+        elif src_eff and tgt and src_eff == tgt:
             status = "skipped"
             text = item.text
             reason = "源语与目标语相同"
