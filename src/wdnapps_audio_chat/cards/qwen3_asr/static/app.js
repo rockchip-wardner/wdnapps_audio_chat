@@ -4607,8 +4607,15 @@ const Qwen3Asr = {
         if (it.status === "done") {
           txt = it.text || "";
         } else if (it.status === "skipped") {
-          // 源语 == 目标语 ⇒ 原文就是译文（不浪费一次推理）
-          txt = it.text || it.source || "";
+          // ⚠️ **不要把原文再抄一遍**（实测 2026-11-24，M36，用户报
+          // 「每个句子显示两遍」）——
+          // 「源语 == 目标语」时译文**本来就是**原文 ⇒ 抄一遍只是重复
+          // 占屏（上面一行已经有原文了）⇒ 只留一句短的说明。
+          //
+          // ⚠️ 「没有可译内容」（只有标点的碎片）⇒ 连说明都不显示。
+          txt = it.reason && it.reason.indexOf("没有可译内容") >= 0
+            ? ""
+            : "（" + (it.reason || "未翻译") + "）";
           muted = true;
         } else {
           txt = "（未翻译）" + (it.reason || "");

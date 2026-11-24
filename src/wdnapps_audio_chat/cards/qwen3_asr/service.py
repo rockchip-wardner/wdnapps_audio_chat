@@ -379,6 +379,75 @@ def _text_has_cjk(text: str) -> bool:
     return False
 
 
+def _text_has_letters(text: str) -> bool:
+    """正文里有没有**字母**（任何文字系统的字母都算）。
+
+    ⚠️ 与 :func:`_text_has_cjk` 配对：判「自报中文系但正文是**别的文字**」
+    时不能只看汉字 —— 日文（假名）/ 韩文（谚文）**一个字汉字都没有** ⇒
+    只能问「有没有字母」。
+    """
+    return any(ch.isalpha() for ch in (text or ""))
+
+
+def _language_to_lock(lang: str, text: str) -> str:
+    """这一轮能不能把「**这段媒体**的语种」锁成 ``lang``？
+
+    返回采信后的语种；``""`` = **现在还不能锁**（等下一轮）。
+
+    ⚠️ **为什么不能一见自报就锁**（实测 2026-11-24，M36，用户报「音频文件
+    的**前两句没翻译**，而且**每句显示两遍**」）：
+
+    英文素材（``asr_en.wav``）的**第 1 轮**长这样::
+
+        round=1  language=Chinese  committed=""      ← 一个字都还没提交
+
+    ⇒ 那一轮的语种**只是模型在猜**（音频开头是音乐 ⇒ 猜成中文）⇒ 采信它
+    ⇒ 这段媒体被**永久**标成中文（``_language`` 是「只填一次」的）⇒
+    前两句送去翻译时源语=中文、目标语=中文 ⇒ **「源语与目标语相同」**
+    ⇒ **直接跳过** ⇒ 面板上只剩原文（还显示两遍）。
+
+    ⇒ **两条规则**：
+
+    1. **没有「已确认的正文」⇒ 不锁** —— 零上下文时模型只是在猜；
+    2. **自报中文系但正文是拉丁字母 ⇒ 不锁** —— 自相矛盾 ⇒ 等一个
+       **自洽**的轮次（自报中文 + 正文有汉字）。
+
+    ⚠️ 规则 2 按**文种**判，不按语言名 ⇒ 日文（假名）/ 韩文（谚文）
+    不会被误伤（它们没有汉字，但也不是拉丁字母）。
+
+    ⚠️ **「自报非中文系 + 正文全是汉字」仍然按正文来**（模型跑偏 ⇒ 标成
+    中文）—— 与既有口径一致。
+    """
+    lang = _valid_language(lang)
+    if not lang:
+        return ""
+    text = (text or "").strip()
+    if not text:
+        # 规则 1 —— 还没有「已确认的正文」⇒ 模型只是在猜 ⇒ 不锁。
+        return ""
+    if _is_cjk_language(lang):
+        # 自报中文 / 日文 / 韩文 ⇒ 正文得是**同一族**的文种才算自洽。
+        detected = ""
+        try:
+            # ⚠️ **文种判据只有一份** —— 放宿主（见
+            # ``app/core/translate/npu_provider.py``）⇒ 这里 import 复用。
+            from app.core.translate.npu_provider import detect_text_language
+            detected = detect_text_language(text) or ""
+        except Exception:  # noqa: BLE001 — 宿主不在 ⇒ 按「不是 CJK」处理
+            detected = ""
+        if detected in ("zh-CN", "ja", "ko") or _text_has_cjk(text):
+            return lang
+        if _text_has_letters(text):
+            # 规则 2 —— 正文是拉丁/西里尔… ⇒ 与「中文系」自相矛盾 ⇒ 不锁。
+            return ""
+        # 还没有文种证据（只有数字/标点）⇒ 等下一轮。
+        return ""
+    if _text_has_cjk(text):
+        # 模型跑偏（自报非中文系、正文全是汉字）⇒ 按正文来（既有口径）。
+        return "Chinese"
+    return lang
+
+
 def _markup_cut(growth: str) -> Optional[int]:
     """新增文本里有没有**网页标记**（模型跑偏的指纹）？返回它的起点。
 
@@ -1031,6 +1100,13 @@ class _AsrManager:
         self._current_request_id: Optional[int] = None
         self._last_result: Optional[Dict[str, Any]] = None
         self._language: str = ""
+        #: 最近一次模型**自报**的语种（**弱信号**）——
+        #:
+        #: ⚠️ 媒体语种 ``_language`` 是「**只填一次**」的（见
+        #: :func:`_language_to_lock`）⇒ 头几轮模型只是在**猜**的时候它是
+        #: 空的 ⇒ 送去翻译的源语就空了 ⇒ 翻译直接报「认不出源语言」。
+        #: ⇒ 兜底用这个（模型对**音频**的判断）⇒ 见 :meth:`_media_language`。
+        self._last_reported_language: str = ""
         self._rounds: List[Dict[str, Any]] = []
         #: **这批轮次归属哪个来源**（页面刷新后要靠它把历史恢复回来）。
         #:
@@ -1328,6 +1404,7 @@ class _AsrManager:
             self._last_started = time.time()
             self._rounds = []
             self._language = ""
+            self._last_reported_language = ""
             self._last_result = None
             self._options = dict(options or {})
             self._set_state(self.STATE_RUNNING)
@@ -1637,6 +1714,24 @@ class _AsrManager:
         return bool(end_sec is not None and lb_until >= 0.0
                     and end_sec <= lb_until + 1e-6)
 
+    def _media_language(self, text: str = "") -> str:
+        """这段媒体的语种（**已锁定**的优先；没锁定过就用最近一次自报）。
+
+        ⚠️ **为什么要兜底**（M36）：媒体语种是「**只填一次**」的 ⇒ 头几轮
+        没锁定（模型零上下文时只是在**猜**）时它是空的 ⇒ 送去翻译的源语
+        就空了 ⇒ 翻译直接报「认不出源语言」⇒ 这一句没译文。
+
+        ⇒ 兜底用**最近一次自报**（模型对**音频**的判断）⇒ 至少能翻。
+        ⚠️ 兜底**不参与**「英文臆造」判定（那个只看已锁定的媒体语种 ⇒
+        见 :meth:`_on_delta`）。
+        """
+        with self._lock:
+            lang = self._language
+            last = self._last_reported_language
+        if lang:
+            return lang
+        return last
+
     def _interp_emit(self, text: str, seq: int, c0: int = 0, c1: int = 0) -> None:
         """**同传引擎**的句子出口（文件 / 视频路径）。
 
@@ -1665,7 +1760,7 @@ class _AsrManager:
             # ⚠️ **带上这一轮 ASR 报的语种** —— 文件路径的语种要等
             # ``asr_final`` 才最终确定，而句子是**识别过程中**就切出来
             # 的 ⇒ 不带语种的话，翻译会在「认不出源语言」上失败。
-            lang = self._language
+            lang = self._media_language(text)
         engine.on_file_segment(
             text, seq,
             start_sec if start_sec is not None else -1.0,
@@ -1743,7 +1838,7 @@ class _AsrManager:
             svc.submit(
                 index=int(ctx["base"]) + int(seq),
                 text=text,
-                lang=self._language,
+                lang=self._media_language(text),
                 stream_id=str(ctx["stream_id"]),
                 loop=ctx.get("loop"),
                 # ⚠️ **时间**是给「画面字幕显示双语」用的：前端要靠它把
@@ -1818,6 +1913,7 @@ class _AsrManager:
             self._rounds_source = {}
             self._sent_log = []      # 句子流也要清（否则刷新后又冒出来）
             self._language = ""
+            self._last_reported_language = ""
             self._last_result = None
             self._current_request_id = None
             self._set_state(self.STATE_IDLE)
@@ -1964,6 +2060,8 @@ class _AsrManager:
                 #    拖到 41 s 后连着 10 轮吐英文且**卡住不动**），我们
                 #    仍然知道「这段媒体是中文」⇒ 那 10 轮会被剪掉 ✓。
                 self._language = ""
+                # ⚠️ **弱信号也一起清** —— 换素材了 ⇒ 最近一次自报也不能留。
+                self._last_reported_language = ""
             self._last_result = None
             # ⚠️⚠️ **回滚窗口的默认口径**（文件 / 视频源）—— 见
             # :func:`_file_stream_options` 与 :data:`_FILE_ROLLBACK_ROUNDS`：
@@ -2638,12 +2736,22 @@ class _AsrManager:
             return
         kind = payload.get("type")
         if kind == "asr_final":
-            # 收尾载荷：完整结果。真正的「done」由 RPC reply 带回，
-            # 这里只记下语种。
+            # 收尾载荷：完整结果。
+            #
+            # ⚠️ **只填一次**（与 ``asr_round`` 同一口径，M36）——
+            # 收尾的语种自报**也可能**是猜的 ⇒ 不能让它**覆盖**已经锁好的
+            # 媒体语种（那会让整段素材的译文全部走错源语）。
+            #
+            # ⚠️ 没锁过才用收尾的报告 ⇒ 但仍要**核对**（正文全是拉丁字母却
+            # 自报中文 ⇒ 自相矛盾 ⇒ 不锁）。
             lang = _valid_language(payload.get("language") or "")
             if lang:
                 with self._lock:
-                    self._language = lang
+                    self._last_reported_language = lang
+                    if not self._language:
+                        locked = _language_to_lock(lang, self._epoch_text)
+                        if locked:
+                            self._language = locked
             return
         if kind != "asr_round":
             return
@@ -2743,7 +2851,13 @@ class _AsrManager:
                     # 模型跑偏时**自报的语种也跟着跑偏**（实测拖动重开后
                     # 连着 10 轮自报 English，而这段媒体明明是中文）⇒
                     # 用自报语种判 = 永远判不出来。
-                    media_lang = self._language or frame["language"]
+                    # ⚠️ **兜底也要核对**（M36）—— 这一轮自报「中文」但正文是
+                    # 拉丁字母（英文素材第 1 轮）⇒ 那是**猜**的 ⇒ 不能拿它
+                    # 当「这段媒体是中文」的凭据 ⇒ 否则真英文会被当成
+                    # 「模型臆造英文」剪掉（实测《圆桌派》的中文媒体靠这个
+                    # 守卫才没被剪）。
+                    media_lang = self._language or _language_to_lock(
+                        frame["language"], growth)
                     c = self._latin_cut(growth, media_lang)
                     if c is not None:
                         cuts.append(c)
@@ -2769,6 +2883,11 @@ class _AsrManager:
                     frame["unfixed"] = ""
                 self._rounds.append(frame)
                 lang = _valid_language(frame["language"])
+                if lang and not degenerate:
+                    # 最近一次**自报**（弱信号）—— 媒体语种还没锁上时
+                    # （头几轮模型只是在猜）⇒ 送去翻译的源语用它兜底
+                    # （见 :meth:`_media_language`）。
+                    self._last_reported_language = lang
                 # ⚠️ **退化那一轮不更新语种** —— 模型退化时常伴随「转成
                 #    英文」（实测退化里出现 "human rights violations"）
                 #    ⇒ 采信它会把**整段**结果标成英文。
@@ -2790,14 +2909,18 @@ class _AsrManager:
                 #    之后单轮自报**不改它**（真换了素材会在新请求里重置 ⇒
                 #    见 :meth:`transcribe_stream` 的 ``not append`` 分支）。
                 if lang and not degenerate and not self._language:
-                    # ⚠️ **第一轮也要核对** —— 模型可能**一上来就跑偏**
-                    # （自报 English、正文却是汉字）⇒ 采信它 ⇒ 从一开始
-                    # 「这段媒体是中文」这个凭据就是错的。
-                    # ⇒ 矛盾时按**正文**来（正文有汉字 ⇒ 这段媒体是中文）。
-                    if growth and _text_has_cjk(growth) and not _is_cjk_language(lang):
-                        self._language = "Chinese"
-                    else:
-                        self._language = lang
+                    # ⚠️ **锁之前先核对**（M36）——
+                    # 模型可能**一上来就在猜**（实测英文素材第 1 轮自报
+                    # Chinese、``committed`` 还是空的）⇒ 采信它 ⇒ 这段媒体
+                    # 被**永久**标成中文 ⇒ 前两句的翻译全被「源语与目标语
+                    # 相同」跳过 ⇒ 面板上只剩原文（还显示两遍）。
+                    #
+                    # ⇒ 锁的条件：这一轮**自洽**（自报的语种与正文对得上）
+                    #    且**有已确认的正文**（见 :func:`_language_to_lock`）。
+                    #    不自洽就**等下一轮** ⇒ 下一轮自报 English ⇒ 锁上。
+                    locked = _language_to_lock(lang, growth)
+                    if locked:
+                        self._language = locked
             # **停滞检测**：已确认文本（epoch 内累积）连续 N 轮长度不变
             # → 模型输出卡住了（SDK 侧等价于 ``stable_count == 0``）。
             # 见 :data:`_STALL_ROUNDS_LIMIT`。
