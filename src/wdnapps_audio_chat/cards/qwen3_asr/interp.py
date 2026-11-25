@@ -969,6 +969,9 @@ class InterpEngine:
         self._volume = 0.05
         self._source = "live"            # live | file | video
         self._seg_index = 0
+        # ⚠️ **播放头最后一次到的墙钟**（2026-11-25）⇒ 用来判断「跟播放」
+        # 的前提还在不在（前端停止上报 ⇒ 整套跟播机制静默失效）。
+        self._ph_received_at = 0.0
         self._queue: "queue.Queue[InterpSegment]" = queue.Queue(
             maxsize=INTERP_QUEUE_MAX)
         self._pending: list[InterpSegment] = []   # 已译好、等播放头的
@@ -1073,7 +1076,12 @@ class InterpEngine:
                 # 压住 ⇒ **有翻译、一声不响**（用户实测报的就是这个）。
                 self._gate.reset()
             self._gate.set_mode(self._gate_mode)
-            self._apply_clock()
+            # ⚠️ **每轮会话都强制重设播放时钟**（2026-11-25）——
+            #
+            # 队列那边的「卡住计时」是**跨会话**的 ⇒ 上一轮结束时它就停在
+            # 那一刻 ⇒ 下一轮 8 秒后时钟就放弃等待 ⇒ 译文**不等字幕位置**
+            # （实测超前 13~24 秒）⇒ 详见 :meth:`_apply_clock` 的说明。
+            self._apply_clock(force=True)
             # ⚠️ **新会话 ⇒ 变速复位**（棘轮只在一轮内生效）⇒ 新的一轮从
             # TEMPO_MIN 起步，再按实测速率往上提。
             if not self._running:
@@ -1587,6 +1595,18 @@ class InterpEngine:
         「只播放了第一句」，实测踩过）。
         """
         self._set_stream(stream_id)
+        # ⚠️ **记下「播放头最后一次到」的墙钟**（2026-11-25）——
+        #
+        # 为什么：「跟播放」的整套机制（队列的播放时钟 + seek 识别）**全靠
+        # 这个播放头** ⇒ 一旦前端**停止上报**（刷新页面后没接回来、媒体没
+        # 加载、页面被挂起…），系统会**静默**退化成「不等播放」⇒ 译文
+        # 合成完就播 ⇒ 比字幕位置**超前几十秒**（实测 15~75 秒）⇒ 用户
+        # 报「不跟字幕的节奏」，而日志里**一条线索都没有**。
+        #
+        # ⇒ 把它做成**状态里看得见的信号**（``playhead_age_sec`` /
+        # ``playhead_missing``）⇒ 面板能直接说清楚。
+        with self._lock:
+            self._ph_received_at = time.time()
         seek = self._gate.update_playhead(stream_id, playhead_sec, playing,
                                            ended, failed)
         info = self._gate.last_seek() if seek else None
@@ -2598,17 +2618,34 @@ class InterpEngine:
                 best = t
         return min(best, TEMPO_MAX)
 
-    def _apply_clock(self) -> None:
+    def _apply_clock(self, force: bool = False) -> None:
         """把**播放时钟**同步给 TTS 队列（跟播模式才有）。
 
         ⚠️ **跟播**：播放由**源话的播放头**驱动 ⇒
         ① 译文跟源话**对齐**（不再靠提前量硬凑）② 合成可以提前跑 ⇒
         管线有缓冲余量 ⇒ **不断音**。
         ⚠️ **now**：关掉时钟（不等播放头）⇒ 合成出来就播。
+
+        ⚠️⚠️ **``force=True`` ⇒ 每轮会话都要重设时钟**（2026-11-25）——
+        队列那边的时钟有两个状态：**``_clock_last``**（最后看到的播放头）
+        与 **``_clock_stall_at``**（播放头**最后一次前进**的时刻）。
+
+        ⇒ 「卡住」判据 = ``now - _clock_stall_at > 8 s`` ⇒ **播放头不再
+        前进** ⇒ 时钟**放弃等待**（源不再往前走 ⇒ 别把译文永久压住）。
+
+        ⚠️⚠️ **这两个状态是跨会话的** ⇒ 上一轮会话结束时媒体停了（播完 /
+        暂停 / 页面关了）⇒ ``_clock_stall_at`` 就停在那一刻 ⇒ **下一轮
+        会话一开始，这个计时器已经是「陈旧」的** ⇒ 8 秒后时钟认定「源不再
+        往前走」⇒ **对所有句子一律放行** ⇒ 译文**不等字幕位置** ⇒ 合成完
+        就播 ⇒ 而 ASR 跑在播放头**前面** ⇒ **比字幕位置超前 13~24 秒**
+        （实测：同一段素材，第一轮 ±0.2 s，第二轮 −13~−24 s ⇒ 差别就是
+        「这一轮没有重设时钟」）。
+
+        ⇒ **每轮 start 都强制重设** ⇒ 时钟从干净状态开始。
         """
         clocked = self._gate_mode == "follow"
         with self._lock:
-            if clocked == self._clocked:
+            if not force and clocked == self._clocked:
                 return
             self._clocked = clocked
         try:
@@ -2636,6 +2673,34 @@ class InterpEngine:
             return self._gate.playhead(self._source_stream_id())
         except Exception:  # noqa: BLE001
             return None
+
+    def _playhead_age(self) -> float:
+        """播放头**最后一次到**是多久以前（秒；没到过 = -1）。
+
+        ⚠️ 这是「跟播放」能不能成立的**前提**：播放头是队列时钟与 seek
+        识别的唯一输入 ⇒ 它停了 ⇒ 整套机制静默失效（2026-11-25）。
+        """
+        with self._lock:
+            at = self._ph_received_at
+        if at <= 0.0:
+            return -1.0
+        return max(0.0, time.time() - at)
+
+    def _playhead_missing(self) -> bool:
+        """**播放头失联了吗**（跟播模式下会静默退化成「不等播放」）。
+
+        ⚠️ 判据：
+        * 「不等播放」⇒ 用不上播放头 ⇒ **不算失联**（麦克风源就是这种）；
+        * 「跟播放」但**从来没收到过**播放头 ⇒ **失联**（前端没上报）；
+        * 「跟播放」但**超过 5 秒**没收到 ⇒ **失联**（前端断了 / 页面挂了）。
+
+        ⚠️ **别用「放行器卡住」当判据** —— 那是「媒体没在放」，这里是
+        「**根本没有播放头**」（前端没接回来）⇒ 两件事要分开说。
+        """
+        if self._gate_mode != "follow":
+            return False
+        age = self._playhead_age()
+        return age < 0.0 or age > 5.0
 
     def _update_lead(self, queue_status: dict) -> None:
         """按**实测的生产延迟**更新放行器的提前量。
@@ -2761,6 +2826,17 @@ class InterpEngine:
                 # 这一轮会话里播放头**有没有真的走过**（自动播放被拦 ⇒ False）
                 # —— 诊断用：False ⇒ 媒体**从没播过**。
                 "playhead_moved": not self._gate.never_played(),
+                # ⚠️⚠️ **播放头失联**（2026-11-25）——
+                #
+                # 「跟播放」的整套机制（队列的播放时钟 + seek 识别）**全靠播放
+                # 头** ⇒ 前端一旦停止上报（刷新页面没接回来 / 媒体没加载 /
+                # 页面被挂起），系统会**静默**退化成「不等播放」⇒ 译文合成
+                # 完就播 ⇒ 比字幕位置**超前几十秒**（实测 15~75 秒）⇒ 用户
+                # 报「不跟字幕的节奏」，而日志里一条线索都没有。
+                #
+                # ⇒ 做成**看得见的信号** ⇒ 面板能直接说清楚「为什么不跟」。
+                "playhead_age_sec": self._playhead_age(),
+                "playhead_missing": self._playhead_missing(),
                 "last_error": c.last_error,
                 "playhead_sec": self._gate.playhead(self._source_stream_id()),
             }
