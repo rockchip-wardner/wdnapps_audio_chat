@@ -531,6 +531,12 @@ const Qwen3Asr = {
     // catch 里写一句，下一秒就没了 ⇒ 用户只看到泛泛的提示，
     // 不知道**到底为什么没声音** ⇒ 记成状态。
     mediaBlocked: "",
+    // ---- 向导里的选择（2026-11-25 新增）----
+    // ⚠️ **换步会重建 body**（select 会被清空）⇒ 这些值必须记在这儿，
+    //    否则用户在向导里选的朗读语言 / 音色会被无声地冲回默认值。
+    wizardOn: false,      // 向导里勾了「开启同声传译」
+    wizardLang: "",       // 向导里选的朗读语言（"" = 跟随翻译目标语言）
+    wizardVoice: "",      // 向导里选的音色（"kind:id"，kind = ref | builtin）
   },
 
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
@@ -3276,6 +3282,11 @@ const Qwen3Asr = {
   // ------------------------------------------------------------------ //
   async onWizardStepRendered(appId) {
     if (appId !== "qwen3-asr") return;
+    // ⚠️ **同传那一步的选项要独立灌** —— 不能被下面的早退跳过：
+    //    ``wizard:step-rendered`` 是**按步**触发的 ⇒ 渲染「同声传译」
+    //    那一步时，翻译那一步的 select **根本不在 DOM 里** ⇒ 早退 ⇒
+    //    朗读语言 / 音色的下拉会是空的。
+    await this._interpWizardOptions();
     const sel = document.querySelector(
       '#wd-wizard-root-qwen3-asr [data-field-id="asr-tr-target"]');
     if (!sel) return;
@@ -4783,6 +4794,136 @@ const Qwen3Asr = {
   },
 
   /** 拉「能出声的目标语言」和音色列表。 */
+  /**
+   * **向导第 5 步「同声传译」**的选项 —— **运行时**灌进去。
+   *
+   * ⚠️ 为什么要自己灌：朗读语言的表在**后端**（``/interp/languages`` 只列
+   *    **能用语音播报**的 10 种），音色的表在**TTS 卡**（``/api/tts/voices``）
+   *    ⇒ ``wizard.json`` 里只有占位项。
+   *
+   * ⚠️ **不能复用卡片页的 ``_interpLoadOptions``**：它按 **id** 取元素
+   *    （``getElementById``）⇒ 拿不到**向导里**那份 select（向导的字段
+   *    带 ``data-field-id``，id 由框架生成）⇒ 只能各灌各的。
+   */
+  async _interpWizardOptions() {
+    const langSel = document.querySelector(
+      '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-lang"]');
+    const voiceSel = document.querySelector(
+      '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-voice"]');
+    if (!langSel && !voiceSel) return;
+
+    if (langSel) {
+      try {
+        const r = await fetch("/api/qwen3-asr/interp/languages",
+          { cache: "no-store" });
+        const data = r.ok ? await r.json() : null;
+        const items = (data && data.items) || [];
+        langSel.innerHTML = "";
+        // ⚠️ 第一项 = 「跟随翻译目标语言」（空值）—— 默认项。
+        const follow = document.createElement("option");
+        follow.value = "";
+        follow.textContent = "跟随翻译目标语言";
+        langSel.appendChild(follow);
+        items.forEach((it) => {
+          const opt = document.createElement("option");
+          opt.value = it.id || "";
+          opt.textContent = it.name || it.label || it.id || "";
+          langSel.appendChild(opt);
+        });
+        // 换步会重建 body ⇒ 选回用户上次在这张卡里选过的那个。
+        langSel.value = this._interp.wizardLang || "";
+      } catch (e) {
+        console.warn("[qwen3-asr] 向导同传语言拉取失败:", e);
+      }
+    }
+
+    if (voiceSel) {
+      try {
+        const r = await fetch("/api/tts/voices", { cache: "no-store" });
+        const data = r.ok ? await r.json() : null;
+        const voices = (data && data.voices) || [];
+        voiceSel.innerHTML = "";
+        voices.forEach((v) => {
+          const opt = document.createElement("option");
+          const id = v.id || "";
+          // ⚠️ **音色类别必须带上** —— 参考音色（voice-clone）和内置音色
+          //    是**两个不同的 SDK 参数** ⇒ 混用 ⇒ 音色不生效。
+          //    ⇒ 值里带前缀（``kind:id``），回填时据此拆成两个参数。
+          const kind = v.kind === "builtin" ? "builtin" : "ref";
+          opt.value = kind + ":" + id;
+          // ⚠️ 板端**没有符号字体** ⇒ 只用普通汉字。
+          opt.textContent = (kind === "ref" ? "参考音色 " : "内置音色 ") + id;
+          voiceSel.appendChild(opt);
+        });
+        const want = this._interp.wizardVoice || "";
+        if (want) voiceSel.value = want;
+        if (!voiceSel.value && voiceSel.options.length) {
+          voiceSel.selectedIndex = 0;
+          this._interp.wizardVoice = voiceSel.options[0].value;
+        }
+      } catch (e) {
+        console.warn("[qwen3-asr] 向导同传音色拉取失败:", e);
+      }
+    }
+  },
+
+  /**
+   * 同传的**目标语言** —— 向导选的「朗读语言」，没选就跟随翻译目标语言。
+   *
+   * ⚠️ **只有一个语言概念** —— 同传的朗读语言与字幕的翻译语言**同一个**：
+   *    用户在向导里选了「朗读语言 = 日语」⇒ 字幕也翻成日语、声音也是日语
+   *    ⇒ 音字幕对得上（需求：语音节奏与字幕节奏一致）。
+   */
+  _interpTargetLang() {
+    const w = String(this._interp.wizardLang || "").trim();
+    if (w) return w;
+    const t = String(this._tr.targetLang || "").trim();
+    if (t && t !== "off") return t;
+    return this._interp.targetLang || "zh-CN";
+  },
+
+  /**
+   * **发起** TTS 模型的加载 —— **不等**它加载完。
+   *
+   * ⚠️ 为什么不等：``POST /interp/ensure-tts`` 会等 worker 注册完才返回
+   * （~1 s），而模型的真正加载（~30 s）是后台的 ⇒ 进度条那边按
+   * ``model_id`` 等实例变 ``running`` 就行。
+   */
+  async _interpEnsureTts() {
+    try {
+      const r = await fetch("/api/qwen3-asr/interp/ensure-tts",
+        { method: "POST" });
+      const data = await r.json();
+      if (!r.ok || !data || !data.ok) {
+        const why = (data && (data.detail || data.detail)) || "起不来";
+        console.warn("[qwen3-asr] TTS 模型拉起失败:", why);
+        return false;
+      }
+      return true;
+    } catch (e) {
+      console.warn("[qwen3-asr] TTS 模型拉起请求失败:", e);
+      return false;
+    }
+  },
+
+  /**
+   * TTS 模型的 ``model_id`` —— 给向导的「模型加载进度条」用。
+   *
+   * ⚠️ 进度条是**按 model_id 找实例**的 ⇒ 必须先知道要等的是谁。
+   * ⚠️ 走同传 status 拿（宿主桥按 capability 查，不写死 id）。
+   */
+  async _interpTtsModelId() {
+    try {
+      const r = await fetch("/api/qwen3-asr/interp/status",
+        { cache: "no-store" });
+      const data = r.ok ? await r.json() : null;
+      return String((data && data.tts_model_id) || "");
+    } catch (e) {
+      console.warn("[qwen3-asr] 同传 TTS 模型 id 拉取失败:", e);
+      return "";
+    }
+  },
+
   async _interpLoadOptions() {
     if (this._interp.loaded) return;
     this._interp.loaded = true;
@@ -5519,33 +5660,65 @@ window.ImApp_qwen3_asr = window.ImApp_qwen3_asr || {};
  */
 window.ImApp_qwen3_asr.preloadExtraModels = async function (opts) {
   const o = opts || {};
+  const targets = [];
+  const soft = [];
   const lang = String(o.trTarget || "").trim();
-  if (!lang || lang === "off") return { targets: [] };
-  // 没有源就别白加载一个 2.2 GB 的模型（与 applyWizardSnapshot 的判断一致）
-  if (!String(o.source || "").trim()) return { targets: [] };
+  const trOn = !!lang && lang !== "off";
+  // ⚠️ **同传开着吗**（2026-11-25 新增）—— 向导第 5 步的开关。
+  const interpOn = !!o.interp;
+  // 没有源就别白加载模型（2.2 GB 的翻译 + 1.9 GB 的语音合成）。
+  if (!String(o.source || "").trim()) return { targets: targets, soft: soft };
 
-  // 进度条要按 model_id 找实例 ⇒ 先确保知道它（后端 status 里带）
-  if (!Qwen3Asr._tr.modelId) await Qwen3Asr._trRefresh();
-  const modelId = Qwen3Asr._tr.modelId;
-  if (!modelId) return { targets: [] };
+  // ---- 翻译模型 ----
+  // ⚠️ **同传开着 ⇒ MT 一定要起来** —— 同传**自己**调 MT 翻译，不依赖
+  //    「实时翻译」那个开关 ⇒ 即便翻译目标语言选了「不翻译」，同传也要
+  //    MT（否则同传没译文可念）。
+  if (trOn || interpOn) {
+    // 进度条要按 model_id 找实例 ⇒ 先确保知道它（后端 status 里带）
+    if (!Qwen3Asr._tr.modelId) await Qwen3Asr._trRefresh();
+    const modelId = Qwen3Asr._tr.modelId;
+    if (modelId) {
+      // 发起加载（**不等**）—— 框架的进度条会并行追踪它
+      Qwen3Asr._trEnablePromise = Qwen3Asr._trStartModel(
+        trOn ? lang : Qwen3Asr._interpTargetLang());
+      Qwen3Asr._trEnablePromise.catch((e) => {
+        const msg = (e && (e.message || e)) || "启动失败";
+        try {
+          if (window.WizardProgress && window.WizardProgress.notifyFailed) {
+            window.WizardProgress.notifyFailed(modelId, msg);
+          }
+        } catch (_) { /* 忽略 */ }
+      });
+      targets.push({
+        // npu_index: null = 任意一张卡起来即可（落哪张卡由后端卡位策略定）
+        model_id: modelId, npu_index: null,
+      });
+      // 软失败：翻译模型起不来只把这行标 error，**不**让整个向导失败
+      soft.push(modelId + "@null");
+    }
+  }
 
-  // 发起加载（**不等**）—— 框架的进度条会并行追踪它
-  Qwen3Asr._trEnablePromise = Qwen3Asr._trStartModel(lang);
-  Qwen3Asr._trEnablePromise.catch((e) => {
-    const msg = (e && (e.message || e)) || "启动失败";
-    try {
-      if (window.WizardProgress && window.WizardProgress.notifyFailed) {
-        window.WizardProgress.notifyFailed(modelId, msg);
-      }
-    } catch (_) { /* 忽略 */ }
-  });
+  // ---- 语音合成模型 ----
+  // ⚠️ **发声链必须独占一张卡**（卡位策略：TTS 与 ASR 同卡会把识别轮
+  //    间隔顶到 > 1 s ⇒ 客户端上行队列溢出 ⇒ 丢块）⇒ npu_index 传
+  //    **null**，让后端按策略挑一张**没被感知链占用**的卡。
+  if (interpOn) {
+    const ttsId = await Qwen3Asr._interpTtsModelId();
+    if (ttsId) {
+      targets.push({ model_id: ttsId, npu_index: null });
+      // 软失败：TTS 起不来 ⇒ 那一行标 error ⇒ 同传降级为**仅字幕**，
+      // 识别与翻译照常。
+      soft.push(ttsId + "@null");
+      // ⚠️⚠️ **必须真的把它拉起来** —— 进度条是「按 model_id **等实例
+      //    出现**」的（框架轮询 ``GET /api/compute``）⇒ 只把 model_id
+      //    报上去**不会有人去起它** ⇒ 进度条会一直等到超时。
+      //    ⇒ 这里**发起**（不等）—— 卡位由后端卡位策略决定
+      //    （发声链独占 ⇒ 落一张没被感知链占用的卡）。
+      Qwen3Asr._interpEnsureTts().catch(() => {});
+    }
+  }
 
-  return {
-    // npu_index: null = 任意一张卡起来即可（落哪张卡由后端卡位策略定）
-    targets: [{ model_id: modelId, npu_index: null }],
-    // 软失败：翻译模型起不来只把这行标 error，**不**让整个向导失败
-    soft: [modelId + "@null"],
-  };
+  return { targets: targets, soft: soft };
 };
 
 window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
@@ -5593,8 +5766,39 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
   //    ⇒ _trEnableForWizard 内部软失败，这里照样往下走启动识别。
   //    放在「有没有源」之后：源都没有就别白加载一个 2.2 GB 的模型了。
   const trTarget = String(o.trTarget || "").trim();
-  if (trTarget && trTarget !== "off") {
+  const trOn = !!trTarget && trTarget !== "off";
+  // ---- 同传（2026-11-25 新增）----
+  // ⚠️ **同传需要译文** ⇒ 同传的目标语言 = 向导的「朗读语言」，
+  //    没选就跟随翻译目标语言。
+  const interpOn = !!o.interp;
+  const interpLang = interpOn ? Qwen3Asr._interpTargetLang() : "";
+  if (trOn) {
     await Qwen3Asr._trEnableForWizard(trTarget);
+  } else if (interpOn) {
+    // ⚠️ **字幕翻译选了「不翻译」，但同传开着** ⇒ 目标语字幕还是得显示
+    //    （需求：语音与字幕节奏一致）⇒ 照样把 MT 拉起来，并把翻译目标
+    //    语言设成同传的语言 ⇒ **一个语言概念**。
+    await Qwen3Asr._trEnableForWizard(interpLang);
+  }
+
+  // 4.5) 同传的参数 —— **先设好，等识别起来之后再起引擎**。
+  if (interpOn) {
+    const vw = String(o.interpVoice || "").trim();
+    if (vw) {
+      // ⚠️ 值是 ``kind:id`` —— 参考音色 / 内置音色是**两个不同的 SDK
+      //    参数** ⇒ 必须拆开传，混用 ⇒ 音色不生效。
+      const idx = vw.indexOf(":");
+      const kind = idx >= 0 ? vw.slice(0, idx) : "ref";
+      const vid = idx >= 0 ? vw.slice(idx + 1) : vw;
+      if (kind === "builtin") {
+        Qwen3Asr._interp.speaker = vid;
+        Qwen3Asr._interp.refSpeaker = "";
+      } else {
+        Qwen3Asr._interp.refSpeaker = vid;
+        Qwen3Asr._interp.speaker = "";
+      }
+    }
+    if (interpLang) Qwen3Asr._interp.targetLang = interpLang;
   }
 
   // 5) 等能力就绪 → 真启动。
@@ -5618,6 +5822,16 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
     const ok = await Qwen3Asr.start();
     if (!ok) throw new Error("WizardSnapshotError:start_failed:识别请求没被接受");
   }
+
+  // 6) 同传 —— **识别起来之后**再起引擎。
+  //    ⚠️ 顺序有讲究：识别先起来 ⇒ 引擎才有句子可翻；反过来（引擎先起）
+  //    第一批句子会在 MT 还没就绪时被标成「未翻译」。
+  //    ⚠️ **自动播放的用户手势到这里已经没了**（框架等了 ~30 s 的模型
+  //    加载才走到这一步）⇒ 视频源的「跟播放」要等用户点一下播放 ⇒
+  //    分支自带的**兜底放行**会接管（译文照样出声）。
+  if (interpOn) {
+    await Qwen3Asr._interpStart();
+  }
 };
 
 // 向导里「翻译目标语言」的选项是**运行时**才有的（语言表在后端 provider
@@ -5636,6 +5850,16 @@ window.addEventListener("wizard:field-change", (ev) => {
   //    也必须记下来，否则「不翻译」会被卡片当前状态盖掉。
   const v = vals["asr-tr-target"];
   if (v !== undefined) Qwen3Asr._tr.wizardTarget = v;
+
+  // ---- 同传那一步的选择（2026-11-25）----
+  // ⚠️ **换步会重建 body** ⇒ select 会被清空 ⇒ 不记下来的话，
+  //    用户在向导里选的朗读语言 / 音色会被无声地冲回默认值。
+  const iv = vals["asr-interp-enabled"];
+  if (iv !== undefined) Qwen3Asr._interp.wizardOn = !!iv;
+  const il = vals["asr-interp-lang"];
+  if (il !== undefined) Qwen3Asr._interp.wizardLang = String(il || "");
+  const iw = vals["asr-interp-voice"];
+  if (iw !== undefined) Qwen3Asr._interp.wizardVoice = String(iw || "");
 });
 
 // 暴露给控制台 / 回归脚本（别的卡片也这么做，比如 VdFsModal）——

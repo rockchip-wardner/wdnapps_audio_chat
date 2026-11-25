@@ -964,9 +964,39 @@ async def post_interp_stop() -> dict:
     return {"ok": True, **status}
 
 
+@router.post("/interp/ensure-tts")
+async def post_interp_ensure_tts() -> dict:
+    """把 **TTS 模型**拉起来（卡位由卡位策略决定 ⇒ 发声链独占一张卡）。
+
+    ⚠️ **为什么需要这个端点**：向导的「模型加载进度条」是**按 model_id
+    等实例出现**的 ⇒ 只把 model_id 报给框架**不会有人去起它** ⇒
+    进度条会一直等到超时。
+
+    ⚠️ **为什么走宿主桥**：卡片之间不能直接 import ⇒ TTS 卡在另一个插件包里
+    ⇒ 由宿主（``app.core.audio.tts_bridge``）去动 registry。
+    """
+    try:
+        from app.core.audio.tts_bridge import start_model, tts_model_id
+    except Exception as exc:  # noqa: BLE001 — 宿主桥不可用 ⇒ 软失败
+        return {"ok": False, "model_id": "", "npu_index": -1,
+                "detail": "TTS 桥不可用: %s" % exc}
+    model_id = tts_model_id()
+    if not model_id:
+        return {"ok": False, "model_id": "", "npu_index": -1,
+                "detail": "本机没有 TTS 模型"}
+    return start_model(model_id)
+
+
 @router.get("/interp/status")
 async def get_interp_status() -> dict:
-    """同传指标（切句 / 翻译 / 播报 / 滞后 / 队列 / 变速）。"""
+    """同传指标（切句 / 翻译 / 播报 / 滞后 / 队列 / 变速）。
+
+    ⚠️ **额外带一个 ``tts_model_id``** —— 向导的「模型加载进度条」是
+    **按 model_id 找实例**的（框架轮询 ``GET /api/compute``，拿
+    ``instances[]`` 里 model_id 对得上、status 变成 running 的那条判为
+    就绪）⇒ 卡片得先知道**要等的那个 TTS 模型**是谁。
+    ⇒ 这里从**宿主桥**取（按 capability 查，不写死 id ⇒ 换模型包不失效）。
+    """
     import asyncio
 
     from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
@@ -974,7 +1004,13 @@ async def get_interp_status() -> dict:
     engine = get_interp_engine()
     if engine.loop_missing():
         engine.set_loop(asyncio.get_running_loop())
-    return engine.status()
+    out = engine.status()
+    try:
+        from app.core.audio.tts_bridge import tts_model_id
+        out["tts_model_id"] = tts_model_id()
+    except Exception:  # noqa: BLE001 — 宿主桥不可用 ⇒ 当作「没有 TTS」
+        out["tts_model_id"] = ""
+    return out
 
 
 @router.post("/interp/settings")
