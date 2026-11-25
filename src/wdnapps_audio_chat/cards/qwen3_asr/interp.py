@@ -265,6 +265,17 @@ INTERP_FIRST_WINDOW_FRAMES = 25
 #:   （实测面板显示 0.96）⇒ 每秒多落后 0.05 秒 ⇒ 5 分钟素材多落后 15 秒。
 #:
 #: ⇒ **变速只用来「抵消长度比」（k > 1 且产能够），永不用来「放慢」**。
+#:
+#: ⚠️⚠️ **这条规矩 2026-11-25 被推翻了**（用户报「播放卡顿 + 切音」）：
+#:
+#: * 上面那条推理只算了**滞后**，没算**断音** —— 而实测里「卡顿」是
+#:   用户**直接听到**的（断音），滞后只是面板上的数字；
+#: * 实测 8 个作业的「开口存货」**全是 0.00 s** ⇒ 管道里的存货被
+#:   **结构性抽干**（播放 1.00 > 产能 0.96）⇒ 每个作业的 2 s 首窗
+#:   期间管道必然是空的 ⇒ **句间断音**；
+#: ⇒ **现在反过来：宁可慢 8% 也不要断音** ⇒ 真正的下限不再是 1.0，
+#: 而是队列给出的**缓冲余量档**（``tempo_floor`` = 产能档再退一档）。
+#: ⇒ 下面的 :data:`TEMPO_FLOOR` 只在「**队列还没测出产能**」时兜底。
 TEMPO_FLOOR = 1.0
 
 #: **合并窗口**（秒）—— 放行器放行前多等这么久，让「几乎同时到」的
@@ -987,6 +998,8 @@ class InterpEngine:
         self._timings: list[dict] = []
         self._workers: list[threading.Thread] = []
         self._gate_thread: Optional[threading.Thread] = None
+        #: **指标线程**（2026-11-25）—— 每秒刷新队列指标 + 重算变速。
+        self._metrics_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         #: 取「当前公开文本」的回调（播前复核用）—— 由 ASR 服务注入。
         self._text_provider: Optional[Callable[[str], str]] = None
@@ -1389,6 +1402,10 @@ class InterpEngine:
         for w in self._workers:
             w.join(timeout=2.0)
         self._workers = []
+        # ⚠️ 指标线程也收一下（``_stop`` 已置位 ⇒ 它自己会退出）
+        if self._metrics_thread is not None:
+            self._metrics_thread.join(timeout=2.0)
+            self._metrics_thread = None
         try:
             from app.core.audio.tts_bridge import queue_clear
             queue_clear()
@@ -1735,6 +1752,36 @@ class InterpEngine:
         self._gate_thread = threading.Thread(target=self._gate_worker,
                                             name="interp-gate", daemon=True)
         self._gate_thread.start()
+        # ⚠️⚠️ **指标线程**（2026-11-25）—— 自动变速**必须周期性地**重算。
+        #
+        # 原来 :meth:`_refresh_status` **只在提交一批之后**被调一次 ⇒
+        # 而「产能」是**播过几句之后才测得出来的** ⇒ 第一次评估时队列
+        # 还没有任何速率数据 ⇒ 变速永远停在 1.0 ⇒ 播放速度超过产能 ⇒
+        # **管道里的存货被抽干** ⇒ 句间断音（用户报「卡顿」）。
+        #
+        # ⇒ 这里每秒跑一次 ⇒ 变速成了**真正的反馈闭环**：
+        # 测到产能 ⇒ 降一档 ⇒ 存货涨 ⇒ 不再断音。
+        self._metrics_thread = threading.Thread(target=self._metrics_loop,
+                                                name="interp-metrics",
+                                                daemon=True)
+        self._metrics_thread.start()
+
+    def _metrics_loop(self) -> None:
+        """**每秒**刷新一次指标 + 重算自动变速。
+
+        ⚠️ ``_refresh_status`` 里会调 :func:`queue_set_tempo` ⇒ **变速**
+        变了 ⇒ 队列会**重开 aplay 管道**（sox 的 tempo 是 spawn 时定死的）
+        ⇒ 所以这里有**死区 + 最小间隔**（:data:`TEMPO_DEADBAND` /
+        :data:`TEMPO_MIN_INTERVAL`）⇒ 变速不抖 ⇒ 不会反复重开管道。
+        """
+        while not self._stop.is_set():
+            time.sleep(1.0)
+            if not self.running:
+                continue
+            try:
+                self._refresh_status()
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("interp: 指标刷新失败: %s", exc)
 
     # ------------------------------------------------------------------ #
     # 翻译 → 复核 → 放行 → 播报
@@ -2406,15 +2453,39 @@ class InterpEngine:
                     break
             # ⚠️ **产线上限是硬约束**（必须放在最后）——
             # 变速超过产能 ⇒ 播放拉不动合成流 ⇒ 缓冲被吃空 ⇒ 断音。
+            #
+            # ⚠️⚠️ **队列还没测出产能时不要用这个上限**（2026-11-25）：
+            # 队列刚起来时 ``need_tempo`` 返回**最保守的** 0.9（因为没有
+            # 速率数据）⇒ 拿它当上限 ⇒ **开机第一句话就慢 10%** ⇒ 滞后
+            # 白白多涨。⇒ 必须先确认**真的测到速率**了。
             need = float(st.get("need_tempo") or 0.0)
-            if need > 0.0:
+            measured = float(st.get("rate") or 0.0) > 0.0
+            if need > 0.0 and measured:
                 want = min(want, need)
-            # ⚠️⚠️ **但绝不慢于 1.0**（实测 2026-11-23，M29）——
-            # 「宁可断音也不要慢」是**反的**：变慢 ⇒ 译文落后得更快
-            # （k ÷ min(tempo, 产能) − 1 ⇒ tempo 0.96 比 1.0 多落后
-            # 0.05 s/s）⇒ 用户抱怨的正是这个。
-            # ⇒ 变速**只**用来抵消长度比（k > 1 且产能够），不用来放慢。
-            want = max(want, TEMPO_FLOOR)
+            # ⚠️⚠️⚠️ **缓冲余量档**（2026-11-25，用户报「卡顿/断音」）——
+            #
+            # **旧规矩是「绝不慢于 1.0」**（实测 2026-11-23，M29）⇒
+            # ``want = max(want, TEMPO_FLOOR)`` 把上面那句
+            # ``want = min(want, need)`` **顶了回去** ⇒ 实测 tempo 恒为
+            # 1.00 而可持续速率只有 0.96 ⇒ **播放比生产快 4%** ⇒
+            # 管道里的存货**被结构性抽干**（实测 8 个作业的「开口存货」
+            # **全是 0.00 s**）⇒ 每个作业的 2 s 首窗期间管道必然是空的
+            # ⇒ **句间断音**（用户报「卡顿」）。
+            #
+            # ⇒ **现在反过来：宁可慢 8% 也不要断音。**
+            # 播放速度 = 「产能档再退一档」（0.96 ⇒ 0.92）⇒ 存货每句
+            # 涨 0.1~0.3 s ⇒ 两三句之后管道里就有存货 ⇒ 首窗的空档
+            # 被填平。
+            #
+            # ⚠️ **代价**：译文相对源话**多落后**（tempo 0.92 ⇒ 每秒
+            # 源话多落后 0.08 s）⇒ 面板的滞后数字会如实变大 —— 这是
+            # 「用一点滞后换不断音」。
+            floor = float(st.get("tempo_floor") or 0.0)
+            if floor > 0.0:
+                want = min(want, floor)
+            else:
+                # ⚠️ **队列还没测出产能**（刚起来）⇒ 保持旧行为。
+                want = max(want, TEMPO_FLOOR)
             # ⚠️ **变速要「少动」** —— 每次改变速 = **重开 aplay 管道**
             # （sox 的 tempo 是 spawn 时定死的）= 一次句间缝隙。
             # ⇒ 死区（:data:`TEMPO_DEADBAND`）+ 最小间隔

@@ -114,6 +114,12 @@ _CLOCK_STALL_SEC = 8.0
 #: 设备**（设备是独占的）⇒ 同传一停下来就得让出来。
 _WRAPPER_IDLE_CLOSE_SEC = 15.0
 
+#: **关管道前最多等多久让音频放完**（秒）—— 2026-11-25（用户报「切音」）：
+#: ALSA 管道是**实时消费**的 ⇒ 写进去 ≠ 放出来 ⇒ 关管道 / 换管道时管道里
+#: 还压着一截 ⇒ 直接关 ⇒ **那截没了 ⇒ 句子被拦腰切断**。
+#: ⇒ 关之前先等 ``backlog_sec()`` 归零（放完），最多等这么久。
+_CLOSE_DRAIN_SEC = 5.0
+
 #: ⚠️ **「开口前先攒缓冲」这个机制已经删掉了**（2026-11-22）：
 #:
 #: 原来每句开头都要等「这句收到了 3 s 音频」才出声 ⇒ **句与句之间**
@@ -603,21 +609,45 @@ class TTSQueue:
         with self._cond:
             return bool(self._jobs) or self._playing is not None
 
-    def _fifo_clear(self) -> int:
-        """清空 FIFO（``clear()`` 用）⇒ 返回清掉的 job 数。"""
+    def _fifo_clear(self, keep_jobs=None) -> int:
+        """清空 FIFO（``clear()`` 用）⇒ 返回清掉的 job 数。
+
+        ⚠️⚠️ **正在播的那句不能砍**（2026-11-25，用户报「切音」）：
+        「新一轮识别」会清 FIFO ⇒ 若把**正在播**的那句**已经合成好、还没
+        写进管道**的 PCM 也丢了 ⇒ **句子被拦腰截断**（实测：清完之后那
+        半句直接没了 ⇒ 听感就是「切」）。
+        ⇒ ``keep_jobs`` 里的 job 的 PCM **保留** ⇒ 那句话放完再接下一句。
+
+        ⚠️ **记账要跟着改**：保留的 chunk **不能**从 ``_fifo_sec`` 里扣掉
+        （否则「队列里还有多少秒」会算错 ⇒ 面板的积压显示失真）。
+        """
+        keep_ids = {id(j) for j in (keep_jobs or ()) if j is not None}
         cleared = 0
         with self._fifo_cond:
-            while self._fifo:
-                job, chunk, _ts = self._fifo.popleft()
+            if not self._fifo:
+                self._fifo_sec = 0.0
+                self._fifo_cond.notify_all()
+                return 0
+            kept, dropped = [], []
+            for item in self._fifo:
+                job = item[0]
+                if job is not None and id(job) in keep_ids:
+                    kept.append(item)
+                else:
+                    dropped.append(item)
+            sec = 0.0
+            for _job, chunk, _ts in kept:
                 if chunk is not None:
                     try:
-                        self._fifo_sec -= int(chunk.size) / float(_SAMPLE_RATE)
+                        sec += int(chunk.size) / float(_SAMPLE_RATE)
                     except Exception:  # noqa: BLE001
                         pass
+            for job, _chunk, _ts in dropped:
                 if job is not None and not job.cancelled:
                     job.cancelled = True
                     cleared += 1
-            self._fifo_sec = 0.0
+            self._fifo = deque(kept)
+            self._fifo_sec = sec
             self._fifo_cond.notify_all()
         return cleared
 
@@ -722,8 +752,12 @@ class TTSQueue:
             self._jobs.clear()
             self._c.dropped += cleared
             self._cond.notify_all()
+            # ⚠️⚠️ **正在播 / 正在合成的那句要留着**（2026-11-25，用户报
+            # 「切音」）：它的 PCM 已经合成好了 ⇒ 丢掉就是**拦腰截断**。
+            # ⇒ 这两句的 FIFO 音频**保留** ⇒ 放完再接下一轮的内容。
+            keep = [j for j in (self._speaking, self._playing) if j is not None]
         # ⚠️ **FIFO 里还没播的音频**也清掉（上一轮的内容不该接着播）。
-        fifo_cleared = self._fifo_clear()
+        fifo_cleared = self._fifo_clear(keep_jobs=keep)
         if fifo_cleared:
             with self._cond:
                 self._c.dropped += fifo_cleared
@@ -736,19 +770,46 @@ class TTSQueue:
         with self._cond:
             speaking = self._speaking
         if speaking is None:
-            self._close_writer()
+            self._close_writer(drain=True)
         return {"cleared": cleared}
 
-    def _close_writer(self) -> None:
-        """关掉复用的 aplay 管道（释放 ALSA 设备）。"""
+    def _close_writer(self, drain: bool = False) -> None:
+        """关掉复用的 aplay 管道（释放 ALSA 设备）。
+
+        ⚠️ **``drain=True`` ⇒ 先等管道里的音频放完再关**（2026-11-25）：
+        ALSA 管道里还压着没放完的音频时直接关 ⇒ **那截被丢掉** ⇒
+        听感是「话说一半被切掉」。⇒ 先等 ``backlog_sec()`` 归零
+        （最多 :data:`_CLOSE_DRAIN_SEC` 秒）再关。
+        """
         with self._cond:
             writer = self._writer
             self._writer = None
-        if writer is not None:
+        if writer is None:
+            return
+        if drain:
+            self._drain_writer(writer)
+        try:
+            writer.close()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("tts-queue: 关 aplay 失败: %s", exc)
+
+    @staticmethod
+    def _drain_writer(writer, timeout: float = _CLOSE_DRAIN_SEC) -> None:
+        """等管道里的音频**放完**（最多 ``timeout`` 秒）。
+
+        ⚠️ **为什么要等**（实测 2026-11-25，用户报「切音」）：ALSA 管道
+        是**实时消费**的 ⇒ 写进去 ≠ 放出来 ⇒ 换管道 / 关管道时管道里还
+        压着一截 ⇒ 直接关 ⇒ 那截**没了** ⇒ 句子被切。
+        ⇒ 先等 ``backlog_sec()`` 归零（放完了）再关。
+        """
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
             try:
-                writer.close()
-            except Exception as exc:  # noqa: BLE001
-                LOG.debug("tts-queue: 关 aplay 失败: %s", exc)
+                if float(writer.backlog_sec()) <= 0.02:
+                    return
+            except Exception:  # noqa: BLE001
+                return
+            time.sleep(0.05)
 
     @staticmethod
     def _writer_alive(writer) -> bool:
@@ -958,6 +1019,11 @@ class TTSQueue:
             # ⚠️ **取阶梯上的档**（离散）—— 变速变了要重开 aplay 管道 ⇒
             # 连续变速会频繁重开 ⇒ 频繁句间缝隙。
             "need_tempo": self._need_tempo_locked(),
+            # ⚠️⚠️ **缓冲余量档**（2026-11-25，用户报「卡顿」）——
+            # 播放速度的**上限**要比「可持续速率」**再低一档** ⇒
+            # 管道里的存货才会**涨** ⇒ 每个作业的 2 s 首窗期间管道不会
+            # 空 ⇒ 句间断音消失。详见 :meth:`_tempo_floor_locked`。
+            "tempo_floor": self._tempo_floor_locked(),
             # **电平探针**（诊断「没播」vs「播得太小」）
             "last_peak": round(c.last_peak, 4),
             "last_raw_peak": round(c.last_raw_peak, 4),
@@ -1002,6 +1068,38 @@ class TTSQueue:
             if t <= capacity + 1e-6:
                 return round(t, 3)
         return round(TEMPO_MIN, 3)
+
+    def _tempo_floor_locked(self) -> float:
+        """**缓冲余量档** = 「可持续速率档」的**再退一档**。
+
+        ⚠️⚠️ **为什么要再退一档**（实测 2026-11-25，用户报「卡顿/断音」）：
+        播放速度**等于**产能 ⇒ 管道里的存货**不涨也不跌** ⇒ 恒为 0 ⇒
+        每个作业的**首窗（~2 s）**期间管道必然是空的 ⇒ **句间断音**
+        （实测：8 个作业的「开口存货」全是 0.00 s）。
+        ⇒ 播放速度要比产能**低一档** ⇒ 存货每句涨 0.1~0.3 s ⇒
+        两三句之后管道里就有存货 ⇒ 首窗的空档被填平。
+
+        ⚠️ **代价**：播放慢 ⇒ 译文相对源话**多落后**（tempo 0.92 ⇒
+        每秒源话多落后 0.08 s）。⇒ 这是「用一点滞后换不断音」——
+        与旧规矩（「宁可断音也不要慢」）**方向相反**，2026-11-25 改。
+
+        ⚠️ **还没测出产能时返回 0.96**（不凭空变慢、但**留一点余量**）：
+        队列刚起来时 ``_rate == 0`` ⇒ ``need_tempo`` 会返回最保守的
+        :data:`TEMPO_MIN`（0.9）⇒ 若拿它当上限 ⇒ 开机第一句话就慢 10%
+        ⇒ 滞后白白多涨。⇒ 用**阶梯上 1.0 的下一档**（0.96）——
+        与实测完之后的建议**一致**（实测可持续速率 ~1.0 ⇒ 档位 0.96），
+        且**第一句就有缓冲余量**（实测：第一句按 1.0 播 ⇒ 句中饿死
+        0.64 s；按 0.96 播 ⇒ **0.00 s**）。
+        """
+        if self._rate <= 0.0:
+            return 0.96
+        need = self._need_tempo_locked()
+        prev = None
+        for t in TEMPO_LADDER:
+            if t >= need - 1e-6:
+                break
+            prev = t
+        return round(prev if prev is not None else TEMPO_MIN, 3)
 
     def _tts_instance_count(self) -> int:
         """本机跑着几个 TTS 实例。
@@ -1307,7 +1405,13 @@ class TTSQueue:
                 writer_tempo = None
             # ⚠️ **变速变了 ⇒ aplay 管道得重开**（sox 的 tempo 是 spawn
             # 时定死的）。
+            #
+            # ⚠️⚠️ **先把正在播的放完再换**（2026-11-25，用户报「切音」）：
+            # 管道是**实时消费**的 ⇒ 里面还压着一截没放完 ⇒ 直接 close
+            # ⇒ **那截没了** ⇒ 句子被拦腰切断。⇒ 先等它放完（最多
+            # :data:`_CLOSE_DRAIN_SEC` 秒）再关。
             if writer is not None and writer_tempo != job.tempo:
+                self._drain_writer(writer)
                 try:
                     writer.close()
                 except Exception as exc:  # noqa: BLE001
