@@ -70,6 +70,19 @@
   const TR_REQ_TICK_MS = 600;         // 多久跑一轮（≈ 3.3 个/秒）
 
   /**
+   * **播放头的心跳**（毫秒）—— 播放头**没变**时也要每隔这么久上报一次。
+   *
+   * ⚠️ **为什么要有**（2026-11-25）：播放头原来只在**变化**时上报 ⇒ 媒体
+   * **暂停**在某个位置后就**再也不报了** ⇒ 服务端那边「播放头多久没来」
+   * 一直涨 ⇒ 被误判成「**前端失联**」（`playhead_missing`）⇒ 面板会说
+   * 「播放头没上报」—— 而真相是「**媒体暂停着**」。
+   *
+   * ⇒ 这两件事**必须分开说**：**前端还在不在**（心跳）≠ **媒体在不在动**。
+   * ⇒ 心跳让服务端的「多久没来」只反映前者。
+   */
+  const PH_HEARTBEAT_MS = 2000;
+
+  /**
    * **服务端队列的「软上限」** —— 队列深到这个数就**先别再塞**。
    *
    * ⚠️ **为什么需要**：客户端的速率**只是上限**，不是承诺 —— 服务端这台
@@ -811,6 +824,17 @@ const Qwen3Asr = {
     });
     this._interpLoadOptions();
     this._interpSyncUi();
+    // ⚠️ **刷新页面后要把「同传还在跑」接回来**（2026-11-25）——
+    //
+    // 症状（实测）：用户在同传跑着的时候刷新了页面 ⇒ 前端的
+    // ``_interp.running`` 回到 false ⇒ **播放头上报的定时器根本没起来**
+    // ⇒ 服务端**再也收不到播放头** ⇒
+    //   ① 队列的播放时钟拿不到播放头 ⇒ 译文**不等字幕位置**（不同步）；
+    //   ② 服务端**看不见拖进度条** ⇒ seek 处理（丢陈旧 + 重播）全部失效。
+    //
+    // ⇒ 这里问服务端「同传还在跑吗」⇒ 在跑就**接管**：把状态、轮询、
+    //    播放头上报都接回来。
+    this._interpRestoreState();
 
     // 输入来源切换（音频文件 / 含音轨的视频 / 板载麦克风 / 浏览器麦克风）
     document.querySelectorAll("#asr-source-tabs .asr-source-tab")
@@ -4812,6 +4836,28 @@ const Qwen3Asr = {
     return src === "file" || src === "video";
   },
 
+  /**
+   * 「开始同传」要发给服务端的**播放时机**（2026-11-25）。
+   *
+   * ⚠️ **不直接用 ``this._interp.gate``** —— 那是**本地状态**，它在没有
+   * 播放头的源上会被强制改成「now」，而用户在麦克风与视频之间来回切时
+   * 这个「now」会**留在本地** ⇒ 于是「开始同传」把「不等播放」发出去 ⇒
+   * **队列的播放时钟被关掉** ⇒ 译文**不等字幕位置**（实测比字幕位置超前
+   * 15~75 秒 ⇒ 用户报「不跟字幕的节奏」）。
+   *
+   * ⇒ 规则：**有播放头的源 ⇒ 除非用户自己选过，否则一律「跟播放」**；
+   *   没有播放头的源 ⇒ 只能「不等播放」。
+   */
+  _interpStartGate() {
+    if (!this._interpHasPlayhead()) return "now";
+    const g = this._interp.gateTouched ? this._interp.gate : "follow";
+    // 面板上的下拉也要跟实际发出去的一致（否则界面在骗人）。
+    this._interp.gate = (g === "follow") ? "follow" : "now";
+    const sel = document.getElementById("asr-interp-gate");
+    if (sel) sel.value = this._interp.gate;
+    return this._interp.gate;
+  },
+
   /** 拉「能出声的目标语言」和音色列表。 */
   /**
    * **向导第 5 步「同声传译」**的选项 —— **运行时**灌进去。
@@ -5020,7 +5066,16 @@ const Qwen3Asr = {
     }
     const body = {
       mode: this._interp.mode,
-      gate: this._interpHasPlayhead() ? this._interp.gate : "now",
+      // ⚠️⚠️ **媒体来源 ⇒ 除非用户自己选过「不等播放」，否则一律「跟播放」**
+      // （2026-11-25）——
+      //
+      // 「播放时机」是**本地状态**，而它在**没有播放头的源**（板载麦 /
+      // 浏览器麦）上会被强制改成「now」⇒ 用户从麦克风切回视频时，这个
+      // 「now」可能还**留在本地** ⇒ 「开始同传」就把它发给服务端 ⇒
+      // **播放时钟被关掉** ⇒ 译文不等字幕位置（实测超前 15~75 秒）。
+      //
+      // ⇒ 这里**不信任本地残留值**：用户没显式选过 ⇒ 媒体源一律「跟播放」。
+      gate: this._interpStartGate(),
       target_lang: this._interp.targetLang,
       // ⚠️ 内置音色 / 参考音色**分开传**（两个不同的 SDK 参数）
       speaker: this._interp.speaker,
@@ -5097,6 +5152,23 @@ const Qwen3Asr = {
         if (!r.ok) return;
         const data = await r.json();
         this._interp.status = data;
+        // ⚠️⚠️ **「同传在不在跑」以服务端为准**（2026-11-25）——
+        //
+        // 症状（实测）：同传**不是**通过界面停的（另一处 API 调用停的 /
+        // 引擎自己停了 / 源跑完了）⇒ 前端的 ``_interp.running`` 还停在
+        // true ⇒ 面板显示「同传中」⇒ **「开始同传」按钮一直 disabled**
+        // ⇒ 用户（和回归脚本）再也开不了第二轮。
+        //
+        // ⇒ 这里把服务端的 ``running`` 同步回来 ⇒ 面板永远跟着引擎的真实
+        // 状态走。
+        if (typeof data.running === "boolean"
+            && data.running !== this._interp.running) {
+          this._interp.running = data.running;
+          if (!data.running) {
+            // 服务端不跑了 ⇒ 别再上报播放头（否则服务端收到的是幽灵数据）。
+            this._interpStopPlayhead();
+          }
+        }
         this._interpSyncUi();
       } catch (e) {
         /* 网络问题不打扰用户 */
@@ -5111,6 +5183,54 @@ const Qwen3Asr = {
     }
   },
 
+  /**
+   * **刷新页面后接管「同传还在跑」**（2026-11-25）。
+   *
+   * ⚠️ **为什么必须接管**：同传是**服务端**的引擎，**刷新页面不会停它**
+   * ⇒ 但前端的状态全在内存里 ⇒ 刷新后 ``_interp.running`` 变成 false ⇒
+   * * 面板显示「同传未开启」（其实它在跑）；
+   * * **播放头上报的定时器没起来** ⇒ 服务端收不到播放头 ⇒
+   *   「跟字幕节奏」与「拖进度条后重新对齐」**双双失效**。
+   *
+   * ⇒ 这里问一次服务端的状态，在跑就接回来。
+   */
+  async _interpRestoreState() {
+    try {
+      const r = await fetch("/api/qwen3-asr/interp/status",
+        { cache: "no-store" });
+      if (!r.ok) return;
+      const data = await r.json();
+      if (!data || !data.running) return;
+      this._interp.running = true;
+      this._interp.status = data;
+      // ⚠️ **服务端的播放时机是权威** —— 刷新前用户选过什么就还是什么。
+      if (data.gate === "follow" || data.gate === "now") {
+        this._interp.gate = data.gate;
+        this._interp.gateTouched = true;   // 服务端这么跑 ⇒ 用户选过
+      }
+      if (data.mode === "fast" || data.mode === "steady") {
+        this._interp.mode = data.mode;
+      }
+      // ⚠️⚠️ **源**不用在这里接管（2026-11-25 改）——
+      //
+      // 「刷新后源要切回去」这件事**已经有人做了** ⇒ `_restoreFromServer()`
+      // 从 `GET /rounds` 的 `source.{kind,path}` 把**路径**和**源**一起
+      // 恢复（服务端说了算 ⇒ 那才是权威的 —— 轮次就是那个源的）。
+      //
+      // ⇒ 在这里再切一次会**跟它打架**（两个异步恢复各切各的）⇒ 而且
+      // `_switchSource()` 在源**真变了**时会清字幕 ⇒ 可能把刚恢复出来的
+      // 字幕又清掉。
+      //
+      // ⇒ 只接管**同传自己的状态**（在不在跑 / 播放时机 / 档位）。
+      this._interpSyncUi();
+      this._interpPoll();
+      this._interpStartPlayhead();
+      console.info("[qwen3-asr] 同传还在跑，已接管（gate=" + this._interp.gate + "）");
+    } catch (e) {
+      /* 网络问题不打扰用户 */
+    }
+  },
+
   /** 面板渲染。 */
   _interpSyncUi() {
     const st = this._interp.status || {};
@@ -5121,11 +5241,23 @@ const Qwen3Asr = {
     const gateSel = document.getElementById("asr-interp-gate");
     // 播放时机：没有播放头的源 ⇒ 置灰 + 强制「不等播放」
     const hasPh = this._interpHasPlayhead();
+    const prevGate = this._interp.gate;
     if (gateSel) {
       gateSel.disabled = !hasPh;
       if (!hasPh) {
-        this._interp.gate = "now";
-        gateSel.value = "now";
+        // ⚠️⚠️ **别吃掉用户自己的选择**（2026-11-25）——
+        //
+        // 「没有播放头的源 ⇒ 强制『不等播放』」是对**默认值**的降级 ⇒
+        // 用户**自己**选过的那个（``gateTouched``）不该被覆盖 ⇒ 否则：
+        // 用户在视频源上选过「跟播放」⇒ 切到麦克风（这里被强制成
+        // 「now」）⇒ 再切回视频 ⇒ 选择**丢了** ⇒ 面板显示「不等播放」，
+        // 而服务端其实还在「跟播放」⇒ **界面在骗人**。
+        //
+        // ⇒ 只有**用户没选过**的时候才强制降级。
+        if (!this._interp.gateTouched) {
+          this._interp.gate = "now";
+        }
+        gateSel.value = this._interp.gate;
       } else if (!this._interp.gateTouched) {
         // ⚠️ **有播放头的源（文件 / 视频）默认「跟播放」**。
         //
@@ -5139,11 +5271,50 @@ const Qwen3Asr = {
         gateSel.value = "follow";
       }
     }
+    // ⚠️⚠️ **服务端也要跟着换**（2026-11-25，用户报「含音轨的视频的同传
+    // 不跟字幕的节奏」）。
+    //
+    // 症状（实测）：用户浏览器那一场同传是 **gate=now**（引擎日志：「播放
+    // 时钟 已关掉（gate=now）」）⇒ 队列的播放时钟被关掉 ⇒ 译文**合成完就
+    // 播** ⇒ 而 ASR 跑在播放头**前面** ⇒ 译文比字幕位置**超前 15~75 秒**
+    // （实测 a_lag）⇒ 完全不同步。
+    //
+    // 根因：**「播放时机」是前端的本地状态**，而它在「没有播放头的源」
+    // （板载麦 / 浏览器麦）上会被**强制改成「不等播放」** ⇒ 用户从麦克风
+    // 切回视频时这个「now」**留在本地** ⇒ 「开始同传」就带着 now 发出去
+    // ⇒ 服务端从此不跟播放头。
+    //
+    // ⇒ **来源变了、服务端在跑 ⇒ 把播放时机同步过去**（用户自己选过就
+    // 不动）。
+    if (this._interp.running && hasPh && this._interp.gate !== prevGate) {
+      this._interpSettings({ gate: this._interp.gate });
+    }
     if (btnStart) btnStart.disabled = this._interp.running;
     if (btnStop) btnStop.disabled = !this._interp.running;
     if (el) {
       if (!this._interp.running) {
         el.textContent = "同传未开启";
+      } else if (st.playhead_missing) {
+        // ⚠️⚠️ **播放头没上报**（2026-11-25）——
+        //
+        // 「跟播放」的整套机制（队列的播放时钟 + 拖进度条后重新对齐）**全靠
+        // 播放头** ⇒ 前端一停止上报（刷新页面没接回来 / 媒体还没加载），
+        // 系统就**静默**退化成「不等播放」⇒ 译文合成完就播 ⇒ 而 ASR 跑在
+        // 播放头**前面** ⇒ 译文比字幕位置**超前 15~75 秒**（实测）。
+        //
+        // ⇒ **说清楚**：这跟「媒体没在放」是两件事 ⇒ 给出的出路也不同。
+        const age = Number(st.playhead_age_sec || -1);
+        const ageTxt = age >= 0 ? `${Math.round(age)} 秒没收到` : "从没收到过";
+        el.textContent = "播放头没上报（" + ageTxt + "）"
+          + "· 译文不等字幕位置（会越走越超前）"
+          + "· 刷新一下页面，或确认媒体已加载";
+      } else if (this._interp.gate === "now" && hasPh) {
+        // ⚠️ **「不等播放」+ 有播放头的源** ⇒ 译文**不等字幕位置**。
+        //
+        // 用户可能是有意的（源比译文短 / 不想等），但**默认不该是这个**
+        // ⇒ 说清楚它意味着什么。
+        el.textContent = "不等播放（译文不等字幕位置，会越走越超前）"
+          + "· 改成「跟播放」才会贴着字幕";
       } else if (st.playhead_stalled && !st.source_done) {
         // ⚠️ **播放头卡住** —— 媒体没在放（自动播放被拦 / 用户暂停）
         // ⇒ 「跟播放」压着句子不放 ⇒ 用户看不到译文出声。
@@ -5227,7 +5398,9 @@ const Qwen3Asr = {
             text = "译文跟着播放头走；若媒体没在放，译文不会出声（可切「不等播放」）。";
           }
         } else {
-          text = "不等播放：识别一句就播一句。";
+          // ⚠️ **说清楚代价**（2026-11-25）—— 「不等播放」在有播放头的源
+          // 上意味着「译文不等字幕位置」⇒ 越播越超前（实测 15~75 秒）。
+          text = "不等播放：识别一句就播一句（译文不等字幕位置 ⇒ 越播越超前）。";
         }
       }
       hint.textContent = text;
@@ -5371,6 +5544,14 @@ const Qwen3Asr = {
     if (src === "video") {
       const v = document.getElementById("asr-video");
       if (!v) return null;
+      // ⚠️ **媒体还没加载 ⇒ 位置没有意义**（2026-11-25）——
+      //
+      // 刷新页面后媒体元素是**新的**（``currentTime`` = 0）⇒ 报一个「0」
+      // 上去 ⇒ 服务端以为用户**跳回开头** ⇒ 把待播的句子全当成「被跳过」
+      // 丢掉。
+      //
+      // ⇒ **没有源就不上报**（``null`` ⇒ 前端跳过这次上报）。
+      if (!v.src && !v.currentSrc) return null;
       const t = (v.currentTime || 0) - (this._audioOriginSec || 0);
       return {
         sec: Math.max(0, t),
@@ -5384,6 +5565,7 @@ const Qwen3Asr = {
     if (src === "file") {
       const a = document.getElementById("asr-audio-player");
       if (!a) return null;
+      if (!a.src && !a.currentSrc) return null;
       return {
         sec: Math.max(0, a.currentTime || 0),
         playing: !a.paused && !a.ended,
@@ -5408,14 +5590,27 @@ const Qwen3Asr = {
       // ⚠️ **「结束 / 失败」也算变化** —— 媒体播完的那一刻 ``playing``
       // 会从 true 变 false（会被上报），但「源结束了」这个状态必须
       // **单独**让服务端知道 ⇒ 不然它只会看到「暂停」⇒ 以为还能等。
-      if (Math.abs(ph.sec - this._interp.lastPh) < 0.05
-          && ph.playing === this._interp.lastPlaying
-          && !!ph.ended === !!this._interp.lastEnded
-          && !!ph.failed === !!this._interp.lastFailed) return;
+      //
+      // ⚠️⚠️ **心跳**（2026-11-25）—— 播放头**没变**时也要定期上报：
+      //
+      // 原来只在**变化**时上报 ⇒ 媒体**暂停**在某个位置后就**再也不报了**
+      // ⇒ 服务端那边「播放头多久没来」就一直涨 ⇒ 被误判成「**前端失联**」
+      // ⇒ 面板会说「播放头没上报」—— 而真相是「**媒体暂停着**」。
+      //
+      // ⇒ 这两件事**必须分开说**：前端还在不在（心跳）≠ 媒体在不在动。
+      // ⇒ 心跳让服务端的「多久没来」**只反映前端在不在**。
+      const nowMs = Date.now();
+      const changed = Math.abs(ph.sec - this._interp.lastPh) >= 0.05
+        || ph.playing !== this._interp.lastPlaying
+        || !!ph.ended !== !!this._interp.lastEnded
+        || !!ph.failed !== !!this._interp.lastFailed;
+      const beat = (nowMs - (this._interp.lastPhAt || 0)) >= PH_HEARTBEAT_MS;
+      if (!changed && !beat) return;
       this._interp.lastPh = ph.sec;
       this._interp.lastPlaying = ph.playing;
       this._interp.lastEnded = !!ph.ended;
       this._interp.lastFailed = !!ph.failed;
+      this._interp.lastPhAt = nowMs;   // 心跳的基准（见上面的说明）
       // ⚠️ **带上引擎当前的流 id** —— 播放头是**按流**存的 ⇒ id 对不上
       // ⇒ 放行器配不上这句 ⇒「跟播放」把它永久压住 ⇒「有翻译没声音」
       // （实测：前端之前一直报空 id ⇒ 必然配不上）。
