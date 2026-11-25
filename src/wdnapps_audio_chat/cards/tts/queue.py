@@ -937,6 +937,14 @@ class TTSQueue:
             "dropped": c.dropped,
             "failed": c.failed,
             "done": c.done,
+            # ⚠️⚠️ **播放时钟接上了没有** —— 跟播的「译文对齐源话」全靠它
+            # （``_clock_ready``：播放头没走到这一句就不播）。
+            # ⚠️ **之前这里没有这个字段** ⇒ 时钟**没接上**也看不出来
+            # （症状：视频源的译文跑在画面前面 ⇒ 逐行同步误差 −25 ~ −85 秒）。
+            "clocked": self._clock_provider is not None,
+            "clock_offset": round(self._clock_offset, 2),
+            "clock_last": round(self._clock_last, 2),
+            "clock_stall_sec": round(time.time() - self._clock_stall_at, 2),
             "tempo": tempo,
             "max_tempo": TEMPO_MAX,
             # ⚠️ **实测合成速率**（音频秒 / 墙钟秒）—— <1.0 「产能不够」

@@ -2593,11 +2593,17 @@ class InterpEngine:
         try:
             from app.core.audio.tts_bridge import queue_set_clock
             if self._gate_mode == "follow":
-                queue_set_clock(self._playhead_provider, 0.0)
+                res = queue_set_clock(self._playhead_provider, 0.0)
             else:
-                queue_set_clock(None, 0.0)
+                res = queue_set_clock(None, 0.0)
+            # ⚠️ **记 INFO 不记 DEBUG** —— 「时钟没接上」的症状是
+            # 「译文跑在画面前面几十秒」，而 DEBUG 在生产日志里看不到 ⇒
+            # 排查时完全没有线索（踩过）。
+            LOG.info("interp: 播放时钟 %s（gate=%s）",
+                     "已接上" if self._gate_mode == "follow" else "已关掉",
+                     self._gate_mode)
         except Exception as exc:  # noqa: BLE001
-            LOG.debug("interp: 设播放时钟失败: %s", exc)
+            LOG.warning("interp: 设播放时钟失败（跟播会失效）: %s", exc)
 
     def _playhead_provider(self):
         """给 TTS 队列的**播放时钟**用：当前播放头（媒体秒）。
