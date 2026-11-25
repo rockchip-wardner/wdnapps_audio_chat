@@ -24,9 +24,14 @@ browser       endpoint             ✅          ❌
 两条正交的轴
 ------------
 * **切句档位** ``fast`` / ``steady``
-  - 稳档：实时流用 endpoint（静音 1200 ms）；文件流用标点断句。
-  - 快档：实时流用「最长公共前缀连续 N 轮不变」；文件流用**更短的强制
-    切句**（24 字而不是 60 字 ⇒ 更早出句）。
+  - **实时流**：两档都看 **committed 增量**（已确认文本）——
+    ``fast`` 在**子句**标点处切（更早出句），
+    ``steady`` 在**句末**标点处切（句子完整）。
+    ⚠️ **不能用 ``unfixed``** —— 它是 SDK 回退窗口的**滑动尾巴**
+    （每轮都在移）⇒ 拿它当稳定信号 ⇒ 连续讲话时**一句都切不出来**
+    （实测 2026-11-25：15 s 连续讲话前 14.34 s 零句 ⇒ 首声 17.77 s）。
+  - **文件 / 视频流**：``fast`` 用**更短的强制切句**（24 字而不是 60 字
+    ⇒ 更早出句）。
 * **播放时机** ``now``（不等播放）/ ``follow``（跟播放头）
   - 只有 file / video 有播放头 ⇒ board / browser 恒为 ``now``。
 
@@ -61,14 +66,12 @@ LOG = logging.getLogger(__name__)
 # 常量
 # --------------------------------------------------------------------------- #
 
-#: 快档：LCP 连续 N 轮不变才成句（实时流）。
-INTERP_STABLE_ROUNDS = 2
-#: 低于这个字数不切句（太碎的句子翻不准）。
-INTERP_MIN_CHARS = 8
-#: 单句上限（实时流快档）。
-INTERP_MAX_CHARS = 40
-#: **文件流快档**的强制切句长度（比稳档的 60 短 ⇒ 更早出句 ⇒ 跟播滞后更小）。
-INTERP_FAST_MAX_CHARS = 24
+#: **同传引擎的常量**（切句口径在 ``service.py`` 的切句器里 ——
+#: 那一侧才有标点/软切的实现 ⇒ **口径只有一份**）。
+#:
+#: ⚠️ **快档的实时流切句器**是 ``service.py::\_FastCommittedSegmenter``
+#: （**committed 增量**驱动）；**文件 / 视频流**的快档强制切句长度也是
+#: 同一侧（``_FAST_MAX_CHARS``）⇒ 实时流与文件流的快档口径一致。
 
 #: 跟播：提前放行量（秒）—— 给 TTS 留出首帧时间。
 FOLLOW_LEAD_SEC = 1.0
@@ -510,69 +513,6 @@ class _Counters:
     tts: dict = field(default_factory=dict)
 
 
-class StablePrefixSegmenter:
-    """快档切句器：从 ``unfixed`` 求「最长公共前缀」。
-
-    规则：
-
-    1. 与上一轮求 LCP；
-    2. LCP 变长 ⇒ 候选更新，稳定计数清零；
-    3. LCP 连续 N 轮「长度与内容都不变」⇒ 成句；
-    4. LCP **变短**（模型改写）⇒ 作废候选，重新开始。
-
-    为什么不用 ``committed`` 增量：文件流的 ``committed`` 只增长、不回滚 ⇒
-    「说话中」与「停顿」分不开 ⇒ 快档判据在文件流上失效 ⇒ 文件流的快档
-    改用「更短的强制切句」（见 service.py）。
-    """
-
-    def __init__(self, stable_rounds: int = INTERP_STABLE_ROUNDS,
-                 min_chars: int = INTERP_MIN_CHARS,
-                 max_chars: int = INTERP_MAX_CHARS) -> None:
-        self._stable_rounds = stable_rounds
-        self._min_chars = min_chars
-        self._max_chars = max_chars
-        self._candidate = ""
-        self._stable = 0
-
-    def feed(self, unfixed: str) -> Optional[str]:
-        """喂一轮 ``unfixed``；成句了返回句子，否则返回 None。"""
-        text = (unfixed or "").strip()
-        if not text:
-            # 模型清空（退化 / 回看）⇒ 作废候选
-            self._candidate = ""
-            self._stable = 0
-            return None
-        prev = self._candidate
-        # ⚠️ 比较的是**截断后**的文本 —— 候选本来就只留前 N 字 ⇒ 用原文
-        # 比会把「一直在长」误判成「没变」。
-        cur = text[: self._max_chars]
-        if prev and not cur.startswith(prev):
-            # LCP 变短（模型改写）⇒ 作废候选，从头再来
-            prev = ""
-            self._candidate = ""
-            self._stable = 0
-        if not prev:
-            # 第一轮：候选 = 当前文本（截到上限）
-            self._candidate = cur
-            self._stable = 0
-            return None
-        if len(cur) > len(prev):
-            # 还在长 ⇒ 候选更新，稳定计数清零
-            self._candidate = cur
-            self._stable = 0
-            return None
-        # 长度与内容都不变 ⇒ 稳定计数 +1
-        self._stable += 1
-        if self._stable < self._stable_rounds:
-            return None
-        out = self._candidate
-        self._candidate = ""
-        self._stable = 0
-        if len(out) < self._min_chars:
-            return None
-        return out
-
-
 class Gate:
     """放行器：决定「这句现在能不能进 TTS 队列」。"""
 
@@ -1002,13 +942,18 @@ class InterpEngine:
         #: **参考音色**（voice-clone）—— 与 ``_speaker``（内置音色）是两个
         #: 不同的 SDK 参数。本板只有参考音色 ⇒ 面板选的是参考音色时走这里。
         self._ref_speaker = ""
-        #: **默认音量 0.5**（振幅倍率，不是硬件音量）。
+        #: **默认音量 0.01（1%）**（振幅倍率，不是硬件音量）。
         #:
-        #: ⚠️ 之前是 0.1 ⇒ 板端实测出声峰值只有 **0.025（≈ −32 dBFS）**
-        #: （模型原始输出本身才 0.15~0.40）⇒ 板载小喇叭上**基本听不见**
-        #: ⇒ 用户会报「有翻译，但是没有播放」—— 其实是「太小」。
-        #: ⇒ 与 TTS 卡自己的默认（0.5）对齐。
-        self._volume = 0.5
+        #: ⚠️ **2026-11-25 用户定案**：同传的默认音量**一律 1%**
+        #: （此前是 0.5 ⇒ 板载喇叭整段朗读 ⇒ 扰民 / 测试时吵）。
+        #: ⇒ **用户想听清楚时自己往上拉**（面板上的音量滑块 0~100）。
+        #: ⇒ **测试播放同样用 1%**（探针与浏览器回归都显式带
+        #: ``volume=0.01``）⇒ 两条纪律现在是**同一条**。
+        #:
+        #: ⚠️ 之前试过 0.1 ⇒ 板端实测出声峰值只有 0.025（≈ −32 dBFS）
+        #: ⇒ 板载小喇叭上基本听不见 ⇒ 用户报「有翻译，但是没有播放」。
+        #: ⇒ 1% 更安静 ⇒ 听不见时用滑块调大，**别**改这个默认值。
+        self._volume = 0.01
         self._source = "live"            # live | file | video
         self._seg_index = 0
         self._queue: "queue.Queue[InterpSegment]" = queue.Queue(
@@ -1032,7 +977,6 @@ class InterpEngine:
         self._armed: set[int] = set()
         #: **最近一次 seek 的回执**（给面板显示「已重新对齐」）。
         self._last_seek_info: Optional[dict] = None
-        self._segmenters: dict[str, StablePrefixSegmenter] = {}
         self._gate = Gate("now")
         self._counters = _Counters()
         #: **每句的分段计时**（诊断「滞后 15 秒」到底花在哪一段）：
@@ -1437,7 +1381,6 @@ class InterpEngine:
             self._armed.clear()
             self._ready_since.clear()
             self._cache.clear()
-            self._segmenters.clear()
             while True:
                 try:
                     self._queue.get_nowait()
@@ -1534,22 +1477,6 @@ class InterpEngine:
         if not text:
             return
         self._push(text, lang, stream_id, mode, ts)
-
-    def on_unfixed(self, unfixed: str, lang: str, stream_id: str,
-                   ts: Optional[float] = None) -> None:
-        """**快档**（实时流）：``unfixed`` 的稳定前缀成句。"""
-        if not self.running:
-            return
-        with self._lock:
-            if self._mode != "fast":
-                return
-            seger = self._segmenters.get(stream_id)
-            if seger is None:
-                seger = StablePrefixSegmenter()
-                self._segmenters[stream_id] = seger
-        sentence = seger.feed(unfixed)
-        if sentence:
-            self._push(sentence, lang, stream_id, "fast", ts)
 
     def on_file_segment(self, text: str, seq: int, start_sec: float,
                         end_sec: float, stream_id: str,

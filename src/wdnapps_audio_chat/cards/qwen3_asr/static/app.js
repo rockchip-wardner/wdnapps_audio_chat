@@ -510,10 +510,11 @@ const Qwen3Asr = {
     speaker: "",         // 内置音色（SDK 的 SPK_ID）
     refSpeaker: "",      // 参考音色（voice-clone）—— 本板只有这类可用
     gateTouched: false,  // 用户**自己**选过播放时机吗（没选过才用默认）
-    // ⚠️ **默认 0.5**（振幅倍率）—— 板端实测：0.1 ⇒ 出声峰值只有
-    // 0.025（≈ −32 dBFS）⇒ 板载小喇叭上基本听不见 ⇒ 用户会报
-    // 「有翻译，但是没有播放」。与 TTS 卡的默认值一致。
-    volume: 0.5,
+    // ⚠️ **默认 0.01（1%）**（2026-11-25 用户定案）—— 同传的默认音量
+    // 一律 1%：板载喇叭整段朗读很吵 ⇒ 默认安静 ⇒ 想听清自己拉滑块。
+    // ⚠️ 0.1 ⇒ 板端实测出声峰值只有 0.025（≈ −32 dBFS）⇒ 听不见；
+    // 1% 更安静 ⇒ **听不见就调滑块**，别改默认值。
+    volume: 0.01,
     source: "live",      // live | file —— 决定滞后口径
     tts: true,           // TTS 可用吗（不可用 ⇒ 降级为仅字幕）
     status: {},          // 最近一次后端状态
@@ -798,9 +799,9 @@ const Qwen3Asr = {
     });
     $("asr-interp-volume")?.addEventListener("change", (e) => {
       // ⚠️ **别用 `|| 10` 这种写法** —— 音量 0（静音）是合法值，
-      // 兜底值应该跟默认档一致（0.5）。
+      // 兜底值应该跟默认档一致（**0.01 = 1%**，2026-11-25 用户定案）。
       const v = Number(e.target.value);
-      this._interp.volume = Number.isFinite(v) ? v / 100 : 0.5;
+      this._interp.volume = Number.isFinite(v) ? v / 100 : 0.01;
       this._interpSettings({ volume: this._interp.volume });
     });
     this._interpLoadOptions();

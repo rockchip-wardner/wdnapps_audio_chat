@@ -629,6 +629,27 @@ _TR_MAX_SENTENCE_CHARS = 60
 #: —— 两边都是「句中标点够长就断句」⇒ 句子的粒度一致。
 _TR_CLAUSE_END = ",;:，；、"
 
+# --------------------------------------------------------------------------- #
+# 快档（同传）专用
+# --------------------------------------------------------------------------- #
+#: **快档**的子句标点 —— 快档在**子句**处就切 ⇒ 比稳档（句末标点）更早出句。
+#:
+#: ⚠️ **不含顿号「、」** —— 顿号分隔的是**并列成分** ⇒ 切在那里会碎成
+#: 「苹果、香蕉、橘子」这种没法独立翻译的碎片。
+_FAST_CLAUSE_END = "，；：,;:"
+
+#: **快档**的最小切句长度（字符）—— 太碎的句子翻不准。
+_FAST_MIN_CHARS = 8
+
+#: **快档**的强制切句长度（字符）—— 比稳档的 60 短 ⇒ 更早出句 ⇒ 滞后更小。
+_FAST_MAX_CHARS = 24
+
+#: **快档**的「停顿」判据：连续多少轮 ``committed`` **没有增长** ⇒ 模型停了。
+#:
+#: ⚠️ 实时流每轮 ≈ 1 秒音频 ⇒ 2 轮 ≈ 2 秒静音（与 endpoint 的 1200 ms
+#: 同量级，但**不需要等满 1200 ms 的电平门限** ⇒ 少等半秒）。
+_FAST_PAUSE_ROUNDS = 2
+
 #: 兜底切句时，子句标点至少要在这个位置之后才认 —— 否则切出来的会是
 #: 「Hi, ok」这种两三个字的碎句（切太碎 ⇒ 译文也碎）。
 #:
@@ -1074,6 +1095,167 @@ class _SentenceSplitter:
         :meth:`_AsrManager._sent_tail_text` 算好再发给前端。
         """
         return self._done
+
+
+class _FastCommittedSegmenter:
+    """快档切句器 —— **committed 增量**驱动，**子句级**出句。
+
+    为什么不能看 ``unfixed``（滑动尾巴）
+    ------------------------------------
+    SDK 的 ``unfixed`` 是**回退窗口的滑动尾巴**（``wdnai/backends/asr.py``：
+    ``new_unfixed = round_tokens[stable_count:]`` ⇒ 每轮只保留最后
+    ``rollback_tokens`` 个 token）⇒ **连续说话时每轮都在滑动** ⇒ 任何
+    「这一轮文本没变」的判据都**永远不成立** ⇒ 老快档切句器
+    （``StablePrefixSegmenter``）在连续讲话时**一句都切不出来**：
+
+    .. code-block:: text
+
+        实测 2026-11-25：15 s 连续讲话里，前 14.34 s 零句 ⇒ 首声 17.77 s
+        （稳档同样素材 5.3 s 就出句 ⇒ 「快档」反而比「稳档」慢一倍）
+
+    ⇒ 改看 **committed 增量**：``committed`` 是**已确认**文本且**单调增长**
+    （SDK：``self.committed += delta`` ⇒ 不回滚）⇒ 每轮都能算出
+    **「这一轮新确认了多少」**：
+
+    * ``delta > 0`` ⇒ 模型还在说；
+    * ``delta == 0`` ⇒ **模型停了**（停顿 / 静音）⇒ 尾巴可以切了。
+
+    判据（优先级从高到低）
+    --------------------
+    1. **子句标点**（:data:`_FAST_CLAUSE_END`）⇒ 立即切 —— **子句级**
+       ⇒ 连续说话也能出句 ⇒ 比稳档（只认句末标点）**早**；
+    2. **句末标点**（:data:`_TR_SENTENCE_END`）⇒ 立即切；
+    3. **停顿**：连续 ``pause_rounds`` 轮 ``committed`` 没增长 ⇒ 切尾巴
+       （≥ ``min_chars``）；
+    4. **长度兜底**：pending ≥ ``max_chars`` ⇒ 软切（**不劈词**，见
+       :func:`_soft_sentence_end`）。
+
+    ⚠️ **碎片不丢**：切点太靠前（不足 ``min_chars``）⇒ **不切、不记账**
+    ⇒ 等下一轮把它带长 ⇒ 绝不会「切出两三个字」丢在中间。
+    """
+
+    def __init__(self, max_chars: int = _FAST_MAX_CHARS,
+                 min_chars: int = _FAST_MIN_CHARS,
+                 pause_rounds: int = _FAST_PAUSE_ROUNDS) -> None:
+        self._max_chars = int(max_chars or _FAST_MAX_CHARS)
+        self._min_chars = int(min_chars or 0)
+        self._pause_rounds = max(1, int(pause_rounds or 1))
+        self._done = 0        # 当前 epoch 内已切成句的字符数
+        self._last = ""       # 上一轮的 committed
+        self._idle = 0        # 连续「committed 没增长」的轮数
+        self._index = 0       # 句子序号（1 起，跨 epoch 递增）
+
+    # ------------------------------------------------------------------ #
+    def reset_request(self) -> None:
+        """**新一次识别**开始（句子序号归零）。"""
+        self._done = 0
+        self._last = ""
+        self._idle = 0
+        self._index = 0
+
+    def reset_epoch(self) -> None:
+        """**epoch 切换**（decoder 重置）—— 只清文本记账，句子序号继续。"""
+        self._done = 0
+        self._last = ""
+        self._idle = 0
+
+    # ------------------------------------------------------------------ #
+    def feed(self, committed: str, emit) -> None:
+        """喂一轮 ``committed``，切出的句子交给 ``emit(text, index, c0, c1)``。
+
+        ⚠️ 一轮里可能攒下**好几句** ⇒ 这里是**循环**，不是「一刀切一句」。
+        """
+        committed = committed or ""
+        # epoch 切换的兜底检测：decoder 重置 ⇒ committed 从头开始（变短）。
+        if len(committed) < len(self._last):
+            self.flush(emit)
+            self.reset_epoch()
+        # ⚠️⚠️ **增量信号**：这一轮 committed 比上一轮长了多少。
+        # 「没增长」= 模型这轮没吐出新 token = **停顿**（或静音）。
+        if len(committed) > len(self._last):
+            self._idle = 0
+        else:
+            self._idle += 1
+        self._last = committed
+        while True:
+            rest = committed[self._done:]
+            if not rest.strip():
+                return
+            cut = self._find_cut(rest)
+            if cut < 0:
+                return
+            sentence = rest[:cut].strip()
+            if not sentence:
+                return
+            # ⚠️ **这里不再做「太短就不切」的判断** —— 那是 :meth:`_find_cut`
+            # 的职责（它知道这个切点是**句末**（短句也是完整句）还是**子句**
+            # （太短就跳过、往后找下一个切点））⇒ 两处都判会互相打架
+            # （曾把「第一句。」这种 4 个字的完整句也挡掉 ⇒ 一句都出不来）。
+            c0 = self._done
+            self._done += cut
+            self._index += 1
+            emit(sentence, self._index, c0, self._done)
+
+    def flush(self, emit) -> None:
+        """收尾 / epoch 切换：把剩下的尾巴提交。"""
+        tail = (self._last or "")[self._done:].strip()
+        if tail:
+            self._index += 1
+            emit(tail, self._index, self._done, len(self._last))
+        self._done = len(self._last)
+
+    def done_offset(self) -> int:
+        """当前 epoch 里**已经切成句**的字符数。"""
+        return self._done
+
+    # ------------------------------------------------------------------ #
+    def _candidates(self, body: str):
+        """按位置顺序产出 ``(切点, 是不是句末标点)``。"""
+        for i, ch in enumerate(body):
+            if ch in _FAST_CLAUSE_END:
+                yield (i + 1, False)
+            elif ch in _TR_SENTENCE_END:
+                yield (i + 1, True)
+            elif ch == ".":
+                # ⚠️ 英文句点要过护栏（缩写 / 小数 / 后面还没来）⇒ 走
+                # `_ascii_sentence_end`（与稳档同一套判定 ⇒ 口径一致）。
+                cut = _ascii_sentence_end(body, i)
+                if cut > 0:
+                    yield (cut, True)
+
+    def _find_cut(self, rest: str) -> int:
+        """在 ``rest`` 里找切点（下标，相对 ``rest``）；找不到返回 -1。
+
+        规则
+        ----
+        * **句末标点** ⇒ 立即切（**不论长短** —— 一句话完整就是完整，
+          「你好。」只有 3 个字也是一句）；
+        * **子句标点** ⇒ 切，但**片段太短就跳过** ⇒ 往后找下一个切点
+          ⇒ 「Hi,」不会被单独切出去，**也不会丢** —— 它被并进下一句；
+        * 都没有 ⇒ **停顿**（``committed`` 连续 N 轮没增长）⇒ 切尾巴；
+        * 还没有 ⇒ **长度兜底**（≥ ``max_chars``）⇒ 软切（**不劈词**）。
+        """
+        # ⚠️ 去掉开头的空白 —— 上一句切完之后剩下的分隔空格。
+        lead = len(rest) - len(rest.lstrip())
+        body = rest[lead:]
+        for cut, is_sentence in self._candidates(body):
+            # 收尾的引号 / 括号跟着这一句走
+            end = cut
+            while end < len(body) and body[end] in _TR_SENTENCE_CLOSE:
+                end += 1
+            frag = body[:end].strip()
+            if is_sentence or len(frag) >= self._min_chars:
+                return _safe_cut(rest, end + lead)
+        # ⚠️ **停顿** ⇒ 切尾巴（模型停了 ⇒ 剩下的就是一句完整的话）。
+        if (self._idle >= self._pause_rounds
+                and len(rest.strip()) >= self._min_chars):
+            return len(rest)
+        # 长度兜底 ⇒ 软切（**不劈词**）。
+        if len(rest) >= self._max_chars:
+            cut = _soft_sentence_end(rest, self._max_chars)
+            if cut > 0:
+                return cut
+        return -1
 
 
 class _AsrManager:
@@ -3023,13 +3205,15 @@ class _AsrManager:
             _LOG.debug("文件路径切句失败（best-effort）: %s", exc)
         try:
             # 同传**独立**的切句器（快档用更短的强制切句长度）。
+            # ⚠️ 长度常量在**本模块**（``_FAST_MAX_CHARS``）—— 与实时流
+            # 快档切句器（``_FastCommittedSegmenter``）**共用一份** ⇒ 口径
+            # 不会漂移。
             from wdnapps_audio_chat.cards.qwen3_asr.interp import (
-                INTERP_FAST_MAX_CHARS,
                 get_interp_engine,
             )
             _eng = get_interp_engine()
             self._interp_splitter.set_max_chars(
-                INTERP_FAST_MAX_CHARS if _eng.mode == "fast" else 0)
+                _FAST_MAX_CHARS if _eng.mode == "fast" else 0)
             self._interp_splitter.feed(pub_text, self._interp_emit)
         except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
             # ⚠️ **记 WARNING 不记 DEBUG**（理由同 ``_interp_emit``）。
@@ -3321,6 +3505,11 @@ class _LiveAsrSession:
         #: ``segments=0``，译文要等到整段结束才出来 ⇒ 滞后几十秒）。
         #: ⇒ 改成「句末标点一出现就成句」⇒ 滞后 ≈ 0.5~1 s。
         self._interp_splitter = _SentenceSplitter()
+        #: **同传快档**的切句器 —— **committed 增量**驱动的**子句级**切句。
+        #:
+        #: ⚠️ **与稳档分开**（两个独立实例）—— 快档要在**子句**处就切、
+        #: 强制切句长度 24（稳档是 60）⇒ 两个口径互不干扰。
+        self._interp_fast_splitter = _FastCommittedSegmenter()
         #: 当前 SDK 会话里**有没有说过话**。
         #:
         #: 纯静音的会话，模型会吐 ``language None`` —— 那不是转写内容，
@@ -3724,30 +3913,28 @@ class _LiveAsrSession:
             self._language = lang
         self._rounds.append(frame)
         self._publish(frame)
-        # ---- 同传（快档）：把「稳定前缀」喂给同传引擎 ------------------- #
-        # ⚠️ 必须在**回看轮次过滤之后**、退化时 ``unfixed=""`` 之后 ⇒
-        # 自动继承「不播回看 / 不播胡话」。
-        try:
-            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
-                get_interp_engine,
-            )
-            get_interp_engine().on_unfixed(
-                frame["unfixed"], self._language, self.stream_id, time.time())
-        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
-            _LOG.warning("同传快档钩子失败（best-effort）: %s", exc)
-        # ---- 同传（稳档）：**标点断句** ⇒ 句末标点一出现就成句 ------- #
-        # ⚠️ 用**已确认文本**（``committed``）而不是「假设」⇒ 句子完整。
+        # ---- 同传切句：快档 / 稳档都看 **committed 增量** --------------- #
+        # ⚠️ **必须用已确认文本**（``committed``）而不是「假设」——
+        #    ``unfixed`` 是 SDK 回退窗口的**滑动尾巴**（每轮都在移）⇒
+        #    用它当稳定信号 ⇒ 连续讲话时永远切不出句（实测 14.34 s 零句）。
         # ⚠️ **不要用 endpoint** —— 它要等 1200 ms 静音 ⇒ 连续讲话时永远
-        # 不触发 ⇒ 稳档一句都出不来（用户实测：滞后 18.5 秒）。
+        #    不触发 ⇒ 一句都出不来（用户实测：滞后 18.5 秒）。
+        #
+        # 快档（:class:`_FastCommittedSegmenter`）：**子句级**切 ⇒ 更早出句；
+        # 稳档（:class:`_SentenceSplitter`）：**句末标点**切 ⇒ 句子完整。
         try:
             from wdnapps_audio_chat.cards.qwen3_asr.interp import (
                 get_interp_engine,
             )
-            if get_interp_engine().mode == "steady":
+            engine = get_interp_engine()
+            if engine.mode == "fast":
+                self._interp_fast_splitter.feed(
+                    self._committed, self._interp_fast_emit)
+            else:
                 self._interp_splitter.feed(
                     self._committed, self._interp_steady_emit)
         except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
-            _LOG.warning("同传稳档切句失败（best-effort）: %s", exc)
+            _LOG.warning("同传切句失败（best-effort）: %s", exc)
 
     def _interp_steady_emit(self, text: str, seq: int, c0: int = 0,
                             c1: int = 0) -> None:
@@ -3764,8 +3951,23 @@ class _LiveAsrSession:
         except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
             _LOG.warning("同传稳档出口失败（best-effort）: %s", exc)
 
+    def _interp_fast_emit(self, text: str, seq: int, c0: int = 0,
+                          c1: int = 0) -> None:
+        """快档切出的一句 ⇒ 交给同传引擎（``mode="fast"``）。"""
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.interp import (
+                get_interp_engine,
+            )
+            engine = get_interp_engine()
+            if not engine.running:
+                return
+            engine.on_segment(text, self._language, self.stream_id,
+                              time.time(), mode="fast")
+        except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
+            _LOG.warning("同传快档出口失败（best-effort）: %s", exc)
+
     def _interp_flush_steady(self, text: str = "") -> None:
-        """稳档收尾：把切句器里的**尾巴**（最后那句没标点的）交出去。
+        """收尾：把切句器里的**尾巴**（最后那句没标点的）交出去。
 
         ⚠️ **不能**用 ``on_endpoint(self._final_text)`` —— 那是**整个会话
         的文本** ⇒ 会把已经播过的句子**再播一遍**。
@@ -3777,11 +3979,18 @@ class _LiveAsrSession:
             engine = get_interp_engine()
             if not engine.running:
                 return
+            # ⚠️ **按当前档位**收尾 —— 快档 / 稳档用的是**两个**切句器。
+            if engine.mode == "fast":
+                if text:
+                    self._interp_fast_splitter.feed(
+                        text, self._interp_fast_emit)
+                self._interp_fast_splitter.flush(self._interp_fast_emit)
+                return
             if text:
                 self._interp_splitter.feed(text, self._interp_steady_emit)
             self._interp_splitter.flush(self._interp_steady_emit)
         except Exception as exc:  # noqa: BLE001 — 同传是 best-effort
-            _LOG.warning("同传稳档收尾失败（best-effort）: %s", exc)
+            _LOG.warning("同传收尾失败（best-effort）: %s", exc)
 
     def public_text(self) -> str:
         """这条流**当前**的公开文本（``committed`` + ``unfixed``）。

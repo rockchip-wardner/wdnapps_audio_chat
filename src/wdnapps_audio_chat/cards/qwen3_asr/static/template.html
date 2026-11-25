@@ -279,7 +279,9 @@
                 <label class="asr-file-label" for="asr-interp-speaker">音色</label>
                 <select id="asr-interp-speaker" class="tts-select"></select>
                 <label class="asr-file-label" for="asr-interp-volume">音量</label>
-                <input type="range" id="asr-interp-volume" min="0" max="100" value="50" />
+                <!-- ⚠️ **默认 1%**（2026-11-25 用户定案）—— 同传默认安静，
+                     想听清楚自己往上拉。与 `app.js` 的 `volume: 0.01` 一致。 -->
+                <input type="range" id="asr-interp-volume" min="0" max="100" value="1" />
               </div>
               <div class="asr-tr-head">
                 <button type="button" class="vd-btn vd-btn-primary" id="asr-interp-start">开始同传</button>
