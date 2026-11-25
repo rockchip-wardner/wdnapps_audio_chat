@@ -39,6 +39,12 @@
    * ------------------------------------------------------------------ */
   const SUB_MAX_VISIBLE_LINES = 3;    // 画面上最多同时显示几行
   const SUB_PREV_HOLD_SEC = 3.2;      // 上一行说完后还留多久（然后淡出）
+  //: 「当前行」判据的**边界容差**（秒）。
+  //:
+  //: 判据是「这一行的时间区间**包含**播放头」⇒ 两行相接的地方（上一行
+  //: 结束 == 下一行开始）播放头正好卡在边界上 ⇒ 不给容差的话，每一帧
+  //: 都可能判成「洞」⇒ 字幕一帧一帧地闪。
+  const SUB_CUR_TOL_SEC = 0.25;
   const SUB_MAX_LINE_COLS = 42;       // 一行最多多少「列」（CJK 占两列）
   const SUB_MIN_SOFT_CHARS = 10;      // 逗号断行至少要攒这么多字
   const SUB_MAX_LINE_SEC = 7.0;       // 一行最多跨多少秒
@@ -1683,19 +1689,46 @@ const Qwen3Asr = {
 
     // ⚠️ **当前行**用**同一个方法**算（``_curSubIndex``）—— 画面显示的是哪
     // 一行，译文就该**先要哪一行** ⇒ 两边必须一致。
-    const cur = this._curSubIndex(lines);
-    if (cur < 0) { this._subClear(sub); return; }
+    //
+    // ⚠️ 判据是「**区间包含播放头**」，不是「最后一个 start ≤ 播放头」
+    // （见 ``_curSubIndex`` 的注释）：落在时间轴的**洞**里 ⇒ 没有当前行
+    // ⇒ 画面上**不留旧行**当「当前行」。
+    const pick = this._subPick(lines, t);
+    const cur = pick.cur;
+    const prev = pick.prev;
 
     // 可见行：当前行 + 上面还没淡出的行
     //
     // ⚠️ 记的是**行号**（不是行对象）—— 找译文要靠「上一行的结束时间」
     // 定区间（见 ``_trItemsForLine``）⇒ 需要它在时间轴里的位置。
     const wantIdx = [];
-    for (let i = cur; i >= 0 && wantIdx.length < SUB_MAX_VISIBLE_LINES; i--) {
-      const ln = lines[i];
-      if (i < cur && t - ln.end > SUB_PREV_HOLD_SEC) break;
-      wantIdx.unshift(i);
+    const wantDim = [];      // 这一行是不是「已经不是当前行了」（压暗）
+    if (cur >= 0) {
+      for (let i = cur; i >= 0 && wantIdx.length < SUB_MAX_VISIBLE_LINES; i--) {
+        const ln = lines[i];
+        // ⚠️ 用 ``_subLineEnd``（不是 ``ln.end``）—— **零时长**的行
+        // （锚点表塌成一个点）也得有同样的宽限，否则它**立刻**消失。
+        if (i < cur && t - this._subLineEnd(ln) > SUB_PREV_HOLD_SEC) break;
+        wantIdx.unshift(i);
+        wantDim.unshift(false);
+      }
+    } else if (prev >= 0) {
+      // ⚠️ **洞里**（这一刻没有任何一行覆盖播放头）：当前行 = 没有。
+      //
+      // 老判据下这里是「洞前那一行」⇒ 它被当成「当前行」⇒ **永远不淡出**
+      // ⇒ 画面上钉着一句已经说完的话（实测连续段里落后最久 29.75 s；
+      // 拖动过的洞可以长达几分钟）⇒ 用户看到的就是「字幕比声音更慢」。
+      //
+      // ⇒ 现在只保留**刚说完**的那一行（还在 ``SUB_PREV_HOLD_SEC`` 的
+      //    淡出窗口里），而且它**不再是当前行**（压暗、没有当前词高亮）。
+      //    出了窗口 ⇒ 画面清空 ⇒ 屏幕上的东西永远跟得上声音。
+      const ln = lines[prev];
+      if (t - this._subLineEnd(ln) <= SUB_PREV_HOLD_SEC) {
+        wantIdx.push(prev);
+        wantDim.push(true);
+      }
     }
+    if (!wantIdx.length) { this._subClear(sub); return; }
     const want = wantIdx.map((i) => lines[i]);
 
     // 每行：已经点亮到第几个词 + 当前正在说的词 + **这一行的译文**
@@ -1703,15 +1736,19 @@ const Qwen3Asr = {
       const rv = this._revealState(ln, t);
       const trs = this._trItemsForLine(lines, wantIdx[k]);
       return { ln: ln, revealed: rv.revealed, current: rv.current,
-               trs: trs, trKey: this._trKeyOf(trs) };
+               trs: trs, trKey: this._trKeyOf(trs), dim: wantDim[k] };
     });
 
     // 签名没变 → 什么都不用动（rAF 每秒 60 次，别白折腾 DOM）
     //
     // ⚠️ 签名里**必须含译文** —— 译文是**异步**到的（要等模型翻完），
     // 到了之后这一行的内容变了 ⇒ 签名得变 ⇒ DOM 得重画。
+    //
+    // ⚠️ 签名里**必须含 dim** —— 「这一行已经不是当前行了」（洞里的
+    // 残留行）只改**透明度**，别的字段可能都没变 ⇒ 不进签名 ⇒ 透明度
+    // 改不动 ⇒ 那行还是「当前行」的样子（满亮度 + 当前词高亮）。
     const sig = states.map((s) => s.ln.id + ":" + s.revealed + ":" + s.current
-                            + ":" + s.trKey).join(";");
+                            + ":" + s.trKey + ":" + (s.dim ? 1 : 0)).join(";");
     if (sig === this._subSig) return;
     this._subSig = sig;
 
@@ -1728,8 +1765,12 @@ const Qwen3Asr = {
       }
       slot.el.style.visibility = "visible";
       // 越旧越淡（当前行最亮）
+      //
+      // ⚠️ ``dim`` = 这一行**已经不在当前行了**（落在时间轴的洞里）
+      // ⇒ 压到跟「上一行」一样的亮度，别让它看起来像正在被说。
       const age = n - 1 - (i - offset);
-      slot.el.style.opacity = age === 0 ? "1" : (age === 1 ? "0.7" : "0.42");
+      slot.el.style.opacity = st.dim ? "0.7"
+                            : (age === 0 ? "1" : (age === 1 ? "0.7" : "0.42"));
       if (slot.id !== st.ln.id) {
         slot.id = st.ln.id;
         slot.orig.innerHTML = "";
@@ -1838,12 +1879,15 @@ const Qwen3Asr = {
     const video = document.getElementById("asr-video");
     const t = (video ? (video.currentTime || 0) : 0) - (this._audioOriginSec || 0);
 
-    // 当前行 = 最后一个「开始时间 ≤ 播放头」的行
-    let cur = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].start <= t) cur = i; else break;
-    }
-    this._transcriptPaint(lines, cur, t, rebuilt);
+    // ⚠️ **当前行**必须跟画面字幕用**同一份判据**（``_curSubIndex``）——
+    // 两边各写一份的话，早晚会对不上（这里是曾经就有过的那份 inline 副本）。
+    //
+    // 判据 = 「时间区间**包含**播放头」；落在时间轴的**洞**里 ⇒ 没有当前行
+    // ⇒ 转写框里也不该有一行被标成「当前」（见 ``_curSubIndex``）。
+    const pick = this._subPick(lines, t);
+    const cur = pick.cur;
+    const prev = pick.prev;
+    this._transcriptPaint(lines, cur, prev, t, rebuilt);
     this._transcriptScroll(cur);
   },
 
@@ -1903,14 +1947,21 @@ const Qwen3Asr = {
    * 下标全变了 → 得**全量**刷一遍状态，否则会出现「已经说过的行还
    * 标着未来（压暗）」的错位。
    */
-  _transcriptPaint(lines, cur, t, full) {
+  _transcriptPaint(lines, cur, prev, t, full) {
     const rows = this._trRows;
     if (!rows.length) return;
-    const lo = full ? 0 : Math.min(cur, this._trCur);
-    const hi = full ? rows.length - 1 : Math.max(cur, this._trCur);
+    // 「过去 / 未来」的分界：洞里（``cur < 0``）没有当前行 ⇒ 用「最后一行
+    // **已经开始过**」的行（``prev``）当分界。
+    const mark = cur >= 0 ? cur : prev;
+    const lo = full ? 0 : Math.min(mark, this._trCur);
+    const hi = full ? rows.length - 1 : Math.max(mark, this._trCur);
     for (let i = lo; i <= hi; i++) {
       if (i < 0 || i >= rows.length) continue;
-      const st = i < cur ? "past" : (i === cur ? "current" : "future");
+      // ⚠️ 洞里（``cur < 0``）⇒ **没有任何一行是「当前行」** ⇒ 已经说过的
+      // 那几行算「过去」；别把它标成「未来」（它明明已经说完了）。
+      const st = (cur >= 0)
+        ? (i < cur ? "past" : (i === cur ? "current" : "future"))
+        : (i <= mark ? "past" : "future");
       this._transcriptSetState(rows[i], st);
     }
     // 当前行：逐词点亮 + 当前词高亮（与画面字幕同一份算法）
@@ -2616,21 +2667,78 @@ const Qwen3Asr = {
   },
 
   /**
-   * **当前行**的下标 = 最后一个「开始时间 ≤ 播放头」的行。
+   * 一行的**有效结束时间**。
    *
-   * ⚠️ 与画面字幕的取行判据**必须是同一份** —— 字幕显示的是哪一行，译文
-   * 就该先要哪一行 ⇒ 抽成一个方法，两边共用。
+   * ⚠️ 有些行会塌成**零时长**（``start == end``）：模型的锚点表整段只剩
+   * 一个点时（见 :meth:`_epochTable`），这一段的所有词都拿到同一个时间
+   * ⇒ 行的开始和结束是同一个数。
+   *
+   * 实测：视频第 35~65 s 那一段的整段文本只有「有风。」三个字，锚点表
+   * 只有一条 ⇒ 这一行是 ``[36.02, 36.02]``。
+   *
+   * ⇒ 判「区间包含播放头」时必须给它一个**最小占位**，否则这一行
+   * **永远不会被显示**（没有任何播放头能落进 ``[36.02, 36.02]``）。
    */
-  _curSubIndex(lines) {
-    if (!lines || !lines.length) return -1;
-    const video = document.getElementById("asr-video");
-    if (!video) return -1;
-    const t = (video.currentTime || 0) - (this._audioOriginSec || 0);
-    let cur = -1;
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].start <= t) cur = i; else break;
+  _subLineEnd(ln) {
+    const s = (ln && ln.start) || 0;
+    const e = ln && ln.end;
+    if (typeof e !== "number" || !isFinite(e)) return s + SUB_MIN_LINE_SEC;
+    return e > s ? e : s + SUB_MIN_LINE_SEC;
+  },
+
+  /**
+   * 一次扫描同时算出两件事：
+   *   * ``cur``  —— **区间包含播放头**的那一行（落在洞里 = -1）；
+   *   * ``prev`` —— 最后一行「已经开始过」的行（洞里 = 洞**前**那一行）。
+   *
+   * ``prev`` 是给「洞里还能显示什么」用的：洞里没有当前行，但**刚说完**
+   * 的那一行还应该按 ``SUB_PREV_HOLD_SEC`` 淡出，而不是立刻消失。
+   */
+  _subPick(lines, t) {
+    const out = { cur: -1, prev: -1 };
+    if (!lines || !lines.length) return out;
+    if (t === undefined || t === null) {
+      const video = document.getElementById("asr-video");
+      if (!video) return out;
+      t = (video.currentTime || 0) - (this._audioOriginSec || 0);
     }
-    return cur;
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i];
+      const s = ln.start;
+      // 后面的行只会更晚 ⇒ 到这儿就没必要再看了
+      if (s > t + SUB_CUR_TOL_SEC) break;
+      if (s <= t) out.prev = i;
+      const e = this._subLineEnd(ln);
+      // 区间包含播放头（两端各留一点容差）
+      if (t >= s - SUB_CUR_TOL_SEC && t <= e + SUB_CUR_TOL_SEC) out.cur = i;
+      // ⚠️ 多个候选时**后一个覆盖前一个** ⇒ 取「开始时间最近」的那行
+      // （两行相接处提前 0.25 s 换行 ⇒ 不会闪）。
+    }
+    return out;
+  },
+
+  /**
+   * **当前行**的下标 = 时间区间**包含播放头**的那一行。
+   *
+   * ⚠️ 判据**不是**「最后一个 ``start ≤ 播放头`` 的行」—— 那个判据在
+   * 时间轴上有**洞**的时候，会把**洞之前**的那一行永远钉在屏幕上。
+   *
+   * 实测（98 分钟对谈视频，**剔掉拖动造成的洞**之后的连续识别段）：
+   *   * 每个 epoch 的边界都有约 **2 s** 的洞（服务端把每段的首尾各
+   *     丢掉了 1 秒，见 ``_epochTable``）；
+   *   * 偶尔整段塌掉（锚点表只剩一个点）⇒ 那一段有 **7~9 s** 没有字幕；
+   *   * 老判据下画面上那行「落后」最久 **29.75 s**（开头 171 s 那一段里
+   *     **23.1%** 的时间落后超过 1 秒）；另一段 59 s 的最久 **8.02 s**、
+   *     占 **14.2%**；干净的长段（1000 s / 601 s）几乎为零。
+   *
+   * ⇒ 用户看到的现象就是「字幕比声音更慢」：画面上钉着一句**已经说完**
+   * 的话，声音早就走到别处去了。
+   *
+   * ⇒ 现在改成「**这一刻**该显示哪一行」：区间包含播放头的那一行；
+   * 落在洞里 ⇒ **没有当前行**（由调用方决定淡出还是清空）。
+   */
+  _curSubIndex(lines, t) {
+    return this._subPick(lines, t).cur;
   },
 
   /** 一行属于哪个 epoch（行 id 的第一段就是 epoch 下标）。 */
