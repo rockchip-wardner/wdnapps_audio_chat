@@ -1893,6 +1893,27 @@ class InterpEngine:
         seg.translated_at = time.time()
         seg.infer_sec = _infer_total
         seg.attempts = attempt
+        # ⚠️ **成句的「原文 + 译文」广播**（2026-11-25）——
+        #
+        # 为什么要**单独一帧**：已有的两帧都带不全信息 ——
+        #   * ``interp_segment`` 是**入队时**发的 ⇒ 只有原文，译文还没算；
+        #   * ``interp_spoken`` 是**播完时**发的 ⇒ 译文被截到 80 字。
+        # ⇒ 前端**没有任何一帧**能拿到「这一句的完整译文」⇒ 同传的结果
+        # **没法列出来**（面板上只有一句状态行，用户看不到说了什么）。
+        #
+        # ⇒ 这里补一帧：原文 + **完整**译文 + 时间码 ⇒ 前端可以在页面底部
+        # 列出「一句一句的同传结果」（四种来源统一）。
+        self._broadcast({
+            "type": "interp_translated",
+            "index": seg.index,
+            "source": seg.origin,
+            "text": seg.text,
+            "tr": seg.translated,
+            "lang": seg.lang,
+            "mode": seg.mode,
+            "start_sec": seg.src_start_sec,
+            "end_sec": seg.src_end_sec,
+        })
         # ⚠️ **计时记录在这里就建好**（不等放行）⇒ 放行器压住的那段
         # 也能被看见（否则「翻译完了但迟迟不出声」会看不到放行耗时）。
         seg.timing = {
