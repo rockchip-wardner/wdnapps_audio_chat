@@ -444,9 +444,12 @@
  * 那些缩进与换行会**渲染成空行**（实测：结果框顶部凭空多出 ~110 px 空白）。
  *
  * 视频来源早就处理过（见上面的 `.asr-live.asr-live-video`）—— 现在
- * 「音频文件」与「麦克风」两个框里装的也是逐块排版的内容 ⇒ 一并处理。 */
+ * 「音频文件」与「麦克风」两个框里装的也是逐块排版的内容 ⇒ 一并处理。
+ *
+ * ⚠️ **2026-11-25**：麦克风的句子流搬到了页面底部 ⇒ 它现在装在
+ * `#asr-live` 里 ⇒ 要的是 `.asr-live.asr-live-mic`（不再是 `#asr-rt-text`）。 */
 .asr-live.asr-live-file,
-#asr-rt-text {
+.asr-live.asr-live-mic {
   white-space: normal;
 }
 
@@ -703,4 +706,49 @@
 .asr-sent-live {
   color: #1d4ed8;
   line-height: 1.55;
+}
+
+/* ------------------------------------------------------------------ *
+ * 同传结果（页面底部，2026-11-25）
+ *
+ * 同传的**逐句**结果：一句一句，**原文 + 译文成对** —— 复用句子流那套
+ * 排版（``.asr-sent`` / ``.asr-sent-src`` / ``.asr-sent-dst``）⇒
+ * 「实时翻译」与「同传」两种结果**读法一致**，都在页面底部。
+ * ------------------------------------------------------------------ */
+.asr-interp-out {
+  margin-top: 10px;
+  padding: 8px 12px 10px;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  background: #f4fbf6;
+}
+
+.asr-interp-out-cap {
+  font-size: 0.85rem;
+  color: var(--muted, #6b7280);
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px dashed var(--border, #e5e7eb);
+}
+
+/* ⚠️ **限高 + 框内滚** —— 同传会一直产生句子（长音频几千句）⇒ 不限高
+   的话整页被顶到几千行 ⇒ 用户找不到别的控件（同 ``.asr-transcript-body``）。 */
+#asr-interp-list {
+  max-height: min(20rem, 36vh);
+  overflow-y: auto;
+}
+
+/* 「已播报 / 未播出」的角标 —— 挂在每句的右上角 */
+.asr-interp-sent {
+  position: relative;
+}
+
+.asr-interp-tag {
+  position: absolute;
+  top: 0;
+  right: 0;
+  font-size: 0.75rem;
+  color: var(--muted, #6b7280);
+  background: rgba(255, 255, 255, 0.75);
+  padding: 0 4px;
 }

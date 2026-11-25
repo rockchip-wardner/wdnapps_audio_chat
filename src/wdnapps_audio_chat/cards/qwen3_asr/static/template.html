@@ -154,7 +154,7 @@
               <section class="asr-block asr-live-block hidden" id="asr-live-block">
                 <header class="asr-block-head">
                   <h4>实时识别</h4>
-                  <span class="asr-block-hint">对着麦克风说话，识别结果实时刷新；停一段后会自动分成一句一句。</span>
+                  <span class="asr-block-hint">对着麦克风说话，识别结果实时刷新（显示在页面底部的「实时结果」框里）；停一段后会自动分成一句一句。</span>
                 </header>
 
                 <!-- ③ 板载麦克风（设备端 ALSA，独立进程采集） -->
@@ -190,17 +190,17 @@
                   <div class="asr-hint hidden" id="asr-mic-hint"></div>
                 </div>
 
-                <div class="asr-live" id="asr-rt-text">
+                <!--
+                  ⚠️ 这里只剩两个「镜像」span（回归脚本从
+                  ``#asr-rt-committed`` 读文本）⇒ **整块由 CSS 藏起来**。
+
+                  句子流（麦克风来源）在 **2026-11-25** 搬到了页面底部的
+                  「实时结果」框里（``#asr-rt-sentences``）⇒ 四种来源的
+                  **实时翻译结果**从同一个地方看。
+                -->
+                <div class="asr-live hidden" id="asr-rt-text">
                   <span class="asr-live-committed" id="asr-rt-committed"></span><span
                         class="asr-live-unfixed" id="asr-rt-unfixed"></span>
-                  <!--
-                    句子流（麦克风来源）—— 一句一句，**原文 + 译文成对**。
-
-                    ⚠️ 那两个 span 只是「镜像」（回归脚本从
-                    ``#asr-rt-committed`` 读文本）⇒ 由 CSS 藏起来 —— 显示
-                    的是下面这个句子流（同一段内容不出现两遍）。
-                  -->
-                  <div class="asr-sentences" id="asr-rt-sentences"></div>
                 </div>
 
                 <div class="asr-live-gap hidden" id="asr-live-gap">⚠ 有音频丢失，识别结果可能有缺口</div>
@@ -290,7 +290,7 @@
                 <span class="asr-live-status" id="asr-interp-status">同传未开启</span>
               </div>
               <div class="asr-tr-note" id="asr-interp-hint">
-                同传把识别结果翻译后从板载扬声器播报。一句话都不会丢。
+                同传把识别结果翻译后从板载扬声器播报。一句话都不会丢（逐句结果见页面底部）。
               </div>
             </div>
 
@@ -357,10 +357,45 @@
                 显示的是下面这个句子流（同一段内容不出现两遍）。
               -->
               <div class="asr-sentences hidden" id="asr-sentences"></div>
+              <!--
+                句子流（**麦克风**来源，板载麦 / 浏览器麦）—— 同样是
+                **原文 + 译文成对**。
+
+                ⚠️ **2026-11-25 搬到页面底部** —— 原来它在上面的「实时识别」
+                块里 ⇒ 同一份「实时翻译结果」在**麦克风来源**下显示在页面
+                中部、在**文件 / 视频**来源下显示在底部 ⇒ 四种来源**位置
+                不一致** ⇒ 用户得先看来源才知道去哪找译文。
+
+                ⇒ 现在**四种来源的实时翻译结果都在这个框里**（同一时刻只有
+                一个可见，由 ``app.js`` 的 ``_syncSourceUi`` 切换）。
+              -->
+              <div class="asr-sentences hidden" id="asr-rt-sentences"></div>
               <div class="asr-transcript hidden" id="asr-transcript">
                 <div class="asr-transcript-cap">字幕文本 · 与画面字幕同步，可上拉回看</div>
                 <div class="asr-transcript-body" id="asr-transcript-body"></div>
               </div>
+            </div>
+
+            <!--
+              同传结果（2026-11-25）
+              ==========================
+              **同传**（ASR → 翻译 → TTS 播报）的**逐句结果**。
+
+              ⚠️ 为什么要新加这一栏：同传**本来没有任何结果列表** ——
+              前端只收 ``interp_segment``（入队，只有原文）与
+              ``interp_spoken``（播完，译文截到 80 字）⇒ 页面上只有**一句
+              状态行**（「正在播报 · 可听滞后 3.2 秒」），**看不到说了什么**。
+
+              ⇒ 后端补了一帧 ``interp_translated``（原文 + **完整**译文）⇒
+              这里一句一句列出来，**四种来源统一**（都在页面底部）。
+
+              ⚠️ 它是 ``#asr-live`` 的**兄弟**而不是儿子 —— 「显示模式」切到
+              「识别过程」时 ``#asr-live`` 会藏起来，但**同传还在跑** ⇒ 结果
+              不该跟着藏。
+            -->
+            <div class="asr-interp-out hidden" id="asr-interp-out">
+              <div class="asr-interp-out-cap">同传结果 · 一句一句（原文 / 译文）</div>
+              <div class="asr-sentences" id="asr-interp-list"></div>
             </div>
 
             <!-- 模式二：逐轮明细（对应 C demo 的默认输出） -->

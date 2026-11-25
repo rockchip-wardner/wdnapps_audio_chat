@@ -538,6 +538,11 @@ const Qwen3Asr = {
     wizardOn: false,      // 向导里勾了「开启同声传译」
     wizardLang: "",       // 向导里选的朗读语言（"" = 跟随翻译目标语言）
     wizardVoice: "",      // 向导里选的音色（"kind:id"，kind = ref | builtin）
+    // ---- 同传的逐句结果（2026-11-25 新增）----
+    // ⚠️ **Map 而不是数组** —— 查找要按 ``index``（后端给的句号）⇒ 数组
+    //    查找是 O(n) ⇒ 长音频几千句时每来一帧都要扫一遍 ⇒ O(n²)。
+    //    Map 既有 O(1) 查找，又**保序**（插入顺序 = 到达顺序）。
+    segs: new Map(),      // index → {index, text, tr, lang, start, end, spoken, err}
   },
 
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
@@ -2388,19 +2393,29 @@ const Qwen3Asr = {
       startBtn.disabled = !this._isFileSource() || !this._hasSource()
         || this._busy() || this._starting;
     }
-    // ⚠️ **结果框画什么** —— 三种来源三个框：
+    // ⚠️ **结果框画什么** —— 三种来源三个框（都在**页面底部**）：
     //   * 音频文件 ⇒ 「句子流」（原文 + 译文成对），见 `#asr-sentences`；
     //   * 含音轨的视频 ⇒ 「字幕同款转写框」（见 `#asr-transcript`）；
-    //   * 实时（麦克风）⇒ 实时区块自己的框（`#asr-rt-text`）⇒ 这里空的。
+    //   * 实时（麦克风）⇒ 句子流（见 `#asr-rt-sentences`）。
+    //
+    // ⚠️ **三个框都在底部，但同一时刻只显示一个** —— 否则文件来源的句子
+    // 会和麦克风来源的句子挤在一起（用户实测：「每个句子显示两遍」）。
     //
     // `asr-live-file` 这个类用来**藏起那两个「镜像」span**（连续文本）——
     // 否则句子流与连续文本在同一个框里出现两遍。
     const liveBox = $("asr-live");
     if (liveBox) {
       liveBox.classList.toggle("asr-live-file", this._source === "file");
+      // ⚠️ **麦克风来源的排版** —— 它现在也用句子流（不是连续文本）⇒
+      // 那个框也要 `white-space: normal`（见 app.css）。
+      liveBox.classList.toggle("asr-live-mic", !this._isFileSource());
     }
     const sents = $("asr-sentences");
     if (sents) sents.classList.toggle("hidden", this._source !== "file");
+    // ⚠️ **麦克风的句子流（2026-11-25）** —— 它从「实时识别」块搬到了
+    // 页面底部 ⇒ **不再跟着那一整块一起隐藏** ⇒ 必须**单独**管显隐。
+    const rtSents = $("asr-rt-sentences");
+    if (rtSents) rtSents.classList.toggle("hidden", this._isFileSource());
   },
 
   /** 当前来源是不是「文件 / 视频」（决定「开始识别」按钮是否可用）。 */
@@ -4411,6 +4426,9 @@ const Qwen3Asr = {
     this._trRender();
     // ⚠️ **句子流也清** —— DOM 与状态一起清（见 ``_sentClear``）。
     this._sentClear();
+    // ⚠️ **同传结果也清**（2026-11-25）—— 「清空」= 把页面上的结果
+    // 全部清掉 ⇒ 底部那一栏同传结果也得跟着清（不然它还在长）。
+    this._interpClearSegs();
     this._trSyncUi();
     this._audioOriginSec = 0;
     this._subInvalidate();
@@ -5020,6 +5038,9 @@ const Qwen3Asr = {
       if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
       this._interp.running = true;
       this._interp.status = data;
+      // ⚠️ **新一轮同传 ⇒ 底部结果列表清空**（2026-11-25）——
+      // 两轮的结果混在一起 ⇒ 用户分不清哪句是哪轮的。
+      this._interpClearSegs();
       this._interpSyncUi();
       this._interpStartPlayhead();
       this._interpPoll();
@@ -5180,7 +5201,7 @@ const Qwen3Asr = {
     }
     if (hint) {
       const src = this._source || "file";
-      let text = "同传把识别结果翻译后从板载扬声器播报。一句话都不会丢。";
+      let text = "同传把识别结果翻译后从板载扬声器播报。一句话都不会丢（逐句结果见页面底部）。";
       if (this._interp.running) {
         if (src === "board" || src === "browser") {
           text = "实时流：说完一句即译即播。";
@@ -5210,6 +5231,135 @@ const Qwen3Asr = {
         }
       }
       hint.textContent = text;
+    }
+  },
+
+  /* ---------------- 同传结果列表（页面底部，2026-11-25） ---------------- */
+  /**
+   * 收下一句同传结果（原文 / 译文）。
+   *
+   * ⚠️ **为什么需要它**：同传**本来没有任何结果列表** ——
+   * ``interp_segment`` 是**入队时**的帧（只有原文，译文还没算）、
+   * ``interp_spoken`` 是**播完时**的帧（译文被后端截到 80 字）⇒ 页面上
+   * 只有一句状态行（「正在播报 · 可听滞后 3.2 秒」），**看不到说了什么**。
+   *
+   * ⇒ 后端补了 ``interp_translated``（原文 + **完整**译文）⇒ 这里把两句
+   * 合成一行（``index`` 相同 ⇒ 同一句），画在页面底部。
+   */
+  _interpSegUpsert(patch) {
+    const segs = this._interp.segs;
+    const idx = Number(patch.index) || 0;
+    // ⚠️ **句号从 1 开始**（后端 ``_next_index``）⇒ 0 = 「没带句号」⇒
+    // 不建行（不然会多出一行没有句子的空行）。
+    if (!idx) return;
+    let it = segs.get(idx);
+    if (!it) {
+      it = { index: idx, text: "", tr: "", lang: "",
+             start: 0, end: 0, spoken: false, err: "" };
+      segs.set(idx, it);
+    }
+    if (patch.text) it.text = patch.text;
+    if (patch.tr) it.tr = patch.tr;
+    if (patch.lang) it.lang = patch.lang;
+    if (patch.start !== undefined) it.start = patch.start;
+    if (patch.end !== undefined) it.end = patch.end;
+    // ⚠️ **只画这一行** —— 每来一句就重画整张表 ⇒ 长音频（几千句）就是
+    // O(n²) ⇒ 浏览器主线程被占死（同 ``_renderRounds`` 的教训）。
+    this._interpSegPaint(it);
+    this._interpRenderSegs();
+  },
+
+  /** 按 index 找一句（同传结果列表用）。 */
+  _interpSegFind(index) {
+    return this._interp.segs.get(Number(index) || 0) || null;
+  },
+
+  /**
+   * 清空同传结果列表（**状态与 DOM 一起清**）。
+   *
+   * ⚠️ DOM 的行缓存挂在元素上（增量渲染用）⇒ 只清 Map 不清 DOM ⇒ 下一轮
+   * 的句子会**接着**上一轮往下画（同 ``_sentClear`` 的教训）。
+   */
+  _interpClearSegs() {
+    this._interp.segs.clear();
+    const box = document.getElementById("asr-interp-list");
+    if (box) {
+      if (box._interpRows) {
+        box._interpRows.forEach((row) => row.remove());
+        box._interpRows.clear();
+      }
+      box.innerHTML = "";
+    }
+    const wrap = document.getElementById("asr-interp-out");
+    if (wrap) wrap.classList.add("hidden");
+  },
+
+  /**
+   * 画「同传结果」列表的**外壳**（有没有内容 ⇒ 显不显）。
+   *
+   * ⚠️ **不重画行** —— 每一行由 :meth:`_interpSegPaint` **单独**更新 ⇒
+   * 加一句只动一个节点（同 ``_renderRounds`` 的增量规矩）。
+   */
+  _interpRenderSegs() {
+    const box = document.getElementById("asr-interp-list");
+    if (!box) return;
+    const wrap = document.getElementById("asr-interp-out");
+    const segs = this._interp.segs;
+    if (wrap) wrap.classList.toggle("hidden", segs.size === 0);
+    // ⚠️ **有同传结果 ⇒ 「还没有识别结果」的占位就该让位** ——
+    // 只**藏**不**显**（显的那一头由 ``_applySnapshot`` 管 ⇒ 两边不打架）。
+    const empty = document.getElementById("asr-empty");
+    if (empty && segs.size > 0) empty.classList.add("hidden");
+    // 新句子在下面 ⇒ 滚到底（跟句子流一个习惯）。
+    box.scrollTop = box.scrollHeight;
+  },
+
+  /**
+   * 画**一句**同传结果（原文 / 译文 / 状态）。
+   *
+   * ⚠️ **增量** —— 新句才建节点，老句只更新译文那一行。
+   */
+  _interpSegPaint(it) {
+    const box = document.getElementById("asr-interp-list");
+    if (!box || !it) return;
+    if (!box._interpRows) box._interpRows = new Map();
+    const rows = box._interpRows;
+    let row = rows.get(it.index);
+    if (!row) {
+      row = document.createElement("div");
+      row.className = "asr-sent asr-interp-sent";
+      const src = document.createElement("div");
+      src.className = "asr-sent-src";
+      const dst = document.createElement("div");
+      dst.className = "asr-sent-dst";
+      const tag = document.createElement("span");
+      tag.className = "asr-interp-tag";
+      row.appendChild(src);
+      row.appendChild(dst);
+      row.appendChild(tag);
+      box.appendChild(row);
+      rows.set(it.index, row);
+    }
+    const src = row.querySelector(".asr-sent-src");
+    const dst = row.querySelector(".asr-sent-dst");
+    const tag = row.querySelector(".asr-interp-tag");
+    if (src && src.textContent !== (it.text || "")) {
+      src.textContent = it.text || "";
+    }
+    // ⚠️ **译文还没来 ⇒ 占一行「翻译中」**（跟实时翻译的句子流同口径）
+    let txt = it.tr || "";
+    let muted = false;
+    if (!txt) {
+      txt = it.err ? ("（" + it.err + "）") : "翻译中";
+      muted = true;
+    }
+    if (dst && dst.textContent !== txt) dst.textContent = txt;
+    if (dst) dst.classList.toggle("is-muted", muted);
+    if (tag) {
+      // ⚠️ 板端**没有符号字体** ⇒ 只用文字，不用 ✓ / ● 之类。
+      const t = it.err ? "未播出" : (it.spoken ? "已播报" : "");
+      if (tag.textContent !== t) tag.textContent = t;
+      tag.classList.toggle("hidden", !t);
     }
   },
 
@@ -5622,19 +5772,51 @@ const Qwen3Asr = {
         break;
       }
       case "interp_segment": {
-        // 成句（还没播）—— 面板上记一句。
+        // 成句（还没播）—— 面板上记一句 + **页面底部**列一行（原文 + 占位）。
         this._interp.lastSegment = msg;
+        this._interpSegUpsert({
+          index: Number(msg.index) || 0,
+          text: msg.text || "",
+          lang: msg.lang || "",
+          start: Number(msg.start_sec) || 0,
+          end: Number(msg.end_sec) || 0,
+        });
+        break;
+      }
+      case "interp_translated": {
+        // ⚠️ **译文回来了（完整译文）** —— 后端 2026-11-25 新增的一帧。
+        // 之前没有这一帧 ⇒ 前端拿不到完整译文 ⇒ 同传**没法列结果**。
+        this._interpSegUpsert({
+          index: Number(msg.index) || 0,
+          text: msg.text || "",
+          tr: msg.tr || "",
+          lang: msg.lang || "",
+          start: Number(msg.start_sec) || 0,
+          end: Number(msg.end_sec) || 0,
+        });
         break;
       }
       case "interp_spoken": {
         // 播完一句。
         this._interp.lastSpoken = msg;
+        // ⚠️ 标「已播报」（结果列表里能看出播到哪了）。
+        const seg = this._interpSegFind(msg.index);
+        if (seg && !seg.spoken) {
+          seg.spoken = true;
+          this._interpSegPaint(seg);
+        }
         break;
       }
       case "interp_error": {
         const hint = document.getElementById("asr-interp-status");
         if (hint && msg.reason) {
           hint.textContent = "同传提示：" + msg.reason;
+        }
+        // ⚠️ **这一句失败了 ⇒ 在结果列表里标出来**（别让用户以为还在等）。
+        const seg = this._interpSegFind(msg.index);
+        if (seg) {
+          seg.err = msg.reason || "翻译失败";
+          this._interpSegPaint(seg);
         }
         break;
       }
