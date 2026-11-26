@@ -117,6 +117,26 @@
    */
   const TR_REQ_STALE_MS = 5000;
 
+  /**
+   * **同一行最多重试几次**（2026-11-26）。
+   *
+   * ⚠️ **为什么必须封顶**（实测用户那一轮的行级翻译日志）：重试是
+   * **每 5 秒一次、无上限** ⇒ 一句**翻不出来**的字幕（模型复读指令 /
+   * 复读原文）⇒ 被**无限重试** ⇒ 实测**同 7 句话**被重试了**几百次**
+   * （「Translate the following text from zh to en:」**338** 次 /
+   *  「己的概括能力。」**174** 次 / 「徐老师。」**158** 次…）⇒
+   * ⇒ 每次都是**一次真推理** ⇒ **翻译模型的算力全烧在这 7 句上**
+   * ⇒ ⇒ ASR/TTS 抢不到算力 ⇒ **译文越落越远** ⇒ 音频跟不上字幕。
+   *
+   * ⇒ 封顶：同一行重试 **3** 次就不再来（那行保留原文，显示为「没翻出来」）。
+   * ⇒ **用户想再试**：把「实时翻译」关掉再打开 ⇒ 记账清零 ⇒ 重新要一遍
+   * （见 ``_trLineReq.clear()``）。
+   *
+   * ⚠️ 服务端那边还有**第二道闸**（负缓存，同一句 300 s 内不烧推理）⇒
+   * 两道闸都在 ⇒ 前端的重试**不会**变成算力消耗。
+   */
+  const TR_REQ_MAX_ATTEMPTS = 3;
+
   /* ------------------------------------------------------------------ *
    * 翻译目标语言：**中文名 + 本族名**（跟右上角「简体中文」下拉一个排法）
    *
@@ -539,6 +559,8 @@ const Qwen3Asr = {
     lastFailed: false,   // 上次上报的「媒体出错」
     timer: null,         // 状态轮询的定时器
     streamId: "",        // 当前流 id（播放头按流上报）
+    clientId: "",        // **标签页 id**（2026-11-25）—— 见 _interpClientId()
+    phIgnored: false,   // 服务端说这个标签页的播放头**被忽略**了（不是发起方）
     audioSrc: "",        // 音频播放器的当前 src（换了才 reload）
     // 媒体**为什么没在放**（空 = 没有已知原因）——
     // ⚠️ 面板提示每秒被 _interpSyncUi() 刷一遍 ⇒ 光在 play() 的
@@ -556,6 +578,12 @@ const Qwen3Asr = {
     //    查找是 O(n) ⇒ 长音频几千句时每来一帧都要扫一遍 ⇒ O(n²)。
     //    Map 既有 O(1) 查找，又**保序**（插入顺序 = 到达顺序）。
     segs: new Map(),      // index → {index, text, tr, lang, start, end, spoken, err}
+    // ⚠️⚠️ **「当前正在播报的那一句」**（2026-11-25，用户要「显示当前正在
+    // 播放的同传结果」）—— 由**播放头**算出（``_interpSyncCurrent``）⇒
+    // 列表**跟字幕节奏走** ⇒ 高亮 + 滚动到它。
+    curSeg: null,        // 当前那一句（对象）
+    follow: true,        // 还跟着播放头滚吗（用户手动上翻 ⇒ false）
+    autoAt: 0,           // 自己最后一次滚动的时刻（判「用户滚的」）
   },
 
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
@@ -761,6 +789,16 @@ const Qwen3Asr = {
         this._trRender();
         this._renderVideoSubtitle();
         this._renderTranscript();
+      } else {
+        // ⚠️⚠️ **重新打开 ⇒ 重试次数清零**（2026-11-26）——
+        //
+        // 之前翻不出来的那几行（模型复读指令 / 复读原文）已经被
+        // :data:`TR_REQ_MAX_ATTEMPTS` 封顶 ⇒ 不再自动重试 ⇒
+        // ⇒ 用户手动「关掉再打开」= **显式地说「再试一遍」** ⇒
+        // ⇒ 给它们**再试一次**的机会（译文还在，只是重试次数归零）。
+        this._trLineReq.forEach((req, slot) => {
+          this._trLineReq.set(slot, { text: req.text, at: 0, tries: 1 });
+        });
       }
       this._trSet({ enabled: on });
     });
@@ -866,6 +904,13 @@ const Qwen3Asr = {
     const trBody = $("asr-transcript-body");
     if (trBody) {
       trBody.addEventListener("scroll", () => this._onTranscriptScroll());
+    }
+
+    // ⚠️ **同传结果列表的滚动**（2026-11-25）—— 同理：用户上翻回看 ⇒
+    // 暂停跟随播放头（别把人拽走）⇒ 滚回来再恢复。
+    const interpList = $("asr-interp-list");
+    if (interpList) {
+      interpList.addEventListener("scroll", () => this._onInterpScroll());
     }
 
     this._bindLiveGuards();
@@ -2001,7 +2046,11 @@ const Qwen3Asr = {
       // ``_roundsSource`` 把关（见 ``_renderVideoSubtitle``）。
       live.classList.toggle("asr-live-notfile", !this._isFileSource());
     }
-    box.classList.toggle("hidden", !isVideo);
+    // ⚠️⚠️ **显隐统一走 ``_syncResultBoxes``**（2026-11-25 合并）——
+    // 这个框**每次 timeupdate 都会被重画** ⇒ 在这里直接 toggle 会把
+    // 「同传有内容 ⇒ 藏掉实时结果」那条**合并规则覆盖掉** ⇒ 两个列表
+    // 又同时出现 ⇒ 同一批句子显示两遍。
+    this._syncResultBoxes();
     if (!isVideo) { this._transcriptClear(); return; }
 
     const tl = this._buildSubTimeline();
@@ -2440,6 +2489,11 @@ const Qwen3Asr = {
     // 页面底部 ⇒ **不再跟着那一整块一起隐藏** ⇒ 必须**单独**管显隐。
     const rtSents = $("asr-rt-sentences");
     if (rtSents) rtSents.classList.toggle("hidden", this._isFileSource());
+    // ⚠️⚠️ **合并规则**（2026-11-25）—— 同传在跑 ⇒ 只留「同传结果」一个
+    // 列表（它是「实时结果」的更完整版本）⇒ 同一批句子**不显示两遍**。
+    // ⇒ 显隐的**最终口径**统一在 ``_syncResultBoxes`` 里（那里还多一条
+    // 「同传有内容 ⇒ 藏掉实时结果」）。
+    this._syncResultBoxes();
   },
 
   /** 当前来源是不是「文件 / 视频」（决定「开始识别」按钮是否可用）。 */
@@ -2794,6 +2848,13 @@ const Qwen3Asr = {
         //    （用户报：「勾着实时翻译，字幕却只有中文」）。
         if (!this._trLineNeedRetry(slot)) continue;
         if (now - (prev.at || 0) < TR_REQ_STALE_MS) continue;
+        // ⚠️⚠️ **重试封顶**（2026-11-26）—— 同一行重试超过
+        // :data:`TR_REQ_MAX_ATTEMPTS` 次 ⇒ **不再要** ⇒
+        // ⇒ 「翻不出来」的那一行不会把翻译模型的算力**烧光**
+        // （实测：同 7 句话被无限重试了几百次 ⇒ ASR/TTS 抢不到算力
+        //   ⇒ 译文越落越远 ⇒ 音频跟不上字幕）。
+        // ⇒ 用户想再试 ⇒ 把「实时翻译」关掉再打开（记账清零）。
+        if (Number(prev.tries || 1) >= TR_REQ_MAX_ATTEMPTS) continue;
         // ⇒ 过期 ⇒ 下面重新要一次（``_trRequestLine`` 会覆盖记账）
       }
       const ep = this._trEpochOf(ln);
@@ -3042,9 +3103,15 @@ const Qwen3Asr = {
     const old = this._trLineSlot.get(slot);
     if (old && old.item) this._trDropLineItem(old.item);
     this._trLineSlot.set(slot, { seq: seq, item: null, text: text });
-    // ⚠️ **记账带上时间戳** —— 「要了但一直没回来」要能过期重试
-    // （见 ``_trRequestLines`` 里的过期判定与 :data:`TR_REQ_STALE_MS`）。
-    this._trLineReq.set(slot, { text: text, at: Date.now() });
+    // ⚠️ **记账带上时间戳 + 次数** —— 「要了但一直没回来」要能过期重试
+    // （见 ``_trRequestLines`` 里的过期判定与 :data:`TR_REQ_STALE_MS`）；
+    // ⚠️ **次数**用来封顶重试（:data:`TR_REQ_MAX_ATTEMPTS`）⇒
+    // 「翻不出来」的行不会无限重试 ⇒ 不会把翻译模型的算力烧光。
+    const prevReq = this._trLineReq.get(slot);
+    const sameText = prevReq
+      && this._trNormText(prevReq.text) === this._trNormText(text);
+    const tries = sameText ? Number(prevReq.tries || 1) + 1 : 1;
+    this._trLineReq.set(slot, { text: text, at: Date.now(), tries: tries });
     const body = {
       text: text,
       start_sec: ln.start,
@@ -3058,10 +3125,16 @@ const Qwen3Asr = {
       body: JSON.stringify(body),
     }).then((r) => r.json().catch(() => ({}))).then((d) => {
       // ⚠️ 服务端**拒收**（``{"ok": false, "skipped": "翻译没开"}``）⇒ 这一行
-      //    **没有**译文 ⇒ 记账里的时间戳留着 ⇒ 过期后自动重要一次
-      //    （见 ``_trRequestLines``）⇒ 不会出现「永远没有译文」的行。
+      //    **没有**译文。
       if (d && d.ok === false) {
         console.warn("[qwen3-asr] 行级翻译被拒:", d);
+        // ⚠️⚠️ **拒收 = 服务端的开关是关的** ⇒ 本地那个「开着」是**陈旧**
+        //    的（典型的：服务重启后服务端开关复位，而页面里的勾还是开的）
+        //    ⇒ 不停手的话，这一行会**每 5 秒重试一次、永远**（实测
+        //    ~67 次/分 × 6 个标签页 ⇒ 白白空转，还把「失败」计数刷爆）。
+        //
+        // ⇒ **服务端才是权威** ⇒ 把本地开关拉回服务端的值 ⇒ 立刻停手。
+        this._trSyncEnabledFromServer(d);
         return;
       }
       // ⚠️ **队列深度**（服务端入队后的实时值）⇒ 拿它做**背压**
@@ -3150,10 +3223,12 @@ const Qwen3Asr = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then((r) => r.json().catch(() => ({}))).then((d) => {
-      // ⚠️ 服务端**拒收** ⇒ 这一句**没有**译文 ⇒ 记账里的时间戳留着 ⇒
-      //    过期后自动重要一次（见 ``_trRequestSentences``）。
+      // ⚠️ 服务端**拒收** ⇒ 这一句**没有**译文。
       if (d && d.ok === false) {
         console.warn("[qwen3-asr] 句子翻译被拒:", d);
+        // ⚠️⚠️ 同 :meth:`_trRequestLine` —— 拒收 ⇒ 服务端开关是关的 ⇒
+        //    本地「开着」是陈旧的 ⇒ 拉回来、停手（别每 5 秒空转一次）。
+        this._trSyncEnabledFromServer(d);
         return;
       }
       // ⚠️ **队列深度** ⇒ 背压（见 ``TR_QUEUE_SOFT_MAX``）。
@@ -3164,6 +3239,35 @@ const Qwen3Asr = {
       // 翻译是**旁路** —— 请求失败不许打断识别
       console.warn("[qwen3-asr] 句子翻译请求失败:", e);
     });
+  },
+
+  /**
+   * **服务端拒收了一次翻译请求** ⇒ 把本地开关拉回服务端的权威值 ⇒ 停手。
+   *
+   * ⚠️ **为什么必须有这个**（2026-11-26 实测）：
+   *
+   * * 服务端翻译没开 ⇒ 每次 ``POST /translate/line`` 都返回
+   *   ``{"ok": false, "skipped": "翻译没开"}``（**200 OK**）；
+   * * 前端原来只 ``console.warn`` 就 ``return`` ⇒ **既不增长 ``tries``、
+   *   也不停请求** ⇒ 那几行**每 5 秒重试一次、永远**；
+   * * 实测 **~67 次/分 × 6 个标签页** ⇒ 白白空转，还把「失败」计数刷爆。
+   *
+   * ⚠️ **典型触发场景**：**服务重启** ⇒ 服务端开关复位成关，而页面里的
+   * 勾还开着（页面没刷新）⇒ 前端与服务端**不一致** ⇒ 前端一直要。
+   *
+   * ⇒ **服务端才是权威** ⇒ 照它说的改本地状态 ⇒ 立刻停手。
+   * ⇒ 用户想再打开 ⇒ 点一下复选框（``_trSet``）⇒ 正常走服务端。
+   *
+   * @param {object} d 服务端的响应体（要带 ``enabled`` 字段）。
+   */
+  _trSyncEnabledFromServer(d) {
+    // ⚠️ 服务端**没给**权威值 ⇒ 不猜（宁可继续重试，也别瞎改用户的开关）。
+    if (!d || !("enabled" in d)) return;
+    const srv = !!d.enabled;
+    if (this._tr.enabled === srv) return;
+    this._tr.enabled = srv;
+    // ⚠️ **把勾选框同步回服务端的样子** —— 用户得看得见「服务端把它关了」。
+    this._trSyncUi();
   },
 
   async _trLoadLanguages() {
@@ -5082,6 +5186,9 @@ const Qwen3Asr = {
       ref_speaker: this._interp.refSpeaker,
       volume: this._interp.volume,
       source: this._interpSource(),
+      // ⚠️ **标签页 id**（2026-11-25）—— 服务端只认这个标签页的播放头
+      // （多标签页会互相覆盖播放头 ⇒ 对齐失效 ⇒ 声音不跟随字幕）。
+      client_id: this._interpClientId(),
     };
     try {
       const r = await fetch("/api/qwen3-asr/interp/start", {
@@ -5093,6 +5200,9 @@ const Qwen3Asr = {
       if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
       this._interp.running = true;
       this._interp.status = data;
+      // ⚠️ **这一轮是本标签页发起的** ⇒ 服务端会认本标签页的播放头 ⇒
+      // 清掉「被忽略」的标记（2026-11-25，多标签页隔离）。
+      this._interp.phIgnored = false;
       // ⚠️ **新一轮同传 ⇒ 底部结果列表清空**（2026-11-25）——
       // 两轮的结果混在一起 ⇒ 用户分不清哪句是哪轮的。
       this._interpClearSegs();
@@ -5294,6 +5404,18 @@ const Qwen3Asr = {
     if (el) {
       if (!this._interp.running) {
         el.textContent = "同传未开启";
+      } else if (this._interp.phIgnored) {
+        // ⚠️⚠️ **这个标签页的播放头被服务端忽略了**（2026-11-25）——
+        //
+        // 同传引擎是**服务端全局单例** ⇒ 只认**发起这一轮**的那个标签页的
+        // 播放头（实测有 6 个标签页同时上报 ⇒ 播放头来回跳 ⇒ 对齐失效）。
+        //
+        // ⚠️ **这条必须排在「播放头没上报」前面** —— 被忽略的上报**不进**
+        // 服务端的播放头记账 ⇒ 服务端那边 age 一直涨 ⇒ 一定会先命中
+        // 「播放头没上报」⇒ 用户以为页面坏了 ⇒ 其实是「多标签页」。
+        el.textContent = "这个标签页不是发起同传的那个"
+          + "· 它的播放头被服务端忽略（多标签页互相覆盖播放头）"
+          + "· 要在这里播，就重新点一次「开始同传」";
       } else if (st.playhead_missing) {
         // ⚠️⚠️ **播放头没上报**（2026-11-25）——
         //
@@ -5308,6 +5430,19 @@ const Qwen3Asr = {
         el.textContent = "播放头没上报（" + ageTxt + "）"
           + "· 译文不等字幕位置（会越走越超前）"
           + "· 刷新一下页面，或确认媒体已加载";
+      } else if (st.media_paused) {
+        // ⚠️⚠️ **媒体暂停了 ⇒ 播报也停**（2026-11-25，用户提的第三点：
+        // 「视频在暂停的时候，同声传译播完视频实时字幕上的翻译语言后，
+        //  也要暂停播报」）。
+        //
+        // 服务端队列在**句边界**按住（aplay 管道里已写入的 PCM 撤不回来
+        // ⇒ 当前那句会**播完**，下一句才停）⇒ 这就是用户要的语义。
+        //
+        // ⚠️ **这条要排在「播放头卡住」前面** —— 暂停时播放头当然不动 ⇒
+        // 不然用户看到的是「播放头卡住（媒体没在放 / 卡在缓冲）」⇒ 意思
+        // 差不多但没告诉他「这是你按的暂停，播报已经跟着停了」。
+        el.textContent = "已暂停（媒体暂停了，播报跟着停）"
+          + "· 恢复播放后译文继续跟着字幕走";
       } else if (this._interp.gate === "now" && hasPh) {
         // ⚠️ **「不等播放」+ 有播放头的源** ⇒ 译文**不等字幕位置**。
         //
@@ -5349,15 +5484,46 @@ const Qwen3Asr = {
         // ⇒ 只有一个 TTS 卡位 ⇒ 队列恒为**单 worker 串行** ⇒ 这里不显示
         // 任何并行字样（显示了就是骗人）。
         const par = "";
+        const ts = st.tts_status || {};
         // ⚠️ **兜底放行**的提示：播放头一直没动 ⇒ 句子被强行放行了 ⇒
         // 译文比画面/声音**超前**，得让用户知道。
-        const stall = Number(st.stalled_released || 0) > 0
+        //
+        // ⚠️ **读队列侧的 ``clock_released``**（2026-11-25）—— 队列的
+        // 「8 秒兜底放行」才是真正会「狂喷积压」的那个（实测一次放出
+        // 184 秒 ⇒ 声音跑到画面前面 174 秒）；``stalled_released`` 是
+        // **放行器**的计数（另一条路径）。
+        const stall = Number(ts.clock_released || st.stalled_released || 0) > 0
           ? "（播放头没动，已兜底放行）" : "";
-        // ⚠️ **电平探针**：播了但峰值很低 ⇒ 小喇叭上基本听不见 ⇒
-        // 用户会当成「没播放」⇒ 明确告诉他「是太小不是没播」。
-        const peak = Number((st.tts_status || {}).last_peak || 0);
-        const quiet = (peak > 0 && peak < 0.05)
-          ? `（音量偏小：出声峰值 ${peak.toFixed(2)}）` : "";
+        // ⚠️⚠️ **电平探针**（2026-11-25，用户报「显示已播报，喇叭没声音」）
+        // ——
+        //
+        // 「正在播报」**不等于「听得见」**：
+        // * ``last_out_peak = 0`` ⇒ PCM 写进了**死管道** ⇒ **一声不响**；
+        // * 峰值太小 ⇒ 播了，但**太小声**（板载小喇叭上听不见）⇒ 实测
+        //   1.6% 满量程 = **-36 dBFS** ⇒ 用户只看到「已播报」。
+        //
+        // ⚠️ **读 ``last_out_peak``**（真正送进 aplay 的那个）——
+        // 之前读的是 ``last_peak``，而它**恒为 0**（队列从来没给 ``job.peak``
+        // 赋值）⇒ 这个提示**永远不会显示**。
+        //
+        // ⚠️ **阈值用绝对电平**（0.02 ≈ -34 dBFS）—— 归一化之后输出峰值
+        // ≈ 0.9 × 音量 ⇒ 5% ⇒ 0.045 ⇒ 用旧的 0.05 阈值会**永远报警**。
+        const outPeak = Number(ts.last_out_peak || 0);
+        const rawPeak = Number(ts.last_raw_peak || 0);
+        let level = "";
+        if (outPeak <= 0) {
+          level = "（没出声：PCM 写进了死管道）";
+        } else if (outPeak < 0.02) {
+          const db = (20 * Math.log10(Math.max(outPeak, 1e-6))).toFixed(0);
+          level = `（太小听不见：出声峰值 ${outPeak.toFixed(3)} ≈ ${db}dB）`
+            + "· 把音量调大";
+        } else if (rawPeak > 0) {
+          // ⚠️ **顺带报一下模型原始电平** —— 归一化之前它有多小 ⇒ 用户
+          // 一眼看出「自动增益把它拉上来了多少」。
+          const db = (20 * Math.log10(Math.max(outPeak, 1e-6))).toFixed(0);
+          level = `（出声峰值 ${outPeak.toFixed(3)} ≈ ${db}dB`
+            + `· 模型原始 ${rawPeak.toFixed(2)} 已归一化）`;
+        }
         // ⚠️ **刚拖过进度条 ⇒ 告诉用户「已经跟上了」**（实测 2026-11-22，
         // 用户报「多次拖动进度条，没和字幕的翻译同声播放出来」⇒ 用户需要
         // 一个可见的反馈确认「拖动被识别了、译文已重新对齐」）。
@@ -5366,7 +5532,7 @@ const Qwen3Asr = {
         const aligned = (sk && skAge >= 0 && skAge < 20)
           ? `（已跟随进度条重新对齐${Number(sk.replayed || 0) > 0
               ? `，重播 ${Number(sk.replayed)} 句` : ""}）` : "";
-        el.textContent = `正在播报${stall}${quiet}${aligned} · ${lagTag} ${lag.toFixed(1)} 秒 · `
+        el.textContent = `正在播报${stall}${level}${aligned} · ${lagTag} ${lag.toFixed(1)} 秒 · `
           + `队列 ${depth} 段 · 变速 ${tempo.toFixed(2)}${par}${tts}`;
       }
     }
@@ -5455,6 +5621,10 @@ const Qwen3Asr = {
    */
   _interpClearSegs() {
     this._interp.segs.clear();
+    // ⚠️ **当前句也要清**（2026-11-25）—— 否则高亮还留在一个已经不存的
+    // 句子上 ⇒ 「正在播报」的标记悬着。
+    this._interp.curSeg = null;
+    this._interp.follow = true;
     const box = document.getElementById("asr-interp-list");
     if (box) {
       if (box._interpRows) {
@@ -5465,6 +5635,8 @@ const Qwen3Asr = {
     }
     const wrap = document.getElementById("asr-interp-out");
     if (wrap) wrap.classList.add("hidden");
+    // ⚠️ **同传没了 ⇒ 「实时结果」那几栏要回来**（合并规则的另一半）。
+    this._syncResultBoxes();
   },
 
   /**
@@ -5483,8 +5655,149 @@ const Qwen3Asr = {
     // 只**藏**不**显**（显的那一头由 ``_applySnapshot`` 管 ⇒ 两边不打架）。
     const empty = document.getElementById("asr-empty");
     if (empty && segs.size > 0) empty.classList.add("hidden");
-    // 新句子在下面 ⇒ 滚到底（跟句子流一个习惯）。
-    box.scrollTop = box.scrollHeight;
+    // ⚠️⚠️ **合并**（2026-11-25）—— 同传结果列表是「实时结果」的**更完整
+    // 版本**（原文 + 译文 + 播报状态 + **跟播放头**）⇒ 两个同时显示 =
+    // **同一批句子显示两遍**（用户实测过这个）。
+    // ⇒ 同传有内容 ⇒ 只留同传结果这一个列表。
+    this._syncResultBoxes();
+    // ⚠️ **滚动** —— 有「当前句」就滚到它（跟字幕节奏）⇒ 没有（实时流没有
+    // 播放头）⇒ 才滚到底（新句子在下面 ⇒ 跟句子流一个习惯）。
+    if (this._interp.curSeg) {
+      this._interpScrollTo(this._interp.curSeg);
+    } else {
+      box.scrollTop = box.scrollHeight;
+    }
+  },
+
+  /**
+   * **底部结果框的显隐**（2026-11-25 合并）—— 三个「实时结果」框与
+   * 「同传结果」列表**同一时刻只显示一组**。
+   *
+   * ⚠️ **为什么要合并**（用户问「实时结果和同传结果合并在一起是否合理」）：
+   *
+   * | 框 | 内容 | 节奏 |
+   * |---|---|---|
+   * | `#asr-sentences`（音频文件·句子流） | 原文 + 译文 | 识别到就出 |
+   * | `#asr-rt-sentences`（麦克风·句子流） | 原文 + 译文 | 识别到就出 |
+   * | `#asr-transcript`（视频·字幕文本） | 原文（跟画面） | 跟播放头 |
+   * | `#asr-interp-list`（同传结果） | 原文 + 译文 + **播报状态** | **跟播放头** |
+   *
+   * ⇒ 前三个与第四个**是同一批句子**（只是粒度不同：字幕行 vs 同传句）
+   * ⇒ 同时显示 ⇒ **同一句话显示两遍**，用户得自己在两栏之间对号入座。
+   *
+   * ⇒ **同传在跑 ⇒ 只留「同传结果」**（它最全：原文 + 译文 + 播报状态 +
+   * 跟播放头高亮）；**同传没跑 ⇒ 留原来的那一个**。
+   *
+   * ⚠️ **不是「把两个列表拼成一个」** —— 粒度不同（字幕**行** vs 同传**句**）
+   * ⇒ 拼不到一行一行 ⇒ 只能「**同屏只留一个**」。
+   */
+  _syncResultBoxes() {
+    const interpHas = this._interp.segs.size > 0;
+    // 音频文件 · 句子流
+    const sents = document.getElementById("asr-sentences");
+    if (sents) {
+      sents.classList.toggle("hidden", this._source !== "file" || interpHas);
+    }
+    // 麦克风 · 句子流
+    const rtSents = document.getElementById("asr-rt-sentences");
+    if (rtSents) {
+      rtSents.classList.toggle("hidden", this._isFileSource() || interpHas);
+    }
+    // 视频 · 字幕文本（**它自己的规则**在 ``_renderTranscript`` 里）
+    const tr = document.getElementById("asr-transcript");
+    if (tr) {
+      const isVideo = this._source === "video" && this._roundsSource === "video";
+      tr.classList.toggle("hidden", !isVideo || interpHas);
+    }
+  },
+
+  /**
+   * 按**播放头**找「当前那一句」（同传结果列表跟字幕节奏走）。
+   *
+   * ⚠️ **判据与字幕框完全一致**（「时间区间包含播放头」）—— 两边各写
+   * 一份的话，早晚对不上（这个坑在字幕框那边已经踩过一次）。
+   *
+   * ⚠️ **位置未知（实时流）⇒ 找不到**（``start < 0``）⇒ 此时列表退回
+   * 「新句子在下面 ⇒ 滚到底」的老行为。
+   */
+  _interpPickByTime(t) {
+    let best = null;
+    let bestStart = -1;
+    for (const it of this._interp.segs.values()) {
+      const s = Number(it.start);
+      const e = Number(it.end);
+      if (!(s >= 0)) continue;                 // 位置未知（实时流）
+      if (t < s) continue;
+      if (e > 0 && t >= e) continue;           // 已经过去了
+      // ⚠️ **重叠时取「最晚开始」的那句** —— 后一句更贴近当前画面。
+      if (s >= bestStart) { best = it; bestStart = s; }
+    }
+    return best;
+  },
+
+  /**
+   * **播放头变了 ⇒ 更新「当前正在播报的那一句」**。
+   *
+   * ⚠️ **为什么要自己做**（2026-11-25，用户要「显示当前正在播放的同传
+   * 结果」）：后端的 ``interp_spoken`` 是「这句**播完**了」⇒ 只能标
+   * 「已播报」⇒ **看不出现在正在念哪句**。
+   * ⇒ 而「正在念哪句」= **播放头所在的那一句**（同传就是贴着字幕播的）
+   * ⇒ 前端自己算 ⇒ 不用后端再发一帧。
+   */
+  _interpSyncCurrent(t) {
+    const cur = this._interpPickByTime(Number(t));
+    const prev = this._interp.curSeg;
+    if (cur === prev) return;
+    if (prev) { prev.current = false; this._interpSegPaint(prev); }
+    this._interp.curSeg = cur;
+    if (cur) {
+      cur.current = true;
+      this._interpSegPaint(cur);
+      this._interpScrollTo(cur);
+    }
+  },
+
+  /**
+   * 把「当前那一句」滚进视野（**不跟用户抢**）。
+   *
+   * ⚠️ **用户手动上翻过 ⇒ 暂停跟随**（跟字幕框 ``_trFollow`` 同一套
+   * 规矩）—— 别把人正在看的内容拽走。
+   */
+  _interpScrollTo(it) {
+    if (!this._interp.follow) return;
+    const box = document.getElementById("asr-interp-list");
+    if (!box || !it) return;
+    if (!box.clientHeight) return;            // 框没布局（隐藏）⇒ 别乱滚
+    const rows = box._interpRows;
+    const row = rows && rows.get(it.index);
+    if (!row) return;
+    const top = row.offsetTop;
+    const h = row.offsetHeight;
+    const viewTop = box.scrollTop;
+    const viewBottom = viewTop + box.clientHeight;
+    if (top >= viewTop && top + h <= viewBottom) return;   // 已经在视野里
+    this._interp.autoAt = Date.now();
+    box.scrollTop = (top < viewTop)
+      ? Math.max(0, top - 4)
+      : Math.max(0, top + h - box.clientHeight + 4);
+  },
+
+  /** 用户**手动**滚动同传结果列表 ⇒ 暂停跟随（别把人拽回来）。 */
+  _onInterpScroll() {
+    // 自己触发的滚动不算「用户滚动」
+    if (Date.now() - (this._interp.autoAt || 0) < 250) return;
+    const box = document.getElementById("asr-interp-list");
+    if (!box || !box.clientHeight) return;
+    const cur = this._interp.curSeg;
+    if (!cur) { this._interp.follow = false; return; }
+    const rows = box._interpRows;
+    const row = rows && rows.get(cur.index);
+    if (!row) { this._interp.follow = false; return; }
+    const top = row.offsetTop;
+    const h = row.offsetHeight;
+    const visible = (top < box.scrollTop + box.clientHeight)
+                 && (top + h > box.scrollTop);
+    this._interp.follow = visible;
   },
 
   /**
@@ -5528,15 +5841,62 @@ const Qwen3Asr = {
     }
     if (dst && dst.textContent !== txt) dst.textContent = txt;
     if (dst) dst.classList.toggle("is-muted", muted);
+    // ⚠️⚠️ **「正在播报」高亮**（2026-11-25，用户要「显示当前正在播放的
+    // 同传结果」）—— 由**播放头**算出（``_interpSyncCurrent``）⇒ 不用
+    // 后端再发一帧。
+    row.classList.toggle("is-current", !!it.current);
+    // ⚠️ **把媒体位置挂到 DOM 上**（2026-11-25）—— 行本身**自描述** ⇒
+    // ① 调试时 DOM 里就能看出这是第几秒的那一句；② 回归脚本能断言
+    // 「高亮的那一句的区间确实包含播放头」（不用猜）。
+    const ds = String(Number(it.start) || 0);
+    const de = String(Number(it.end) || 0);
+    if (row.dataset.start !== ds) row.dataset.start = ds;
+    if (row.dataset.end !== de) row.dataset.end = de;
     if (tag) {
       // ⚠️ 板端**没有符号字体** ⇒ 只用文字，不用 ✓ / ● 之类。
-      const t = it.err ? "未播出" : (it.spoken ? "已播报" : "");
+      //
+      // ⚠️ **三种状态**：正在播报（播放头在这儿）/ 已播报（这句念完了）/
+      // 未播出（这句没念成）。
+      const t = it.current ? "正在播报"
+              : (it.err ? "未播出" : (it.spoken ? "已播报" : ""));
       if (tag.textContent !== t) tag.textContent = t;
       tag.classList.toggle("hidden", !t);
+      tag.classList.toggle("is-live", !!it.current);
     }
   },
 
   /* ---------------- 播放头（跟播放模式） ---------------- */
+
+  /**
+   * **标签页 id**（2026-11-25）—— 同传引擎是**服务端全局单例** ⇒ 多个
+   * 标签页会**共用一个播放头槽位** ⇒ 后上报的覆盖先上报的。
+   *
+   * ⇒ 实测那一轮日志里有 **6 个浏览器连接**同时上报播放头（172.16.9.18
+   * 的 6 个源端口）⇒ 播放头在 6 个位置之间**来回跳** ⇒ 时钟的对齐判定
+   * 完全失效 ⇒ **声音不跟随字幕**（用户原话）。
+   *
+   * ⇒ 用 **sessionStorage** 存一个 id：
+   * * 不同标签页 ⇒ 不同 id ⇒ 互相不覆盖；
+   * * **刷新后不变** ⇒ 刷新后接管的服务端会话仍然认这个标签页
+   *   （``_interpRestoreState`` 不重新 start ⇒ 靠的就是这个 id 不变）。
+   */
+  _interpClientId() {
+    if (this._interp.clientId) return this._interp.clientId;
+    let id = "";
+    try {
+      id = window.sessionStorage.getItem("wdn_qwen3_asr_client") || "";
+      if (!id) {
+        id = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        window.sessionStorage.setItem("wdn_qwen3_asr_client", id);
+      }
+    } catch (e) {
+      // ⚠️ **隐私模式下 sessionStorage 可能不可用** ⇒ 退化成「本次页面
+      // 的随机 id」（刷新后会变 ⇒ 服务端会拒收 ⇒ 面板会提示重新开始）。
+      id = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    }
+    this._interp.clientId = id;
+    return id;
+  },
 
   /** 当前播放头（秒，音频时间轴）；没有播放头 ⇒ null。 */
   _interpPlayhead() {
@@ -5611,6 +5971,10 @@ const Qwen3Asr = {
       this._interp.lastEnded = !!ph.ended;
       this._interp.lastFailed = !!ph.failed;
       this._interp.lastPhAt = nowMs;   // 心跳的基准（见上面的说明）
+      // ⚠️⚠️ **同传结果列表跟播放头走**（2026-11-25，用户要「显示当前正在
+      // 播放的同传结果」）—— 高亮「播放头所在的那一句」+ 滚到它 ⇒
+      // ⇒ 列表的节奏 = **字幕的节奏**（不是「新句子在下面」）。
+      this._interpSyncCurrent(ph.sec);
       // ⚠️ **带上引擎当前的流 id** —— 播放头是**按流**存的 ⇒ id 对不上
       // ⇒ 放行器配不上这句 ⇒「跟播放」把它永久压住 ⇒「有翻译没声音」
       // （实测：前端之前一直报空 id ⇒ 必然配不上）。
@@ -5629,8 +5993,19 @@ const Qwen3Asr = {
           //  **用户只听到第一句**，实测踩过）。
           ended: !!ph.ended,
           failed: !!ph.failed,
+          // ⚠️ **标签页 id**（2026-11-25）—— 引擎是全局单例 ⇒ 多个标签页
+          // 的播放头会互相覆盖 ⇒ 只认**发起这一轮**的那个标签页。
+          client_id: this._interpClientId(),
         }),
-      }).catch(() => { /* 上报失败不影响播放 */ });
+      })
+        .then((r) => (r && r.json ? r.json() : null))
+        .then((d) => {
+          // ⚠️ **服务端说这次上报被忽略了** ⇒ 这个标签页**不是发起同传的
+          // 那个** ⇒ 它的播放头**不算数** ⇒ 得告诉用户（否则用户看到的是
+          // 「播放头没上报」，会以为是页面坏了）。
+          if (d && d.ignored) this._interp.phIgnored = true;
+        })
+        .catch(() => { /* 上报失败不影响播放 */ });
     }, 250);
   },
 
@@ -5874,7 +6249,12 @@ const Qwen3Asr = {
             // ⚠️ ``skipped``（源语 == 目标语）**不重试** —— 再要也是同一个。
             if (it.status && it.status !== "done" && it.status !== "skipped") {
               const req = this._trLineReq.get(slot);
-              if (req) this._trLineReq.set(slot, { text: req.text, at: Date.now() });
+              // ⚠️ **重试次数要带上**（2026-11-26）—— 否则这里把 ``tries``
+              // 抹掉 ⇒ 封顶失效 ⇒ 无限重试又回来了。
+              if (req) {
+                this._trLineReq.set(slot, { text: req.text, at: Date.now(),
+                                           tries: Number(req.tries || 1) });
+              }
             }
           } else {
             expired = true;

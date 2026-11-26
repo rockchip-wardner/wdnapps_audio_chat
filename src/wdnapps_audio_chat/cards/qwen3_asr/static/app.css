@@ -743,6 +743,30 @@
   position: relative;
 }
 
+/* ⚠️ **当前正在播报的那一句**（2026-11-25，用户要「显示当前正在播放的
+   同传结果」）—— 同传结果列表**跟字幕节奏走**（跟播放头）⇒ 高亮
+   「播放头所在的那一句」⇒ 用户一眼看到「现在在念哪句」。
+
+   ⇒ 底色用**浅黄**（不是高饱和色）⇒ 长时间盯着不刺眼；
+   ⇒ 左边加一条竖线 ⇒ 和译文那条竖线区分开。 */
+.asr-interp-sent.is-current {
+  background: #fffbe6;
+  border-left: 3px solid #f59e0b;
+  padding-left: 8px;
+  margin-left: -3px;
+}
+
+.asr-interp-sent.is-current .asr-sent-dst {
+  color: #7c4a03;
+  font-weight: 600;
+}
+
+/* 「正在播报」的角标 —— 比「已播报」更醒目（正在发生） */
+.asr-interp-tag.is-live {
+  color: #b45309;
+  font-weight: 600;
+}
+
 .asr-interp-tag {
   position: absolute;
   top: 0;
