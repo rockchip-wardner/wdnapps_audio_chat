@@ -38,6 +38,38 @@ from app.core.audio.tts_bridge import (  # noqa: F401  (re-export)
 
 LOG = logging.getLogger("tts_session")
 
+#: **自动增益的目标峰值**（0~1）—— 每句的 PCM 归一化到这个峰值附近。
+#:
+#: ⚠️⚠️ **为什么要有**（实测 2026-11-25，用户报「同传结果显示『已播报』，
+#: 但喇叭里没有声音」）：
+#:
+#: * TTS 模型输出的**电平很不稳** —— 实测同一场会话里，不同句子的**原始
+#:   峰值**在 **0.31 ~ 1.0** 之间（差 **10 dB**）；
+#: * ``volume`` 是**乘性**的 ⇒ 同一档音量下 ⇒ 安静的句子只有 **1.6% 满量程
+#:   （-36 dBFS）** ⇒ **板载小喇叭上听不见** ⇒ 而响的句子又「太吵」；
+#: * ⇒ 用户当初定的「5% 刚好」是**按响句子**的耳朵定的（-26 dBFS）⇒
+#:   安静的句子就掉到了听不见的那一档 ⇒ **两头不讨好**。
+#:
+#: ⇒ 这里给**每句**做一次**峰值归一化** ⇒ 音量滑杆从此表示「**满量程的
+#: 百分之几**」⇒ 5% 就是 5%（-27 dBFS）⇒ **每句一样响** ⇒ 安静的句子也能
+#: 听见，响的句子也不会炸。
+#:
+#: ⚠️ **目标不用 1.0** —— 留一点余量给后面的软限幅（``tanh``）。
+AUTO_GAIN_TARGET = 0.9
+
+#: **自动增益的上限** —— 防止「第一块特别轻」时把增益拉到天上
+#: （那样整句都会被压扁）。
+#:
+#: ⚠️ **为什么是 32 而不是更小**（实测 2026-11-25，回归脚本抓到）：
+#: 增益 = ``0.9 ÷ 这句的峰值`` ⇒ 峰值 0.31 ⇒ 增益 2.9（够）⇒ 但峰值
+#: 0.05 ⇒ 增益 **18** ⇒ 上限 4.0 就会把归一化**挡掉一半** ⇒ 输出只剩
+#: 0.05 × 4 × 0.05 = 0.01（-40 dBFS）⇒ **还是听不见**。
+#: ⇒ 上限只用来防「纯噪声被放大成满量程」，不参与日常增益 ⇒ 取 32。
+#:
+#: ⚠️ **放大不会改变信噪比** —— 增益是线性的 ⇒ 底噪与信号一起放大
+#: ⇒ 32 倍以内不存在「把底噪拉爆」的风险。
+AUTO_GAIN_MAX = 32.0
+
 
 # Plain-print so diagnostics land in uvicorn's stdout regardless of
 # how the root logger is configured.
@@ -74,6 +106,10 @@ class AplayWriter:
         #: **电平探针**：缩放前（模型原始）/ 缩放后（真正出声）的峰值。
         self._peak = 0.0
         self._raw_peak = 0.0
+        #: **自动增益**（2026-11-25）—— 见 :data:`AUTO_GAIN_TARGET`。
+        self._gain = 1.0
+        #: 这句目前的**峰值**（自动增益按它算）。
+        self._job_peak = 0.0
         #: **已写入的音频秒数**（变速前）+ **第一块写入的时刻** ——
         #: 用来估算「这一句什么时候播完」（writer 跨句复用 ⇒ 不能靠
         #: ``close()`` 测了，见 :meth:`playback_end`）。
@@ -187,6 +223,10 @@ class AplayWriter:
         """电平探针**逐句复位**（writer 跨句复用 ⇒ 峰值会串到下一句）。"""
         self._peak = 0.0
         self._raw_peak = 0.0
+        # ⚠️ **自动增益也逐句复位** ⇒ 这句的峰值从零重新算 ⇒
+        # 上一句的响度不会影响下一句。
+        self._job_peak = 0.0
+        self._gain = 1.0
 
     def written_sec(self) -> float:
         """**累计**已写入的音频秒数（变速前）—— 逐句取差值 = 这句多长。"""
@@ -329,10 +369,27 @@ class AplayWriter:
         # 面板默认 10% ⇒ 峰值只剩 1/10 ⇒ 板载小喇叭上可能**基本听不见**
         # ⇒ 用户会报「有翻译，但是没有播放」—— 其实是「太小」。
         # ⇒ 没有这个数就没法判断「是没播」还是「播得太小」。
+        #
+        # ⚠️⚠️ **自动增益**（2026-11-25，用户报「显示已播报，但喇叭没声音」）
+        # —— 见 :data:`AUTO_GAIN_TARGET` 的说明。
         if raw.size:
-            self._raw_peak = max(self._raw_peak,
-                                 float(np.max(np.abs(raw))))
-        chunk = np.clip(raw * self._volume, -1.0, 1.0)
+            p = float(np.max(np.abs(raw)))
+            self._raw_peak = max(self._raw_peak, p)
+            if p > 1e-6:
+                # ⚠️ 增益按「**这句目前的峰值**」算（不是逐块各自算）⇒
+                # 句内**不会忽大忽小**；后面出现更响的部分时增益会下调 ⇒
+                # 已经写出去的那块不受影响（⇒ 句内可能有一点起伏）。
+                self._job_peak = max(self._job_peak, p)
+                self._gain = min(AUTO_GAIN_TARGET / max(self._job_peak, 1e-6),
+                                 AUTO_GAIN_MAX)
+        # ⚠️ **软限幅**（``tanh``）而不是硬削波（``clip``）——
+        # 归一化后这句的峰值会到 :data:`AUTO_GAIN_TARGET` ⇒ 音量拉满时
+        # 乘积会超过 1 ⇒ 硬削波会把波峰削平（失真 + 电流冲击）⇒
+        # ``tanh`` 是**平滑压缩** ⇒ 不削波、不炸喇叭。
+        #
+        # ⚠️ **默认音量下它几乎透明**：5% ⇒ 输入 0.045 ⇒ ``tanh(0.045)``
+        # 与 0.045 差 0.003% ⇒ 音色不变。
+        chunk = np.tanh(raw * self._gain * self._volume)
         if chunk.size:
             self._peak = max(self._peak, float(np.max(np.abs(chunk))))
         with self._cond:

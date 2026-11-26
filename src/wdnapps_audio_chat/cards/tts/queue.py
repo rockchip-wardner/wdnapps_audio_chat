@@ -466,6 +466,27 @@ class TTSQueue:
         #: 永久压住（否则「有翻译、一声不响」）。
         self._clock_stall_at = 0.0
         self._clock_last = -1.0
+        #: **媒体状态**（跟播用）—— 一个返回「媒体状态字典」的可调用对象；
+        #: ``None`` = 不知道媒体状态（按老规矩走）。
+        #:
+        #: ⚠️⚠️ **为什么必须有它**（实测 2026-11-25，用户报「视频暂停了同传
+        #: 还在播」「声音不跟随字幕」）：
+        #:
+        #: 播放时钟只知道「播放头在哪」，**不知道媒体是不是暂停了** ⇒
+        #: 暂停时播放头**不动** ⇒ 8 秒后触发 :data:`_CLOCK_STALL_SEC`
+        #: 的**兜底放行** ⇒ **对所有句子一律放行** ⇒ 积压的译文**一次性
+        #: 狂喷出来**（实测：积压 184 秒 ⇒ 声音跑到画面**前面 174 秒**）
+        #: ⇒ 用户看到的正是「声音不跟随当前字幕」+「暂停了还在播」。
+        #:
+        #: ⇒ 兜底放行必须**知道源是真的不动了**（暂停 / 前端失联）还是
+        #: **只是没上报**（缓冲）—— 前者要**按住**，后者才放行。
+        self._media_provider = None
+        #: **兜底放行了几次**（诊断用）—— 每次都意味着「放弃了对齐」。
+        self._clock_released = 0
+        #: **因为「媒体暂停」按住了几次**（诊断用）。
+        self._clock_held_paused = 0
+        #: **因为「前端失联」按住了几次**（诊断用）。
+        self._clock_held_lost = 0
         #: **FIFO 里留多少秒不播**（延迟线）—— 0 = 不留（直接播）。
         #:
         #: ⚠️ **为什么需要**（实测 2026-11-22）：「零断音」和「零滞后」
@@ -557,10 +578,54 @@ class TTSQueue:
                         pass
                 return job, chunk, _ts
 
-    def _clock_ready(self, job: TTSJob) -> bool:
+    def _media_state(self) -> dict:
+        """读一次**媒体状态**（拿不到 ⇒ 空 dict ⇒ 按老规矩走）。
+
+        ⚠️ 约定的字段（由传进来的 provider 负责填）：
+
+        * ``ended`` / ``failed`` —— 源**不会再往前走**（媒体播完 / 坏了）
+          ⇒ 剩下的译文**直接补播**；
+        * ``playing`` —— 媒体**声称**在播（前端上报的 ``!el.paused``）；
+        * ``moved`` —— 播放头**曾经真的走过**（区分「用户暂停」与
+          「自动播放被拦」—— 后者不能按住，否则「有翻译、一声不响」）；
+        * ``alive`` —— 前端**还在上报**（心跳在）⇒ 「前端失联」与
+          「媒体暂停」是**两件事**。
+        """
+        with self._cond:
+            provider = self._media_provider
+        if provider is None:
+            return {}
+        try:
+            st = provider()
+        except Exception:  # noqa: BLE001
+            return {}
+        return st if isinstance(st, dict) else {}
+
+    def _clock_ready(self, job: TTSJob, boundary: bool = True) -> bool:
         """这一句**现在能播吗**（按源话的播放头判断）。
 
         ⚠️ **时钟卡住 ⇒ 放行**（源不再往前走时不能把译文永久压住）。
+
+        ⚠️⚠️ **2026-11-25 重写：兜底放行之前先问「源到底怎么了」**
+        （用户报「视频暂停了同传还在播」「声音不跟随当前字幕」—— 实测
+        积压 184 秒被一次性放出 ⇒ 声音跑到画面**前面 174 秒**）：
+
+        ================== ==========================================
+        媒体状态            处置
+        ================== ==========================================
+        播完 / 坏了          **放行**（源不会再走 ⇒ 剩下的补播）
+        前端**失联**          **按住**（没人看 ⇒ 别狂喷）
+        用户**暂停**（播过）   **按住**（P3：暂停 ⇒ 播报也暂停）
+        在播 / 从没播过       走老的「8 秒兜底 + 严格判定」
+        ================== ==========================================
+
+        ⚠️⚠️ **``boundary`` = 「这句是不是刚开始播」** —— 「按住」**只在句
+        边界生效**（用户原话：「播完**当前字幕的翻译语言**后，也要暂停
+        播报」）：
+
+        * 「位置没到」这条**逐块判**（对齐要精确）；
+        * 「暂停 / 失联」这两条**只在句边界判** ⇒ 当前这句**播完**才停
+          ⇒ 不会把一句话**拦腰截断**（用户报「切音」的老问题）。
         """
         with self._cond:
             provider = self._clock_provider
@@ -579,13 +644,48 @@ class TTSQueue:
             ph = float(ph)
         except (TypeError, ValueError):
             return True
+
+        # ---------------------------------------------------------------- #
+        # ① **媒体状态**（2026-11-25）—— 见上面的表。
+        # ---------------------------------------------------------------- #
+        ms = self._media_state()
+        if ms and boundary:
+            if ms.get("ended") or ms.get("failed"):
+                # 源**不会再往前走** ⇒ 没什么可等的 ⇒ 剩下的**直接补播**。
+                return True
+            if not ms.get("alive", True):
+                # ⚠️ **前端失联**（页面关了 / 网络断了 / 后台标签被节流）
+                # ⇒ **没有人在看** ⇒ 别把积压一次性狂喷出去 ⇒ **按住**。
+                #
+                # ⚠️ **老规矩是「放行」**（怕「有翻译、一声不响」）——
+                # 但那正是「174 秒狂喷」的元凶 ⇒ 这里改回**按住**。
+                # ⇒ 代价：前端真的断了 ⇒ 声音停住（但**不会乱喷**）。
+                with self._cond:
+                    self._clock_held_lost += 1
+                return False
+            if not ms.get("playing", True) and ms.get("moved"):
+                # ⚠️⚠️ **用户主动暂停**（P3，2026-11-25）——
+                # 媒体**播过**又停下 ⇒ 这是**用户按了暂停** ⇒ **按住**
+                # ⇒ 译文**跟着画面一起停**。
+                #
+                # ⚠️ **「从没播过」不能按住**（``moved=False``）—— 那是
+                # 「自动播放被浏览器拦了」⇒ 按住 ⇒ 「有翻译、一声不响」
+                # （这个坑踩过好几次）⇒ 那种情况走下面的 8 秒兜底。
+                with self._cond:
+                    self._clock_held_paused += 1
+                return False
+
         with self._cond:
             if ph > self._clock_last + 0.05:
                 self._clock_last = ph
                 self._clock_stall_at = time.time()
             stalled = time.time() - self._clock_stall_at
         if stalled > _CLOCK_STALL_SEC:
-            # ⚠️ **源不再往前走**（暂停 / 卡住 / 没上报）⇒ 别把译文压住。
+            # ⚠️ **源不再往前走**（缓冲卡住 / 没上报）⇒ 别把译文压住。
+            # ⚠️ **这里仍然是「对所有句子一律放行」** —— 只在「媒体状态
+            # 说不清」时才会走到这儿（暂停 / 前端失联都已经在上面处理了）。
+            with self._cond:
+                self._clock_released += 1
             return True
         return ph >= (float(job.src_start_sec) - offset)
 
@@ -901,6 +1001,33 @@ class TTSQueue:
         return {"clocked": provider is not None,
                 "offset": round(self._clock_offset, 2)}
 
+    def set_media_state(self, provider=None) -> dict:
+        """设**媒体状态**提供者（跟播用，2026-11-25）。
+
+        ⚠️ ``provider`` = 返回「媒体状态字典」的可调用对象；
+        ``None`` = 不知道媒体状态（退回老规矩：只按播放头 + 8 秒兜底）。
+
+        ⚠️ **为什么必须单独一路**（用户报「视频暂停了同传还在播」）：
+        播放时钟只能回答「播放头在哪」，**回答不了「媒体是不是暂停了」**
+        ⇒ 暂停时播放头不动 ⇒ 8 秒兜底放行 ⇒ 积压的译文**一次性狂喷**
+        （实测 184 秒）⇒ 声音跑到画面前面 174 秒。
+
+        ⇒ 有了这一路，队列就能区分：
+
+        * **用户暂停** ⇒ 按住（译文跟着画面一起停）；
+        * **前端失联** ⇒ 按住（没人看，别狂喷）；
+        * **源播完 / 坏了** ⇒ 放行（剩下的补播）。
+        """
+        with self._cond:
+            self._media_provider = provider
+            # ⚠️ **换一轮 ⇒ 计数清零**（诊断数字按会话算）。
+            self._clock_released = 0
+            self._clock_held_paused = 0
+            self._clock_held_lost = 0
+        with self._fifo_cond:
+            self._fifo_cond.notify_all()
+        return {"media_state": provider is not None}
+
     def set_reserve(self, seconds: float) -> dict:
         """设**延迟线的留量**（FIFO 里留多少秒不播）。
 
@@ -991,6 +1118,17 @@ class TTSQueue:
             "clock_offset": round(self._clock_offset, 2),
             "clock_last": round(self._clock_last, 2),
             "clock_stall_sec": round(time.time() - self._clock_stall_at, 2),
+            # ⚠️⚠️ **「按住」的三个计数**（2026-11-25）—— 诊断「声音为什么
+            # 不跟字幕」的第一手证据：
+            # * ``clock_held_paused`` ⇒ 因为**用户暂停**按住了（正常）；
+            # * ``clock_held_lost`` ⇒ 因为**前端失联**按住了（该查前端）；
+            # * ``clock_released`` ⇒ **兜底放行**了几次（放弃了对齐 ⇒
+            #   声音会跑到画面前面 ⇒ 就是用户报的「不跟随字幕」）。
+            "clock_released": self._clock_released,
+            "clock_held_paused": self._clock_held_paused,
+            "clock_held_lost": self._clock_held_lost,
+            # ⚠️ **有没有接上媒体状态**（接上了才分得清「暂停」与「失联」）。
+            "media_state": self._media_provider is not None,
             "tempo": tempo,
             "max_tempo": TEMPO_MAX,
             # ⚠️ **实测合成速率**（音频秒 / 墙钟秒）—— <1.0 「产能不够」
@@ -1393,7 +1531,16 @@ class TTSQueue:
             # **空转** ⇒ 播放线程 100% CPU ⇒ **抢 ASR/MT 的算力**
             # ⇒ 整条链路变慢。⇒ 50 ms 一次的轮询足够（播放头也是
             # 250 ms 上报一次）。
-            if chunk is not None and not self._clock_ready(job):
+            #
+            # ⚠️⚠️ **``boundary`` = 「这是这句的第一块」**（2026-11-25）——
+            # 「用户暂停 ⇒ 按住」**只在句边界生效**（用户原话：「播完当前
+            # 字幕的翻译语言后，也要暂停播报」）⇒ 当前这句**播完**才停
+            # ⇒ **不会把一句话拦腰截断**（用户报「切音」的老问题）。
+            #
+            # ⚠️ 「位置没到」那条**逐块判**（``boundary=False`` 时也判）
+            # ⇒ 对齐精度不受影响。
+            if chunk is not None and not self._clock_ready(
+                    job, boundary=(job is not cur_job)):
                 self._fifo_unpop(item)
                 time.sleep(0.05)
                 continue
@@ -1533,6 +1680,21 @@ class TTSQueue:
             self._c.done += 1
             self._c.last_lag_sec = job.lag_sec
             self._c.last_a_lag = float(getattr(job, "a_lag", 0.0) or 0.0)
+            # ⚠️⚠️ **把 writer 的峰值拷进 job**（2026-11-25）——
+            #
+            # 之前 ``job.peak`` / ``job.raw_peak`` **从来没被赋值** ⇒
+            # ⇒ ``last_peak`` / ``last_raw_peak`` **恒为 0** ⇒
+            # ⇒ 面板那个「音量偏小，出声峰值 x.xx」的提示**永远不会显示**
+            # ⇒ 用户只看到「正在播报 / 已播报」，却**听不见声音**
+            # ⇒ 而真相是「**播了，但只有 1.6% 满量程**」（实测 -36 dBFS）。
+            #
+            # ⇒ 这里在**这句播完**的时刻取一次 writer 的峰值（writer 的峰值
+            # 会在**下一句**开始时被 ``reset_peaks()`` 清掉 ⇒ 必须现在取）。
+            try:
+                job.peak = float(getattr(writer, "peak", 0.0) or 0.0)
+                job.raw_peak = float(getattr(writer, "raw_peak", 0.0) or 0.0)
+            except Exception:  # noqa: BLE001
+                pass
             self._c.last_peak = float(job.peak or 0.0)
             self._c.last_raw_peak = float(job.raw_peak or 0.0)
             # ⚠️ **真正送进 aplay 的峰值** —— 「出声了没有」的硬证据。
@@ -1682,6 +1844,11 @@ def set_tempo(tempo: float) -> dict:
 def set_clock(provider=None, offset: float = 0.0) -> dict:
     """设**播放时钟**（跟播用）—— 见宿主桥同名函数。"""
     return get_queue().set_clock(provider, offset)
+
+
+def set_media_state(provider=None) -> dict:
+    """设**媒体状态**提供者（跟播用）—— 见 :meth:`TTSQueue.set_media_state`。"""
+    return get_queue().set_media_state(provider)
 
 
 def set_reserve(seconds: float) -> dict:
