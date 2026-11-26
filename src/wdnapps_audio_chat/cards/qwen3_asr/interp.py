@@ -124,6 +124,44 @@ FOLLOW_NEVER_PLAYED_SEC = 0.25
 #: 播放头卡住多久就在状态里标「卡住」（前端提示用；比兜底早）。
 FOLLOW_STALL_WARN_SEC = 3.0
 
+#: **前端「还在不在」的判据**（秒）—— 播放头**心跳**超过这么久没来 ⇒
+#: 前端**失联**（页面关了 / 网络断了 / 标签被挂起）。
+#:
+#: ⚠️ **为什么要有它**（实测 2026-11-25，用户报「视频暂停了同传还在播」
+#: 「声音不跟随当前字幕」）：
+#: 队列的播放时钟只知道「播放头在哪」⇒ 播放头**不动** ⇒ 8 秒后触发
+#: **兜底放行** ⇒ **积压一次性狂喷**（实测 184 秒 ⇒ 声音跑到画面前面
+#: 174 秒）。
+#:
+#: ⇒ 必须分清三件事：
+#: * **用户按了暂停**（心跳在、``playing=false``、播过）⇒ **按住**；
+#: * **前端失联**（心跳断了）⇒ **按住**（没人看 ⇒ 别狂喷）；
+#: * **源播完 / 坏了** ⇒ **放行**（剩下的补播）。
+#:
+#: ⇒ 前端心跳间隔 2 秒 ⇒ 6 秒 = 3 个心跳没来 ⇒ 判「失联」。
+_MEDIA_ALIVE_SEC = 6.0
+
+#: **「提交窗口」**（秒）—— 跟播时，**只提交播放头前方这么多秒**的译文。
+#:
+#: ⚠️⚠️ **为什么必须有它**（实测 2026-11-25，用户报「声音不跟随当前字幕」）：
+#:
+#: * 文件 / 视频源是**离线一次性转写**的 ⇒ 译文**产出速度远快于播放头**
+#:   （实测：文件源一次转写完 ⇒ 几十秒内攒出**几百句**译文）；
+#: * TTS 的产能只有 **~1.0× 实时**（每句还有 ~2 s 首窗）⇒ **追不上**
+#:   ⇒ 队列里堆出**上百秒**的待播内容（实测 ``queued_audio_sec=184``、
+#:   ``depth=11``）；
+#: * 而队列是**先进先出** ⇒ TTS 先做**最老**的那几段（位置早就被播放头
+#:   越过了）⇒ **播放头此刻要的那一句排在队尾** ⇒ **被饿死** ⇒
+#:   ⇒ 声音要么**落后几十秒**，要么（兜底放行时）**跑到画面前面**。
+#:
+#: ⇒ 提交窗口 = **只把播放头前方 N 秒的译文送进 TTS** ⇒ 队列里始终只有
+#: 「马上就要播」的内容 ⇒ TTS 追得上 ⇒ **声音贴着字幕走**。
+#:
+#: ⚠️ **窗口不能太小**：TTS 的产能比 1.0× 略低（变速下限 0.96）⇒ 窗口
+#: 会被慢慢吃空 ⇒ 太小 ⇒ 窗口耗尽时又变成「等合成」⇒ 断音。
+#: ⇒ 取 45 秒：够吸收 4% 的产能缺口（约 19 分钟），又不会攒出上百秒。
+SUBMIT_WINDOW_SEC = 45.0
+
 #: **跟播模式的「合成余量」**（秒）—— 提前量 = 生产延迟 + 余量。
 #:
 #: ⚠️ **有了播放时钟之后，提前量不用再很大** —— 播放由**源话的播放头**
@@ -551,6 +589,17 @@ class Gate:
         self._last_ph: Optional[tuple] = None
         #: 播放头**最后一次变化**的时刻（wall clock）—— 算「卡住多久」。
         self._ph_at: float = 0.0
+        #: **播放头最后一次「收到」**的时刻（wall clock）—— 含**心跳**
+        #: （播放头没变也会定期上报）⇒ 这是「**前端还在不在**」的判据。
+        #:
+        #: ⚠️ **为什么要有它**（实测 2026-11-25，用户报「视频暂停了同传还在
+        #: 播」「声音不跟随字幕」）：
+        #: ``_ph_at`` 只在播放头**变化**时更新 ⇒ 媒体**暂停**后它就冻结了
+        #: ⇒ 「卡住多久」和「前端还在不在」**混成了一件事**。
+        #: ⇒ 有了它才能分开说：
+        #: * 前端还在（心跳在）但播放头不动 ⇒ **用户暂停** ⇒ **按住**；
+        #: * 心跳都断了 ⇒ **前端失联** ⇒ 别把积压一次性狂喷出去。
+        self._ph_seen_at: float = 0.0
         #: 播放头**曾经真正走过**（> ``FOLLOW_NEVER_PLAYED_SEC``）——
         #: 区分「自动播放被拦（从没播过）」和「用户主动暂停（播过再停）」。
         self._ph_moved: bool = False
@@ -648,6 +697,7 @@ class Gate:
             self._last_ph = None
             self._last_done = False
             self._ph_at = 0.0
+            self._ph_seen_at = 0.0
             self._ph_moved = False
             self._stalled_released = 0
             self._armed_at = time.time()
@@ -729,6 +779,9 @@ class Gate:
         """
         now_ts = time.time()
         with self._lock:
+            # ⚠️ **每次收到上报都记一笔**（含心跳）—— 这是「前端还在不在」
+            # 的判据（见 ``_ph_seen_at`` 的说明）。
+            self._ph_seen_at = now_ts
             prev = self._playhead.get(stream_id)
             now = float(playhead_sec)
             self._playhead[stream_id] = now
@@ -814,6 +867,59 @@ class Gate:
             if v is None and self._last_ph is not None:
                 return bool(self._last_ph[1])
             return bool(v if v is not None else True)
+
+    # ------------------------------------------------------------------ #
+    # **媒体状态**（给 TTS 队列用，2026-11-25）
+    # ------------------------------------------------------------------ #
+    def media_state(self, stream_id: str = "") -> dict:
+        """**媒体状态** —— 队列据此决定「按住」还是「放行」。
+
+        ⚠️⚠️ **为什么必须有这一路**（实测 2026-11-25，用户报「视频暂停了
+        同传还在播」「声音不跟随当前字幕」）：
+
+        播放时钟只能回答「**播放头在哪**」⇒ 媒体**暂停**时播放头**不动**
+        ⇒ 队列 8 秒后触发**兜底放行** ⇒ **对所有句子一律放行** ⇒ 积压的
+        译文**一次性狂喷**（实测 184 秒 ⇒ 声音跑到画面**前面 174 秒**）。
+
+        ⇒ 队列需要知道的是**「源到底怎么了」**：
+
+        ================== ==========================================
+        字段                含义
+        ================== ==========================================
+        ``ended``           媒体**播完**了 ⇒ 源不会再走 ⇒ **放行**
+        ``failed``          媒体**坏了** ⇒ 同上
+        ``playing``         媒体**声称**在播（前端上报 ``!el.paused``）
+        ``moved``           播放头**曾经真的走过**（区分「用户暂停」与
+                            「自动播放被拦」）
+        ``alive``           前端**还在上报**（心跳在）⇒ 「前端失联」与
+                            「媒体暂停」是两件事
+        ================== ==========================================
+        """
+        with self._lock:
+            seen = self._ph_seen_at
+            playing = self._playing.get(stream_id)
+            if playing is None and self._last_ph is not None:
+                playing = bool(self._last_ph[1])
+            ended = self._ended.get(stream_id)
+            failed = self._failed.get(stream_id)
+            if ended is None and failed is None:
+                ended = failed = self._last_done
+            moved = self._ph_moved
+        # ⚠️ **心跳判据**（6 秒 = 3 个心跳）—— 前端的心跳间隔是 2 秒
+        # （``PH_HEARTBEAT_MS``）⇒ 6 秒没来就是「前端不在了」。
+        alive = seen > 0.0 and (time.time() - seen) <= _MEDIA_ALIVE_SEC
+        return {
+            "playing": bool(playing) if playing is not None else False,
+            "ended": bool(ended),
+            "failed": bool(failed),
+            "moved": bool(moved),
+            "alive": bool(alive),
+            # ⚠️ **播放头多久没动**（诊断用）——「用户暂停」与「缓冲卡住」
+            # 都表现为它变大，但 ``playing`` 能分开。
+            "stalled_sec": max(0.0, time.time() - self._ph_at)
+            if self._ph_at > 0.0 else 0.0,
+            "seen_age_sec": max(0.0, time.time() - seen) if seen > 0.0 else -1.0,
+        }
 
     # ------------------------------------------------------------------ #
     # 卡住判定
@@ -995,6 +1101,12 @@ class InterpEngine:
         self._last_seek_info: Optional[dict] = None
         self._gate = Gate("now")
         self._counters = _Counters()
+        #: **这一轮是哪个标签页发起的**（2026-11-25）—— 引擎是全局单例 ⇒
+        #: 多标签页的播放头会**互相覆盖** ⇒ 只有发起方（或刷新后接管的那
+        #: 一个）的播放头算数。空 = 不限制（老客户端）。
+        self._client_id: str = ""
+        #: **被忽略的播放头上报数**（别的标签页发来的）—— 诊断用。
+        self._ph_ignored: int = 0
         #: **每句的分段计时**（诊断「滞后 15 秒」到底花在哪一段）：
         #: ``{index, text, src_start, src_end, t_seg, t_tr, t_submit, t_text}``
         #: * ``t_seg``   —— ASR 切出这句的时刻（wall clock）
@@ -1047,8 +1159,23 @@ class InterpEngine:
     def start(self, *, mode: str = "steady", gate: str = "now",
               target_lang: str = "zh-CN", speaker: Optional[str] = None,
               ref_speaker: Optional[str] = None,
-              volume: Optional[float] = None, source: str = "live") -> dict:
+              volume: Optional[float] = None, source: str = "live",
+              client_id: str = "") -> dict:
         with self._lock:
+            # ⚠️⚠️ **记住「这一轮是哪个标签页发起的」**（2026-11-25）——
+            #
+            # 引擎是**全局单例** ⇒ 多个标签页共用一个 ⇒ 播放头也共用一个
+            # 键（``stream_id``）⇒ **后上报的覆盖先上报的**。
+            #
+            # ⇒ 实测那一轮日志里有 **6 个浏览器连接**同时上报播放头
+            # （172.16.9.18 的 6 个源端口）⇒ 播放头在 6 个标签页的位置之间
+            # **来回跳** ⇒ 时钟的对齐判定完全失效 ⇒ **声音不跟随字幕**。
+            #
+            # ⇒ 用**标签页 id**（前端存在 ``sessionStorage`` ⇒ 刷新后不变、
+            # 不同标签页不同）把播放头**按客户端隔离**。
+            cid = str(client_id or "").strip()
+            if cid:
+                self._client_id = cid
             self._mode = mode if mode in ("fast", "steady") else "steady"
             self._gate_mode = gate if gate in ("now", "follow") else "now"
             self._target_lang = target_lang or "zh-CN"
@@ -1587,13 +1714,26 @@ class InterpEngine:
 
     def on_playhead(self, stream_id: str, playhead_sec: float,
                     playing: bool, ended: bool = False,
-                    failed: bool = False) -> dict:
+                    failed: bool = False, client_id: str = "") -> dict:
         """前端上报播放头（250 ms 一次）。
 
         ⚠️ ``ended`` / ``failed`` = **源不会再往前走**（媒体播完 / 媒体
         加载失败）⇒ 放行器**不再等**（不然剩下的句子被永久压住 ⇒
         「只播放了第一句」，实测踩过）。
+
+        ⚠️⚠️ **按标签页隔离**（2026-11-25）—— 引擎是**全局单例** ⇒ 多个
+        标签页的播放头**共用一个键** ⇒ 后上报的覆盖先上报的。
+        ⇒ 实测那一轮日志里有 **6 个浏览器连接**同时上报 ⇒ 播放头在 6 个
+        位置之间来回跳 ⇒ 对齐判定完全失效 ⇒ **声音不跟随字幕**。
+        ⇒ ⇒ 只认**发起这一轮的标签页**（``client_id``）的播放头。
         """
+        # ⚠️ **别的标签页发来的 ⇒ 不认**（但要记账 ⇒ 面板能说明为什么）。
+        cid = str(client_id or "").strip()
+        with self._lock:
+            want = self._client_id
+            if want and cid and cid != want:
+                self._ph_ignored += 1
+                return {"ok": True, "seek": False, "ignored": True}
         self._set_stream(stream_id)
         # ⚠️ **记下「播放头最后一次到」的墙钟**（2026-11-25）——
         #
@@ -2314,6 +2454,14 @@ class InterpEngine:
                 pending = list(self._pending)
             if not pending:
                 continue
+            # ⚠️⚠️ **提交窗口**（2026-11-25）—— 只把「播放头前方
+            # ``SUBMIT_WINDOW_SEC`` 秒」的译文送进 TTS ⇒ 队列里始终只有
+            # 「马上就要播」的内容 ⇒ TTS 追得上 ⇒ **声音贴着字幕走**
+            # （实测那一轮队列堆了 184 秒 ⇒ 播放头要的那句排在队尾 ⇒
+            #  被饿死 ⇒ 声音落后 / 跑到画面前面）。
+            pending = self._within_window(pending)
+            if not pending:
+                continue
             now = time.time()
             if not self._batch_ready(pending, now):
                 continue
@@ -2326,6 +2474,19 @@ class InterpEngine:
             # ⇒ 仍然不是字幕的节奏）。
             if self._source == "video":
                 batch = batch[:self._video_batch_size(batch)]
+            elif self._source == "file":
+                # ⚠️⚠️ **文件源也要限量**（2026-11-25）——
+                #
+                # 有了**提交窗口**（:data:`SUBMIT_WINDOW_SEC` = 45 秒），
+                # 待播的内容最多有 45 秒 ⇒ 原来「攒够 18 秒就整批放」的
+                # 口径会把**整窗**都塞进**一个** TTS 作业 ⇒
+                # * 一个作业就是 **45 秒**的连续语音 ⇒ 用户按了暂停 ⇒
+                #   「按住」要等这 45 秒全播完才生效（用户要的是「播完
+                #   **当前字幕**的翻译就停」）；
+                # * 一次开口的固定开销摊在 45 秒上 ⇒ 万一要重试，代价也大。
+                #
+                # ⇒ 限成「**刚好够 18 秒**」（恢复 M29 的批次大小）。
+                batch = batch[:self._file_batch_size(batch)]
             with self._lock:
                 for seg in batch:
                     if seg in self._pending:
@@ -2334,6 +2495,54 @@ class InterpEngine:
                     self._ready_since.pop(seg.index, None)
             self._submit(batch)
             self._refresh_status()
+
+    def _within_window(self, pending: list) -> list:
+        """**提交窗口**过滤：只留「播放头前方 ``SUBMIT_WINDOW_SEC`` 秒内」的译文。
+
+        ⚠️⚠️ **为什么必须有它**（实测 2026-11-25，用户报「同传的声音播报还是
+        没有跟随视频中当前显示的翻译字幕」—— 实测那一轮
+        ``queued_audio_sec=184.23`` / ``depth=11`` / ``lag_sec=173.89``）：
+
+        * 文件 / 视频源是**离线一次性转写**的 ⇒ 译文**产出速度远快于播放头**
+          （一次转写完 ⇒ 几十秒内攒出几百句译文）；
+        * TTS 产能只有 **~1.0× 实时**（每句还有 ~2 s 首窗）⇒ **追不上**
+          ⇒ 队列里堆出**上百秒**的待播内容；
+        * 而队列是**先进先出** ⇒ TTS 先做**最老**的那几段（位置早被播放头
+          越过了）⇒ **播放头此刻要的那一句排在队尾** ⇒ **被饿死**
+          ⇒ 声音要么落后几十秒，要么（兜底放行时）跑到画面前面。
+
+        ⇒ 只把「播放头前方 N 秒」的译文送进 TTS ⇒ 队列里始终只有**马上
+        就要播**的内容 ⇒ TTS 追得上 ⇒ **声音贴着字幕走**。
+
+        ⚠️ **窗口外的内容不丢** —— 它们留在 ``_pending`` 里 ⇒ 播放头往前走
+        ⇒ 自然进入窗口 ⇒ 自然被提交（**不是丢弃**）。
+
+        ⚠️ **源播完了 ⇒ 不过滤**（剩下的全放 ⇒ 补播）—— 否则窗口永远等
+        不到播放头 ⇒ 尾巴上的译文**永远播不出来**。
+        """
+        if self._gate_mode != "follow":
+            return pending
+        if self._source not in ("file", "video"):
+            return pending
+        try:
+            if self._gate.source_done(self._source_stream_id()):
+                return pending          # 源结束了 ⇒ 剩下的全放（补播）
+            ph = self._gate.playhead(self._source_stream_id())
+        except Exception:  # noqa: BLE001
+            return pending
+        if ph is None:
+            return pending              # 没有播放头 ⇒ 不限制（老行为）
+        limit = float(ph) + SUBMIT_WINDOW_SEC
+        out = []
+        for seg in pending:
+            try:
+                start = float(getattr(seg, "src_start_sec", -1.0) or -1.0)
+            except (TypeError, ValueError):
+                start = -1.0
+            # ⚠️ **位置未知**（实时流 / 老数据）⇒ 不限制它。
+            if start < 0.0 or start <= limit:
+                out.append(seg)
+        return out
 
     def _batch_ready(self, pending: list, now: float) -> bool:
         """这一批**可以送进 TTS**了吗？
@@ -2414,6 +2623,27 @@ class InterpEngine:
             acc += _estimate_audio_sec(seg.translated or "")
             n += 1
             if acc >= target:
+                break
+        return max(1, n)
+
+    def _file_batch_size(self, batch: list) -> int:
+        """**文件源**：这一批取几句（最多 ~:data:`MERGE_MIN_AUDIO_SEC` 秒音频）。
+
+        ⚠️ **为什么要限量**（2026-11-25）—— 见 :meth:`_gate_worker` 里的说明：
+        有了**提交窗口**之后，待播内容最多 45 秒 ⇒ 不限量的话**一个作业
+        就是 45 秒**的连续语音 ⇒
+        * 「用户暂停 ⇒ 按住」要等这 45 秒播完才生效（用户要的是「播完
+        **当前字幕**的翻译就停」）；
+        * 一次开口的固定开销摊得太开 ⇒ 重试的代价也大。
+
+        ⇒ 限成「**刚好够 18 秒**」（= 攒批阈值）⇒ 恢复 M29 的批次大小。
+        """
+        acc = 0.0
+        n = 0
+        for seg in batch:
+            acc += _estimate_audio_sec(seg.translated or "")
+            n += 1
+            if acc >= MERGE_MIN_AUDIO_SEC:
                 break
         return max(1, n)
 
@@ -2649,11 +2879,28 @@ class InterpEngine:
                 return
             self._clocked = clocked
         try:
-            from app.core.audio.tts_bridge import queue_set_clock
+            from app.core.audio.tts_bridge import (
+                queue_set_clock,
+                queue_set_media_state,
+            )
             if self._gate_mode == "follow":
                 res = queue_set_clock(self._playhead_provider, 0.0)
+                # ⚠️⚠️ **媒体状态也要接上**（2026-11-25）——
+                # 播放时钟只知道「播放头在哪」，**不知道「媒体是不是暂停了」**
+                # ⇒ 暂停时播放头不动 ⇒ 8 秒兜底放行 ⇒ **积压一次性狂喷**
+                # （实测 184 秒 ⇒ 声音跑到画面前面 174 秒 ⇒ 用户报「声音不
+                # 跟随字幕」+「暂停了还在播」）。
+                # ⇒ 这一路让队列能分清「暂停 / 失联 / 播完」。
+                try:
+                    queue_set_media_state(self._media_state_provider)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.debug("interp: 设媒体状态失败: %s", exc)
             else:
                 res = queue_set_clock(None, 0.0)
+                try:
+                    queue_set_media_state(None)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.debug("interp: 关媒体状态失败: %s", exc)
             # ⚠️ **记 INFO 不记 DEBUG** —— 「时钟没接上」的症状是
             # 「译文跑在画面前面几十秒」，而 DEBUG 在生产日志里看不到 ⇒
             # 排查时完全没有线索（踩过）。
@@ -2673,6 +2920,31 @@ class InterpEngine:
             return self._gate.playhead(self._source_stream_id())
         except Exception:  # noqa: BLE001
             return None
+
+    def _media_state_provider(self) -> dict:
+        """给 TTS 队列的**媒体状态**用（2026-11-25）。
+
+        ⚠️ **为什么必须单独一路**（用户报「视频暂停了同传还在播」「声音
+        不跟随当前字幕」）：播放时钟只回答「播放头在哪」⇒ 媒体暂停时
+        播放头**不动**⇒ 8 秒兜底放行⇒ **积压一次性狂喷**（实测 184 秒）。
+
+        ⇒ 这一路回答「源到底怎么了」：**暂停 / 前端失联 / 播完 / 坏了**
+        ⇒ 队列据此**按住**或**放行**。
+        """
+        try:
+            return self._gate.media_state(self._source_stream_id())
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def media_paused(self) -> bool:
+        """媒体**是不是暂停了**（用户按了暂停）—— 给面板显示用。"""
+        try:
+            st = self._gate.media_state(self._source_stream_id())
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(st.get("alive") and not st.get("playing")
+                    and st.get("moved") and not st.get("ended")
+                    and not st.get("failed"))
 
     def _playhead_age(self) -> float:
         """播放头**最后一次到**是多久以前（秒；没到过 = -1）。
@@ -2837,6 +3109,17 @@ class InterpEngine:
                 # ⇒ 做成**看得见的信号** ⇒ 面板能直接说清楚「为什么不跟」。
                 "playhead_age_sec": self._playhead_age(),
                 "playhead_missing": self._playhead_missing(),
+                # ⚠️⚠️ **媒体暂停了**（2026-11-25，P3）——
+                # 用户按了暂停 ⇒ **播报也按住**（队列侧 ``_clock_ready``
+                # 会返回 False）⇒ 面板要**明确告诉用户**「暂停中，播报已
+                # 跟着停」，否则用户以为卡住了。
+                "media_paused": self.media_paused(),
+                # ⚠️ **别的标签页发来的播放头被忽略了几次**（2026-11-25）——
+                # 引擎是全局单例 ⇒ 多标签页会互相覆盖播放头 ⇒ 实测那一轮
+                # 有 6 个连接同时上报 ⇒ 对齐判定失效。
+                "ph_ignored": self._ph_ignored,
+                # ⚠️ **这一轮是不是按标签页隔离的**（诊断用）。
+                "client_bound": bool(self._client_id),
                 "last_error": c.last_error,
                 "playhead_sec": self._gate.playhead(self._source_stream_id()),
             }

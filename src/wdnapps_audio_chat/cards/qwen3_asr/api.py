@@ -793,7 +793,21 @@ async def post_translate_line(payload: TranslateLinePayload) -> dict:
     seq = int(payload.seq) if payload.seq is not None else 0
     svc = get_translation_service()
     if not svc.status().get("enabled"):
-        return {"ok": False, "skipped": "翻译没开"}
+        # ⚠️⚠️ **把服务端的权威开关值一起回给前端**（2026-11-26）——
+        #
+        # 拒收本身前端能看见，但它**不知道该拿哪个值当权威** ⇒ 它会一直
+        # 以为「实时翻译是开着的」⇒ 每 5 秒重试一次、永远不停（实测
+        # ~67 次/分 × 6 个标签页）。
+        #
+        # 典型的触发场景：**服务重启** ⇒ 服务端开关复位成关，而页面里的
+        # 勾还是开的（页面没刷新）⇒ 前端与服务端**不一致**。
+        #
+        # ⇒ 明确回传 ``enabled: False`` ⇒ 前端把本地开关拉回来、立刻停手。
+        return {
+            "ok": False,
+            "skipped": "翻译没开",
+            "enabled": False,
+        }
     svc.submit(
         index=_TR_LINE_INDEX_BASE + seq,
         text=payload.text,
@@ -870,6 +884,13 @@ class InterpStartPayload(BaseModel):
     volume: Optional[float] = None
     #: 来源标签："live" / "file" —— 只影响面板提示与滞后口径
     source: Optional[str] = None
+    #: **标签页 id**（2026-11-25）—— 引擎是**全局单例** ⇒ 多个标签页会
+    #: **共用一个播放头槽位** ⇒ 后上报的覆盖先上报的 ⇒ 实测那一轮有 **6 个
+    #: 浏览器连接**同时上报 ⇒ 播放头来回跳 ⇒ 对齐失效 ⇒ 声音不跟随字幕。
+    #: ⇒ 记住「这一轮是哪个标签页发起的」⇒ 只认它的播放头。
+    #:
+    #: ⚠️ 空 = 不限制（老客户端 / 老前端）。
+    client_id: Optional[str] = None
 
 
 class InterpSettingsPayload(BaseModel):
@@ -896,6 +917,9 @@ class InterpPlayheadPayload(BaseModel):
     ended: bool = False
     #: **媒体加载/播放失败** ⇒ 同样源不会再往前走 ⇒ 直接补播。
     failed: bool = False
+    #: **标签页 id**（2026-11-25）—— 只认**发起这一轮**的标签页的播放头
+    #: （引擎是全局单例 ⇒ 多标签页会互相覆盖播放头 ⇒ 对齐失效）。
+    client_id: Optional[str] = None
 
 
 @router.get("/interp/languages")
@@ -951,6 +975,8 @@ async def post_interp_start(payload: Optional[InterpStartPayload] = Body(None)) 
         ref_speaker=data.ref_speaker,
         volume=data.volume,
         source=data.source or "live",
+        # ⚠️ **标签页 id**（2026-11-25）—— 只认这个标签页的播放头。
+        client_id=str(data.client_id or ""),
     )
     return {"ok": True, **status}
 
@@ -1043,6 +1069,7 @@ async def post_interp_playhead(payload: Optional[InterpPlayheadPayload] = Body(N
     return get_interp_engine().on_playhead(
         str(data.stream_id or ""), float(data.playhead_sec or 0.0),
         bool(data.playing), bool(data.ended), bool(data.failed),
+        str(data.client_id or ""),
     )
 
 
