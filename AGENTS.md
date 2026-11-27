@@ -2151,3 +2151,34 @@ cd /userdata/wdnwebui
 .venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_export.py --no-npu   # 含 G1（批次缓存）
 .venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_export.py --http     # 含 G2（真机复用）
 ```
+
+### ⚠️⚠️ 翻译的**目标语言是全局单例** ⇒ 两个必须防的坑
+
+用户实测（2026-11-27）：「**配音导出**选择英文，但是生成的文件播放是中文」。
+
+**根因**：翻译服务（`TranslationService`）是**单例**，「目标语言」是它的
+**全局**属性（`_target_lang`）⇒ 两个地方会互相带偏：
+
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| ① **复用带偏** | 页面那次识别的译文是按**页面上的**目标语言翻的（zh-CN）；导出选英文 ⇒ 复用把**中文**译文当英文用了 ⇒ 文件名叫 `_en_`、内容是中文 | 批次缓存记下**每条译文的目标语言**；复用前**逐条比对**目标语言，不一致 ⇒ **不复用**，退回自己识别 |
+| ② **自己的那批被带偏** | 导出跑自己的 ASR 时，页面改了「实时翻译目标语言」⇒ 全局值变了 ⇒ 导出的句子被翻成**别的语言** | `submit(..., target_lang=...)` **逐批指定**目标语言（`_Item.strict_target` ⇒ 处理时**必须**用它，不看全局值） |
+
+⇒ 配音导出那条路：`transcribe_stream(..., target_lang=job.target_lang)`
+⇒ `_tr_ctx["target_lang"]` ⇒ `submit(target_lang=...)` ⇒ `_Item.target_lang`。
+
+⚠️ **页面那条路维持老行为**（不传 `target_lang` ⇒ `strict_target=False`
+⇒ 处理时仍用全局值）⇒ 页面中途改目标语言，老句子仍按新语言翻 ✓。
+
+⚠️ **「源语 == 目标语」是**透传**（`status="skipped"`，译文 = 原文）**
+⇒ 批次缓存**也要记 `skipped`**（导出成同语种时根本不需要翻译模型）
+⇒ 但「**没有可译内容**」的碎片（只有标点）**不记**（否则导出会多出一条
+只有标点的句子，TTS 去念它）。
+
+### 回归
+
+```bash
+cd /userdata/wdnwebui
+.venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_export.py --http
+# ⇒ G2 段含「同语言 ⇒ 复用」「不同语言 ⇒ 不复用且译文是英文」两条断言
+```

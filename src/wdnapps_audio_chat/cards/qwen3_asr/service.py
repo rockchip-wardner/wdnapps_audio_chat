@@ -2102,6 +2102,9 @@ class _AsrManager:
                 # ⚠️ **批次号 = rid** —— 这一批的句子会被归到一起 ⇒
                 # 识别跑完时整份取走 ⇒ 配音导出**复用**这次识别。
                 batch_id=str(ctx.get("rid") or ""),
+                # ⚠️ **这一批要翻成的语言**（配音导出显式指定 ⇒ 不受
+                # 「页面改了全局目标语言」影响）。
+                target_lang=str(ctx.get("target_lang") or ""),
                 # ⚠️ **时间**是给「画面字幕显示双语」用的：前端要靠它把
                 # 译文挂到对应的字幕行上（按时间重叠匹配）。
                 start_sec=start_sec,
@@ -2228,6 +2231,7 @@ class _AsrManager:
         source_info: Optional[Dict[str, Any]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         tr_mode: str = "sentence",
+        target_lang: str = "",
     ) -> int:
         """发起一次**流式**识别（文件 / 视频）。返回 request_id。
 
@@ -2385,6 +2389,8 @@ class _AsrManager:
                     "stream_id": "file-{}".format(rid),
                     "base": rid * _TR_FILE_INDEX_BASE,
                     "loop": loop,
+                    # ⚠️ **这一批要翻成的语言**（配音导出显式指定）
+                    "target_lang": str(target_lang or ""),
                 }
             # 新的一段 ⇒ 时间表归零（段内坐标）
             self._tr_time_reset()

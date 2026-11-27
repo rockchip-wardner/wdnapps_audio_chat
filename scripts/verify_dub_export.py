@@ -391,7 +391,7 @@ def part_g_http(base: str) -> None:
     rounds = st.get("round_count") or 0
     check("识别出了轮次", rounds > 0, f"round_count={rounds}")
 
-    # ③ 导出 ⇒ **应当复用**
+    # ③ 导出（**目标语言与页面那次相同**）⇒ **应当复用**
     code, d = _api("POST", "/api/qwen3-asr/dub/start",
                    {"kind": "audio", "path": src, "target_lang": "zh-CN",
                     "ref_speaker": "news_female"}, base=base, timeout=60)
@@ -401,7 +401,8 @@ def part_g_http(base: str) -> None:
           f"state={job.get('state')} err={job.get('error')}")
     warns = " | ".join(job.get("warnings") or [])
     check("导出**复用了**页面上那次识别（没有重新识别）",
-          "复用" in warns, f"warnings={warns!r}")
+          "复用" in warns and "没有重新识别" in warns,
+          f"warnings={warns!r}")
     sents = job.get("sentences") or []
     check("复用到的句子带原文 + 译文 + 时间",
           bool(sents) and all(s.get("orig") and s.get("trans")
@@ -410,18 +411,52 @@ def part_g_http(base: str) -> None:
     check("产物落在源文件同级目录",
           bool(audio) and Path(audio).parent == Path(src).parent, audio)
 
+    # ④ ⚠️ **目标语言不同** ⇒ **绝不能复用** ——
+    #    用户实测：「配音导出选择英文，生成的文件播放是中文」。
+    #    页面那次识别的译文是**页面上的**目标语言（zh-CN）⇒ 拿来当英文
+    #    导出用 ⇒ 文件名叫 ``_en_``、内容却是中文。
+    code, d = _api("POST", "/api/qwen3-asr/dub/start",
+                   {"kind": "audio", "path": src, "target_lang": "en",
+                    "ref_speaker": "news_female"}, base=base, timeout=60)
+    check("（语言不同）导出作业已受理", code == 200 and isinstance(d, dict),
+          f"得到 {code}")
+    job2 = _wait_job(base, limit=1800,
+                     job_id=str((d or {}).get("id") or ""))
+    check("（语言不同）导出作业成功", job2.get("state") == "done",
+          f"state={job2.get('state')} err={job2.get('error')}")
+    warns2 = " | ".join(job2.get("warnings") or [])
+    check("（语言不同）**没有**复用页面那次译文",
+          "没有重新识别" not in warns2, f"warnings={warns2!r}")
+    check("（语言不同）已重新识别并翻译",
+          "重新识别" in warns2, f"warnings={warns2!r}")
+    sents2 = job2.get("sentences") or []
+    zh = sum(1 for s in sents2
+             if any("\u4e00" <= c <= "\u9fff" for c in (s.get("trans") or "")))
+    check("（语言不同）译文是**英文**（没有汉字）", zh == 0,
+          f"{zh}/{len(sents2)} 句含汉字")
+
 
 # --------------------------------------------------------------------------- #
 # C / D. 真机端到端（走运行中的服务）
 # --------------------------------------------------------------------------- #
-def _wait_job(base: str, limit: float = 2400.0) -> dict:
+def _wait_job(base: str, limit: float = 2400.0,
+              job_id: str = "") -> dict:
+    """等一个配音导出作业跑完。
+
+    ⚠️ **必须按作业 id 等** —— ``/dub/status`` 返回的是**最新那个**作业；
+    下一个作业刚 POST 出去、还没顶掉上一个时，状态里还是**上一个已经
+    done 的作业** ⇒ 不按 id 等就会读到**上一次的产物**（假失败）。
+    """
     deadline = time.time() + limit
     while time.time() < deadline:
         st = _api("GET", "/api/qwen3-asr/dub/status", base=base)[1]
-        if isinstance(st, dict) and st.get("state") in ("done", "error",
-                                                       "stopped"):
+        if not isinstance(st, dict):
+            time.sleep(1.0)
+            continue
+        same = (not job_id) or (str(st.get("id") or "") == str(job_id))
+        if same and st.get("state") in ("done", "error", "stopped"):
             return st
-        time.sleep(3.0)
+        time.sleep(2.0)
     return _api("GET", "/api/qwen3-asr/dub/status", base=base)[1]
 
 
@@ -453,7 +488,7 @@ def part_c(base: str) -> None:
         "ref_speaker": "news_female"}, base=base)
     check("音频导出：接口接受了作业", code == 200 and d.get("ok"),
           f"得到 {code} {d}")
-    st = _wait_job(base)
+    st = _wait_job(base, job_id=str((d or {}).get("id") or ""))
     print("  状态:", st.get("state"), "|", st.get("phase"), "|",
           st.get("error") or "")
     check("音频导出：作业成功", st.get("state") == "done",
@@ -509,7 +544,7 @@ def part_d(base: str) -> None:
         "ref_speaker": "news_female"}, base=base)
     check("视频导出：接口接受了作业", code == 200 and d.get("ok"),
           f"得到 {code} {d}")
-    st = _wait_job(base)
+    st = _wait_job(base, job_id=str((d or {}).get("id") or ""))
     print("  状态:", st.get("state"), "|", st.get("phase"), "|",
           st.get("error") or "")
     check("视频导出：作业成功", st.get("state") == "done",

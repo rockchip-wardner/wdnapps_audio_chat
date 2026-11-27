@@ -627,6 +627,9 @@ class DubEngine:
                 # ⚠️ **句级翻译** —— 字幕要按「句」来对时间（行级是前端
                 # 驱动的，导出这条链路不经过前端）。
                 tr_mode="sentence",
+                # ⚠️ **这一批翻成导出选的语言** —— 翻译服务的目标语言是
+                # 全局的（页面改下拉会带偏）⇒ 这里显式钉死。
+                target_lang=job.target_lang,
                 # ⚠️ **主事件循环** —— 译文要广播给 WS 订阅者，而订阅队列
                 # 属于主循环 ⇒ 必须把主循环传下去（在 ``start()`` 里抓的）。
                 loop=job.loop,
@@ -740,6 +743,24 @@ class DubEngine:
             raise
         except Exception as exc:  # noqa: BLE001 — 复用是 best-effort
             LOG.debug("dub: 复用识别结果失败（退回自己识别）: %s", exc)
+            return []
+
+        # ⚠️⚠️ **目标语言必须一致** —— 页面那次识别的译文是按**页面上的**
+        # 「实时翻译目标语言」翻的；导出要的是**导出下拉里选的语言**。
+        # ⇒ 两者不同 ⇒ **绝不能复用**（否则文件名写着 ``_en_``、内容却是
+        # 中文 —— 用户实测：「配音导出选择英文，生成的文件播放是中文」）。
+        want_lang = str(job.target_lang or "").strip().lower()
+        got_langs = {str((r or {}).get("target_lang") or "").strip().lower()
+                     for r in rows}
+        got_langs.discard("")
+        if want_lang and (got_langs != {want_lang}):
+            LOG.info(
+                "dub: 复用的译文是 %s 的，导出要 %s ⇒ 自己再识别一遍",
+                "/".join(sorted(got_langs)) or "（未知）", want_lang)
+            job.warnings.append(
+                "页面那次识别的译文是 {} 的，与本次目标语言 {} 不同 ⇒ "
+                "已重新识别并翻译".format("/".join(sorted(got_langs)) or "未知",
+                                          want_lang))
             return []
 
         out: List[DubSentence] = []

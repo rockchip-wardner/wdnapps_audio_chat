@@ -85,14 +85,17 @@ class _Item:
     """队列里的一项：一句待译的话。"""
 
     __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at",
-                 "gen", "start_sec", "end_sec", "seq", "batch_id")
+                 "gen", "start_sec", "end_sec", "seq", "batch_id", "target_lang",
+                 "strict_target")
 
     def __init__(self, index: int, text: str, lang: str, stream_id: str,
                  loop: Any, enqueued_at: float, gen: int = 0,
                  start_sec: Optional[float] = None,
                  end_sec: Optional[float] = None,
                  seq: Optional[int] = None,
-                 batch_id: str = ""):
+                 batch_id: str = "",
+                 target_lang: str = "",
+                 strict_target: bool = False):
         self.index = index
         self.text = text
         self.lang = lang
@@ -115,6 +118,18 @@ class _Item:
         #: 一起（见 :meth:`TranslationService.batch_results`）。
         #: 实时（麦克风）路径没有这个（``""``）。
         self.batch_id = batch_id
+        #: **入队时的目标语言** —— 翻译服务是**单例**、目标语言是**全局**
+        #: 的 ⇒ 这句**入队时**的目标语言才是它**真正会被翻成**的语言
+        #: （处理时全局值可能已经变了）。
+        #:
+        #: ⚠️ 配音导出靠它判断「这批译文能不能复用」—— 页面翻成中文、
+        #: 导出要英文 ⇒ **不能复用**（否则文件名叫 ``_en_``、内容却是
+        #: 中文）。
+        self.target_lang = target_lang
+        #: **是不是显式指定的** —— 显式指定（配音导出那一批）⇒ 处理时
+        #: **必须**用它，不能被「页面改了全局目标语言」带偏；
+        #: 没指定（页面那条路）⇒ 维持老行为（用处理时的全局值）。
+        self.strict_target = bool(strict_target)
 
 
 class TranslationService:
@@ -176,7 +191,17 @@ class TranslationService:
 
         ⚠️ **只有成功的句子才记** —— 失败/跳过的没有译文，导出会拿到空句。
         """
-        if status != "done":
+        # ⚠️ **「skipped」也要记** —— 那是「源语 == 目标语 ⇒ 透传」
+        # （译文 = 原文，见 :meth:`_handle`）⇒ 对配音导出来说**完全可用**
+        # （导出成同语种时根本不需要翻译模型）。
+        if status not in ("done", "skipped"):
+            return
+        text = (text or "").strip()
+        if not text:
+            return
+        # ⚠️ **「没有可译内容」的碎片**（只有标点）⇒ 不记 ——
+        # 记下来会让配音导出多出一条「只有标点」的句子（TTS 会去念它）。
+        if not any(ch.isalnum() for ch in text):
             return
         batch = str(item.batch_id or "")
         if not batch:
@@ -188,6 +213,8 @@ class TranslationService:
                 "trans": text,
                 "start_sec": item.start_sec,
                 "end_sec": item.end_sec,
+                # ⚠️ **这批译文的目标语言** —— 配音导出靠它判断能不能复用。
+                "target_lang": item.target_lang,
             })
             if batch not in self._batch_order:
                 self._batch_order.append(batch)
@@ -292,7 +319,8 @@ class TranslationService:
                loop: Any, start_sec: Optional[float] = None,
                end_sec: Optional[float] = None,
                seq: Optional[int] = None,
-               batch_id: str = "") -> None:
+               batch_id: str = "",
+               target_lang: str = "") -> None:
         """送来一句待译的话。
 
         ``start_sec`` / ``end_sec`` —— 这句话的**音频时间范围**（可选）。
@@ -306,6 +334,11 @@ class TranslationService:
         传 ⇒ 这一批的句子会被**归到一起** ⇒ 识别跑完后可以整份取走
         （配音导出**复用**这次识别，不重复识别一遍）。
 
+        ``target_lang`` —— **这一批要翻成的语言**（留空 = 用全局的）。
+        ⚠️ 配音导出**显式**传 ⇒ 这一批**必须**翻成这个语言 —— 翻译服务
+        是**单例**、目标语言是**全局**的 ⇒ 页面改了下拉就会把正在跑的
+        导出带偏（「导出选英文、出来的却是中文」）。
+
         ⚠️ **绝不抛异常** —— 翻译出问题不许影响识别。
         """
         text = (text or "").strip()
@@ -314,8 +347,13 @@ class TranslationService:
                 return
             self._submitted += 1
             gen = self._gen
+            # ⚠️ **入队时的目标语言** —— 见 ``_Item.target_lang``。
+            #    显式指定的优先（配音导出那一批）。
+            _want = str(target_lang or "").strip()
+            tgt_lang = _want or str(self._target_lang or "")
         item = _Item(index, text, lang, stream_id, loop, time.monotonic(),
-                     gen, start_sec, end_sec, seq, str(batch_id or ""))
+                     gen, start_sec, end_sec, seq, str(batch_id or ""),
+                     tgt_lang, bool(_want))
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -370,7 +408,12 @@ class TranslationService:
                 self._dropped += 1
                 return
         t0 = time.monotonic()
-        target = self.settings()["target_lang"]
+        # ⚠️ **显式指定的目标语言优先** —— 这一批是配音导出的 ⇒ 必须翻成
+        # 它要的那个语言（全局值可能被页面改掉）。
+        if item.strict_target and item.target_lang:
+            target = item.target_lang
+        else:
+            target = self.settings()["target_lang"]
         status = "failed"
         text = ""
         reason = ""
