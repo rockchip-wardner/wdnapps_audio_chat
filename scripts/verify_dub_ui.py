@@ -264,6 +264,66 @@ def main() -> int:
               set(opts["dub"]) <= set(opts["tr"]),
               f"导出={opts['dub']!r} 显示={opts['tr']!r}")
 
+        section("B5. 识别的三个按钮必须与「配音导出」**同一档位置**")
+        # ⚠️ **为什么要有这条**（2026-11-27 用户要求）——
+        #   「清空 / 停止 / 开始识别」原来挂在**页面最底下**（结果框正上方），
+        #   而「配音导出」的「生成配音版 / 停止」是**控件行里并排**的
+        #   ⇒ 同一张卡上两套按钮位置完全不一样 ⇒ 用户要求把前者也搬上去，
+        #   跟「显示语言」「实时翻译」开关并排。
+        # ⇒ 现在三个按钮在「实时翻译」那一行里 ⇒ 断言钉住，防回退。
+        btns = page.evaluate(
+            """() => {
+                const ids = ['asr-reset-btn', 'asr-stop-btn', 'asr-start-btn'];
+                const tr = document.getElementById('asr-tr-block');
+                const ctrl = document.querySelector('.asr-controls');
+                const row = tr ? tr.querySelector('.asr-tr-head') : null;
+                const run = tr ? tr.querySelector('.asr-tr-run') : null;
+                const sel = document.getElementById('asr-tr-target');
+                const y = (el) => el ? Math.round(el.getBoundingClientRect().y) : -1;
+                const mid = (el) => {
+                    if (!el) return -1;
+                    const r = el.getBoundingClientRect();
+                    return Math.round(r.y + r.height / 2);
+                };
+                return {
+                    inTr: ids.filter((id) => !!tr.querySelector('#' + id)),
+                    inCtrl: ids.filter((id) => !!ctrl && !!ctrl.querySelector('#' + id)),
+                    sameRow: ids.every((id) => {
+                        const e = document.getElementById(id);
+                        return !!(row && e && row.contains(e));
+                    }),
+                    oneGroup: ids.every((id) => {
+                        const e = document.getElementById(id);
+                        return !!(run && e && run.contains(e));
+                    }),
+                    btnY: y(document.getElementById('asr-start-btn')),
+                    selY: y(sel),
+                    // ⚠️ **比垂直中心，不比顶边** —— 按钮和下拉的**高度不同**
+                    //    （``align-items: center``）⇒ 顶边差几像素是正常的，
+                    //    只要在**同一行**就对了。
+                    btnMid: mid(document.getElementById('asr-start-btn')),
+                    selMid: mid(sel),
+                    ctrlHasMode: !!(ctrl && ctrl.querySelector('#asr-mode')),
+                    dubInRow: (() => {
+                        const d = document.getElementById('asr-dub-block');
+                        const r = d ? d.querySelector('.asr-tr-head') : null;
+                        const b = document.getElementById('asr-dub-start');
+                        return !!(r && b && r.contains(b));
+                    })(),
+                };
+            }""")
+        check("三个按钮都在「实时翻译」块里", len(btns["inTr"]) == 3,
+              f"实际 = {btns['inTr']!r}")
+        check("三个按钮**不在**页面底部的控制行里", not btns["inCtrl"],
+              f"实际 = {btns['inCtrl']!r}")
+        check("三个按钮与「显示语言」**并排在同一行**", btns["sameRow"]
+              and abs(btns["btnMid"] - btns["selMid"]) <= 12,
+              f"按钮中心 y={btns['btnMid']} 下拉中心 y={btns['selMid']}")
+        check("三个按钮**成组**（窄屏时整组换行，不拆散）", btns["oneGroup"])
+        check("「配音导出」的「生成配音版」也在它自己的控件行里",
+              btns["dubInRow"], "防回退")
+        check("底部的「显示模式」下拉还在结果区那边", btns["ctrlHasMode"])
+
         section("C. 填**设备端路径** ⇒ 「生成配音版」必须可点")
         page.fill("#asr-source", args.source)
         page.wait_for_timeout(800)

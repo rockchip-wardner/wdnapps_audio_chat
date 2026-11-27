@@ -15,15 +15,17 @@
 }
 
 /* ---- 状态组（徽标 + 语种）----
-   它描述的是**下面**那块识别结果文本栏，所以被放在结果栏正上方、
-   「清空」按钮左边。组内两条元素挨在一起，跟右边的按钮组之间用
-   一条竖线分开 —— 免得「识别中」看着像是在给「清空」按钮做说明。 */
+   它描述的是**下面**那块识别结果文本栏，所以被放在结果栏正上方。
+   组内两条元素挨在一起；跟左边的「显示模式」之间用一条竖线分开。
+   ⚠️ 2026-11-27：三个动作按钮（清空 / 停止 / 开始识别）搬到了「实时
+   翻译」那一行 ⇒ 分隔竖线从**右边**（原来给「清空」按钮做分隔）挪到了
+   **左边**（现在右边是空的，留着会像少了一截）。 */
 .asr-status-group {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding-right: 4px;
-  border-right: 1px solid var(--border, #e5e7eb);
+  padding-left: 4px;
+  border-left: 1px solid var(--border, #e5e7eb);
   white-space: nowrap;
 }
 
@@ -635,6 +637,26 @@
   gap: 10px;
   flex-wrap: wrap;
   margin-bottom: 6px;
+}
+
+/* 「实时翻译」这一行里，识别按钮（清空 / 停止 / 开始识别）**成组**——
+   屏幕窄的时候整组一起换行，不会拆成「清空、停止」一行 + 「开始识别」
+   单独一行。 */
+.asr-tr-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+
+/* 「实时翻译」这一行里，翻译控件与识别按钮（清空 / 停止 / 开始识别）
+   之间的分隔竖线 —— 两组控件不是一回事，得让人一眼看出中间隔开了。 */
+.asr-tr-sep {
+  width: 1px;
+  align-self: stretch;
+  min-height: 24px;
+  margin: 0 2px;
+  background: var(--border, #e5e7eb);
 }
 
 .asr-tr-switch {

@@ -232,6 +232,32 @@
                 </label>
                 <button type="button" class="vd-btn" id="asr-tr-model-btn">启用翻译模型</button>
                 <span class="asr-live-status" id="asr-tr-status">翻译未启用</span>
+                <!--
+                  识别控制（清空 / 停止 / 开始识别）搬到这里（2026-11-27 用户要求）
+                  ==========================================================
+                  原来它们在**页面最底下**（结果框正上方那一行）⇒ 与「配音导出」
+                  里「生成配音版 / 停止」那种「控件行里并排」的样式对不上 ——
+                  一眼看过去，同一张卡上两套按钮的位置完全不一样。
+
+                  ⇒ 现在三个按钮与「显示语言」「实时翻译」开关**并排**在这行，
+                    中间一条竖线把「翻译这一组」和「识别这一组」分开。
+
+                  ⚠️ 三个按钮**包在一个组里**（``.asr-tr-run``）—— 屏幕窄的时候
+                    整组一起换行，不会出现「清空、停止」留在一行、「开始识别」
+                    单独掉到下一行那种断法。
+
+                  ⚠️ **JS 零改动** —— 前端一直按 **id** 取元素
+                    （``#asr-start-btn`` / ``#asr-stop-btn`` /
+                    ``#asr-reset-btn``）⇒ 搬 DOM 不影响逻辑，回归脚本里那几处
+                    ``getElementById`` / ``page.click("#asr-start-btn")``
+                    也不用动。
+                -->
+                <span class="asr-tr-run">
+                  <span class="asr-tr-sep" aria-hidden="true"></span>
+                  <button class="vd-btn" id="asr-reset-btn">清空</button>
+                  <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
+                  <button class="vd-btn vd-btn-primary" id="asr-start-btn" disabled>开始识别</button>
+                </span>
               </div>
               <!--
                 ⚠️ **说明必须紧贴自己解释的那一行**（2026-11-27 用户要求）——
@@ -404,21 +430,18 @@
                 状态组：徽标 + 语种。
 
                 它原来在**卡片头右上角** —— 离结果文本框隔着大半个卡片，
-                用户盯着下面那段文字时看不到 ⇒ 挪到**结果文本栏正上方**、
-                且排在「清空」按钮**左边**：状态描述的就是下面这块内容，
-                挨着才直观。
+                用户盯着下面那段文字时看不到 ⇒ 挪到**结果文本栏正上方**：
+                状态描述的就是下面这块内容，挨着才直观。
 
-                三个动作仍然**一组**、顺序不变（清空 → 停止 → 开始识别），
-                「清空」依然紧挨着「停止」。
+                ⚠️ 2026-11-27：三个动作按钮（清空 / 停止 / 开始识别）**搬走了**
+                —— 现在在「实时翻译」那一行（见上面）⇒ 这里只剩「显示模式」
+                和状态组 ⇒ 分隔竖线改到状态组**左边**（原来在右边，是给
+                「清空」按钮做分隔的）。
               -->
               <span class="asr-status-group">
                 <span class="imb-status" id="asr-state-badge" data-state="idle">空闲</span>
                 <span class="imb-meta-inline" id="asr-language"></span>
               </span>
-
-              <button class="vd-btn" id="asr-reset-btn">清空</button>
-              <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
-              <button class="vd-btn vd-btn-primary" id="asr-start-btn" disabled>开始识别</button>
             </div>
 
             <!--
