@@ -353,8 +353,32 @@ def part_g_http(base: str) -> None:
         check("源音频存在（%s）" % src, False, "找不到测试素材")
         return
 
-    _api("POST", "/api/qwen3-asr/translate/settings",
-         {"enabled": True, "target_lang": "zh-CN"})
+    # ⚠️⚠️ **两个前置条件** —— 少了任何一个，G2 都会**假失败**：
+    #   ① 翻译**开关**开着 + 目标语言 = zh-CN（复用是**按语言**判定的：
+    #      页面那次翻成什么语言，导出就得是那个语言才复用）；
+    #   ② 翻译**模型**已经 running（模型在重载时，那次识别的句子**翻不
+    #      出来** ⇒ 批次缓存是空的 ⇒ 无从复用 ⇒ 报「重新识别」）。
+    # ⇒ 之前这两条都靠「**上一个脚本留下的状态**」⇒ **顺序依赖** ⇒
+    #    换个顺序跑就红（实测踩到：前一个脚本把目标语言留成了无效值 ⇒
+    #    模型重载 ⇒ G2 报「没有复用」⇒ 其实跟复用机制本身无关）。
+    code, d = _api("POST", "/api/qwen3-asr/translate/settings",
+                   {"enabled": True, "target_lang": "zh-CN"}, base=base)
+    check("翻译开关已打开、目标语言 = zh-CN", code == 200,
+          f"code={code} {d}")
+    # ⚠️ **光等不够，还要先把它拉起来** —— 前一个脚本（``verify_asr_wizard_
+    # translate.py`` 的用例 2）会**停掉**翻译模型去测「模型起不来」的降级
+    # 路径 ⇒ 轮到本脚本时模型可能**正在被拉起**（或还停着）⇒
+    # 那样这次识别的句子**翻不出来** ⇒ 批次缓存是空的 ⇒ 无从复用。
+    _api("POST", "/api/qwen3-asr/translate/enable", {}, base=base, timeout=120)
+    deadline = time.time() + 180
+    ready = False
+    while time.time() < deadline:
+        stt = _api("GET", "/api/qwen3-asr/translate/status", base=base)[1] or {}
+        if isinstance(stt, dict) and (stt.get("model") or {}).get("running"):
+            ready = True
+            break
+        time.sleep(2.0)
+    check("翻译模型已就绪（否则句子翻不出来 ⇒ 无从复用）", ready)
 
     # ① 页面式识别（句级翻译 ⇒ 后端整段送译文）
     code, d = _api("POST", "/api/qwen3-asr/transcribe", base=base,
