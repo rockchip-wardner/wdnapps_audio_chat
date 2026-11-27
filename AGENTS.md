@@ -2340,3 +2340,42 @@ cd /userdata/wdnwebui
 * `/tmp/t_not_interrupt.py` —— 识别跑到一半点导出 ⇒ 识别**未被掐断**
   （状态一路到「完成」），服务端日志
   `dub: 页面上的识别还在跑 ⇒ 等它跑完（不打断它）`。
+
+## ⚠️ 配音导出必须**等本机 TTS 就绪**（2026-11-27 真机踩到）
+
+**症状**：配音导出报「合成失败: … session not loaded; send action='load'
+first」⇒ **整个作业失败**（音频 / 视频都没产物）。
+
+**根因**：`tts_bridge.synthesize_pcm` 走 `get_session("swcap_text_to_speech")`
+⇒ **本机优先，本机没有就退回 LAN peer**。而本机的 TTS 实例是
+`_ensure_tts()` 在**后台**拉起来的（实测加载 ~22 s）⇒ 导出刚开始合成时本机
+往往**还没就绪** ⇒ `get_session()` 抢先拿到**对端板子**的 TTS ⇒ 那个对端
+worker 的 session 没加载 ⇒ 报上面那句。
+
+⚠️ **别归咎到 `interp.py` 的「本机已经有实例 ⇒ 够了」那条捷径** ——
+`registry` 只在 worker **自己**回报 `running` 时才把 `inst.status` 写成
+`running`（`_probe_instance` 照抄 worker 的 `info`）⇒ 那条捷径是**可靠**的
+（2026-11-27 逐行核过 + 真机复现证明不是它）。
+
+⇒ **修法**：`DubEngine._wait_local_tts(job)` —— 合成**之前**等本机实例：
+
+* 查 `reg.list_sessions("swcap_text_to_speech", include_remote=False)`
+  （**只要本机**，对端不算）；
+* 每秒查一次，最多 `_DUB_WAIT_LOCAL_TTS_SEC = 180.0` s；
+* 等的时候阶段显示「**等语音模型就绪**」（用户看得懂为什么卡着）；
+* 超时**不硬失败** ⇒ 返回 False、继续合成（可能借对端），并在 `warnings`
+  里说清楚。
+
+⚠️ **等的时间不浪费** —— 等待放在**识别 + 翻译之后**（那两步已经跑过了）
+⇒ TTS 是后台加载的，合成前一般早就好了。
+
+⚠️ **为什么必须是本机**：对端的 TTS 要把文字发过网络、把 PCM 拉回来 ⇒
+又慢又不稳（同传那边早就因此规定「语音必须本机出」）。
+
+**真机验证**（2026-11-27）：把本机的 qwen3-tts 实例删掉（模拟开机没有
+本地 TTS）⇒ 导出阶段出现「等语音模型就绪」（~18 s）⇒ 合成全程
+`get_session(swcap_text_to_speech): LOCAL instance` ⇒ 导出成功（wav + mp4
+都出来了）。
+
+回归：插件仓 `verify_dub_export.py` 的 **H 段**（6 条：源码级「合成前必须
+等」+ 行为级「等到了才返回」「确实等过」「等不到返回 False」「说清楚」）。

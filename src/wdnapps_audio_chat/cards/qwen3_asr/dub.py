@@ -81,6 +81,12 @@ _MIN_CUE_SEC = 0.6
 #: ⇒ 超时了只能停掉（不然导出永远进不去）⇒ 那时在 ``warnings`` 里说清楚。
 _DUB_WAIT_PAGE_ASR_SEC = 1800.0
 
+#: **等本机的 TTS 实例就绪**最多等多久（秒）。
+#: ⚠️ TTS 加载实测 ~22 s ⇒ 180 s 足够从零起一个。
+#: ⇒ 超时了**不放弃**（继续合成，只是可能借对端的算力）⇒ 在 ``warnings``
+#:    里说清楚。
+_DUB_WAIT_LOCAL_TTS_SEC = 180.0
+
 #: 文件名里不安全的字符（换掉，别让用户拿到一个建不出来的路径）。
 _UNSAFE_NAME = re.compile(r"[^\w一-鿿.\-]+")
 
@@ -529,6 +535,58 @@ class DubEngine:
 
         threading.Thread(target=_run, name="dub-tts-ensure", daemon=True).start()
 
+    def _wait_local_tts(self, job: DubJob) -> bool:
+        """等**本板**的 TTS 实例就绪（合成之前**必须**等）。
+
+        ⚠️ **为什么必须等**（实测 2026-11-27）：
+        ``synthesize_pcm`` 走 ``get_session("swcap_text_to_speech")`` ⇒
+        **本机优先，本机没有就退回 LAN peer**。而本机的 TTS 实例是
+        ``_ensure_tts()`` 在**后台**拉起来的（要 ~22 s 才加载完）⇒
+        导出刚开始合成时本机往往**还没就绪** ⇒ ``get_session()`` 抢先拿到
+        **对端板子**的 TTS ⇒ 那个对端 worker 的 session 没加载 ⇒ 合成报
+        「session not loaded; send action='load' first」（实测 2026-11-27
+        04:05:14，整个作业失败）。
+
+        ⇒ 所以：**合成之前先等本机的 TTS 跑起来**（等期间不浪费时间 ——
+        识别 + 翻译已经在前面跑过了）。
+
+        ⇒ 而且**必须用本机的**：对端的 TTS 要把文字发过网络、把 PCM 拉回来
+        ⇒ 又慢又不稳（同传那边早就因此规定「语音必须本机出」）。
+
+        Returns ``True`` = 本机有 TTS；``False`` = 超时（继续，退回
+        ``get_session()`` 给的那个，可能是对端的）。
+        """
+        cap = "swcap_text_to_speech"
+        try:
+            from app.core.compute.registry import get_registry
+            reg = get_registry()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("dub: 取 registry 失败（不挡合成）: %s", exc)
+            return False
+
+        deadline = time.time() + _DUB_WAIT_LOCAL_TTS_SEC
+        while True:
+            try:
+                sessions = reg.list_sessions(cap, include_remote=False)
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("dub: 查本机 TTS 实例失败: %s", exc)
+                sessions = []
+            if sessions:
+                return True
+            if time.time() >= deadline:
+                LOG.warning("dub: 等本机的 TTS 超时（%.0f s）⇒ 继续"
+                            "（可能要借对端板子的算力）",
+                            _DUB_WAIT_LOCAL_TTS_SEC)
+                job.warnings.append(
+                    "本机的语音模型等了 {:.0f} 秒还没就绪 ⇒ 这次导出可能"
+                    "借用了对端板子的算力（会慢一些）".format(
+                        _DUB_WAIT_LOCAL_TTS_SEC))
+                return False
+            self._set_phase(job, "等语音模型就绪", 0.5)
+            if self._cancelled():
+                raise RuntimeError("用户取消了")
+            time.sleep(1.0)
+
     # ------------------------------------------------------------------ #
     # 作业主体
     # ------------------------------------------------------------------ #
@@ -575,6 +633,10 @@ class DubEngine:
             job.sentences = sentences
 
             # ---------- ③ TTS ------------------------------------------- #
+            # ⚠️ **先等本机的 TTS 就绪** —— 不等的话 ``get_session()`` 会
+            #    抢先拿到**对端板子**的 TTS ⇒ 那个对端 worker 的 session
+            #    没加载 ⇒ 「session not loaded」（实测 2026-11-27）。
+            self._wait_local_tts(job)
             self._set_phase(job, "合成语音中", 0.55)
             # ⚠️ **视频**要按原句时间戳落位（音画/字幕同一时基）；
             # **纯音频**连续拼接即可。

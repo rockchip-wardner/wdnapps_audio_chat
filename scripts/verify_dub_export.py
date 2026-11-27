@@ -616,6 +616,99 @@ def part_d(base: str) -> None:
         check("视频导出：视频产物存在", False, f"得到 {video}")
 
 
+def part_h() -> None:
+    section("H. 本机没有 TTS ⇒ 导出必须**等本机就绪**（不许借对端）")
+    # ⚠️ **为什么有这一段**（2026-11-27 真机踩到）：
+    # ``synthesize_pcm`` 走 ``get_session("swcap_text_to_speech")`` ⇒
+    # **本机优先，本机没有就退回 LAN peer**。而本机的 TTS 是后台拉起来的
+    # （~22 s 才加载完）⇒ 导出刚开始合成时本机往往还没就绪 ⇒ 抢先拿到
+    # **对端板子**的 TTS ⇒ 那个对端 worker 的 session 没加载 ⇒
+    # 「session not loaded; send action='load' first」⇒ **整个作业失败**。
+    #
+    # ⇒ 所以 ``DubEngine._wait_local_tts`` 必须在合成**之前**等本机就绪。
+    from wdnapps_audio_chat.cards.qwen3_asr import dub as dub_mod
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import DubEngine, DubJob
+
+    # ① 源码级：合成**之前**必须等本机 TTS。
+    src = (REPO / "src" / "wdnapps_audio_chat" / "cards" / "qwen3_asr"
+           / "dub.py").read_text(encoding="utf-8")
+    wait_at = src.find("self._wait_local_tts(job)")
+    synth_at = src.find("self._synthesize(")
+    check("合成之前必须等本机 TTS 就绪",
+          wait_at > 0 and synth_at > 0 and wait_at < synth_at,
+          f"wait@{wait_at} synth@{synth_at}")
+    check("等本机 TTS 用的是**本机**实例（不拿对端）",
+          "include_remote=False" in src)
+
+    # ② 行为级：**没有本机实例** ⇒ 必须**等**，等到了才返回。
+    class _FakeReg:
+        """假 registry：前 N 次没有本机实例，之后有。"""
+
+        def __init__(self, become_after: int):
+            self.calls = 0
+            self._become_after = become_after
+
+        def list_sessions(self, cap, include_remote=False):
+            self.calls += 1
+            if self.calls <= self._become_after:
+                return []
+            return [object()]
+
+    real_registry = None
+    try:
+        import app.core.compute.registry as reg_mod
+        real_registry = reg_mod.get_registry
+    except Exception:  # noqa: BLE001
+        reg_mod = None
+
+    if reg_mod is None:
+        check("能拿到宿主 registry（才能验本机实例）", False, "import 失败")
+        return
+
+    eng = DubEngine()
+    job = DubJob(id="h-1", kind="audio", source_path="/tmp/x.wav",
+                 source_name="x.wav", target_lang="en")
+
+    fake = _FakeReg(become_after=2)
+    reg_mod.get_registry = lambda: fake
+    old_cap = dub_mod._DUB_WAIT_LOCAL_TTS_SEC
+    dub_mod._DUB_WAIT_LOCAL_TTS_SEC = 30.0
+    try:
+        got = eng._wait_local_tts(job)
+    except Exception as exc:  # noqa: BLE001
+        got = False
+        check("等本机 TTS 不炸", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        dub_mod._DUB_WAIT_LOCAL_TTS_SEC = old_cap
+        if real_registry is not None:
+            reg_mod.get_registry = real_registry
+    check("本机 TTS 起来之后 ⇒ 等到了（返回 True）", got is True)
+    check("它**确实等过**（不是一查就有）", fake.calls >= 3,
+          f"list_sessions 调了 {fake.calls} 次")
+
+    # ③ 行为级：**一直没有** ⇒ 超时返回 False + 说清楚（不硬失败）。
+    class _NeverReg:
+        def list_sessions(self, cap, include_remote=False):
+            return []
+
+    reg_mod.get_registry = lambda: _NeverReg()
+    job2 = DubJob(id="h-2", kind="audio", source_path="/tmp/x.wav",
+                  source_name="x.wav", target_lang="en")
+    dub_mod._DUB_WAIT_LOCAL_TTS_SEC = 2.0
+    try:
+        got2 = eng._wait_local_tts(job2)
+    except Exception as exc:  # noqa: BLE001
+        got2 = False
+        check("等不到本机 TTS 也不炸", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        dub_mod._DUB_WAIT_LOCAL_TTS_SEC = old_cap
+        if real_registry is not None:
+            reg_mod.get_registry = real_registry
+    check("等不到 ⇒ 返回 False（不硬失败，继续合成）", got2 is False)
+    check("等不到 ⇒ 在 warnings 里说清楚", len(job2.warnings) >= 1,
+          f"warnings={job2.warnings}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="https://127.0.0.1:8000")
@@ -631,6 +724,7 @@ def main() -> int:
     part_e()
     part_f()
     part_g_logic()
+    part_h()
     if args.http:
         part_c(args.base)
         part_d(args.base)
