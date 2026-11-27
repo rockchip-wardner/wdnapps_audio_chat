@@ -642,6 +642,7 @@ const Qwen3Asr = {
 
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
   _tr: {
+    cleared: false,      // **结果被清空过**（用户点了「清空」）⇒ 状态显示「已清空」
     enabled: false,      // 「实时翻译」开关
     targetLang: "en",    // 目标语言（provider 的语言 key）
     modelReady: false,   // 翻译模型在不在跑
@@ -2574,6 +2575,9 @@ const Qwen3Asr = {
     const $ = (id) => document.getElementById(id);
     const fileName = $("asr-file-name");
     if (fileName && this._path) fileName.textContent = "";
+    // ⚠️ **用户已经选好源了** ⇒ 那句「选择一个音频来源后点『开始识别』」
+    //    过时 ⇒ 清掉（否则它会一直挂在屏幕上）。
+    if (this._hasSource()) this._clearStaleSourceHint();
     // 「开始识别」只对**文件 / 视频**来源有意义 —— 实时两种来源各有各
     // 的按钮（板载采集 / 浏览器麦克风）。
     //
@@ -3612,6 +3616,13 @@ const Qwen3Asr = {
   },
 
   _trStatusText() {
+    // ⚠️ **清空过 ⇒ 显示「已清空」**（2026-11-27 用户要求）——
+    //    参照「配音导出」那块的「清空」按钮（它清完就把状态写成
+    //    「已清空」）。
+    //
+    //    ⇒ 不这么做的坏处：清空之后这里还写着「翻译模型就绪 · 实时翻译
+    //    已开启」⇒ 用户以为**还在译**（其实结果已经没了）。
+    if (this._tr.cleared) return "已清空";
     const bits = [this._tr.modelStatus || "翻译未启用"];
     if (this._tr.enabled) {
       bits.push("实时翻译已开启");
@@ -3938,21 +3949,55 @@ const Qwen3Asr = {
     this._sentPaintFile();  // 文件 / 视频来源的句子流
   },
 
-  _updateHint() {
+  /**
+   * 写提示行（``#asr-hint``）。
+   *
+   * ⚠️ **没内容就把整行藏掉** —— 空着还占一行（``.asr-hint`` 有
+   *    ``padding-bottom``）⇒ 看着像页面缺了一块。
+   */
+  _setHint(text) {
     const hint = document.getElementById("asr-hint");
     if (!hint) return;
+    const t = text || "";
+    hint.textContent = t;
+    hint.classList.toggle("hidden", !t);
+  },
+
+  /**
+   * 提示行里那句「选择一个音频来源后点『开始识别』」**过时了**（用户已经
+   * 选好源了）⇒ 清掉。
+   *
+   * ⚠️ **为什么单独拎出来** —— 「删掉『点击『开始识别』重新跑一遍。』」
+   *    之后，空闲状态下**什么都不写** ⇒ 但那句「没选源」的提示会**留在
+   *    屏幕上**（它是在还没选源时写的）⇒ 用户选完文件还看到「选择一个
+   *    音频来源…」⇒ 过时。
+   */
+  _clearStaleSourceHint() {
+    const hint = document.getElementById("asr-hint");
+    if (!hint) return;
+    const cur = hint.textContent || "";
+    if (cur.indexOf("选择一个音频来源后点") === 0) this._setHint("");
+  },
+
+  _updateHint() {
     const st = (this.snapshot && this.snapshot.state) || "";
     if (!this._hasSource()) {
-      hint.textContent = "选择一个音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。";
+      this._setHint("选择一个音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。");
     } else if (this._busy()) {
-      hint.textContent = "识别中…… 已确认的文本会实时出现，蓝色是尚未确认的部分。";
+      this._setHint("识别中…… 已确认的文本会实时出现，蓝色是尚未确认的部分。");
     } else if (st === "stopped" && !this._seekBusy) {
       // ⚠️ 「已停止」和「完成」要说清楚区别 —— 用户点「停止」是**提前
       // 收尾**：已识别的那部分留下了，画面也停住了（字幕不再滚）。
-      hint.textContent = "已停止 —— 已识别的内容保留在下方转写框里；"
-        + "要重跑点「开始识别」。";
+      this._setHint("已停止 —— 已识别的内容保留在下方转写框里；"
+        + "要重跑点「开始识别」。");
     } else {
-      hint.textContent = "点击「开始识别」重新跑一遍。";
+      // ⚠️⚠️ **这里原来有一句「点击『开始识别』重新跑一遍。」**
+      //    （2026-11-27 用户要求删掉）—— 它**没有信息量**（按钮就在
+      //    旁边，用户想重跑自己会点）⇒ 删。
+      //
+      // ⇒ 而且**别动**这一行原有的内容 —— 「识别完成（…）· 语种 X」
+      //    （``done`` 帧写的）比这句有用得多 ⇒ 以前每次状态帧都会把它
+      //    覆盖掉 ⇒ 现在让它**留住**。
     }
   },
 
@@ -4691,6 +4736,13 @@ const Qwen3Asr = {
     }
     if (!this._hasSource() || this._starting || this._busy()) return false;
     this._starting = true;
+    // ⚠️ **新一轮识别 ⇒ 「已清空」归零**（2026-11-27）—— 又开始识别了，
+    //    结果马上就会重新长出来 ⇒ 状态不该还停在「已清空」。
+    //
+    // ⚠️ **改完要立刻重画状态行** —— 否则那一行还挂着上一轮的「已清空」
+    //    （要等下一帧译文才刷新 ⇒ 中间那几秒是错的）。
+    this._tr.cleared = false;
+    this._trSyncUi();
     // ⚠️⚠️ **识别一开始 ⇒「生成配音版」立刻就灰**（2026-11-27 用户要求：
     //    两者互斥）—— 别等服务端确认（WS 那一帧要 ~0.3 s）⇒ 这中间用户
     //    还能点「生成配音版」⇒ 两个一起跑。
@@ -4857,6 +4909,10 @@ const Qwen3Asr = {
     this._renderLive("", "");
     // 译文也一起清（服务端 /reset 也会清统计）
     this._tr.items = [];
+    // ⚠️ **「实时翻译」的状态改成「已清空」**（2026-11-27 用户要求）——
+    //    参照「配音导出」的清空（它清完就把状态写成「已清空」）。
+    //    ⇒ 不然这里还写着「实时翻译已开启」⇒ 用户以为还在译。
+    this._tr.cleared = true;
     this._trLineTr.clear();   // 行级译文（视频来源）也一起清
     this._trLineReq.clear();
     this._trLineSlot.clear();
@@ -4902,11 +4958,15 @@ const Qwen3Asr = {
     // 就留下一句「刚清空却还在」的原文。
     this._sentClear();
     this._trSyncUi();
+    // ⚠️ **提示行也写「已清空」**（2026-11-27 用户要求）—— 免得上面那行
+    //    「识别完成（…）」还挂着，像是有结果。
+    this._setHint("已清空");
   },
 
   _showError(detail) {
-    const hint = document.getElementById("asr-hint");
-    if (hint) hint.textContent = detail;
+    // ⚠️ 走 ``_setHint`` —— 提示行可能是**藏着的**（没内容就藏了）⇒
+    //    直接写 textContent 的话，错误信息**看不见**。
+    this._setHint(detail);
     const pre = document.getElementById("data-qwen3-asr");
     if (pre) pre.textContent = JSON.stringify({ error: detail }, null, 2);
   },
@@ -6660,14 +6720,11 @@ const Qwen3Asr = {
         // ⚠️ 识别结束 ⇒ **最后一行**也定稿了 ⇒ 把它要过来（不然它永远
         // 没有译文）。
         this._trRequestLines(true);
-        const hint = document.getElementById("asr-hint");
-        if (hint) {
-          // 音频时长 + 耗时都报出来 —— 用户能看出「多长的音频被识别了」
-          // （不再有 60 秒截断，所以这个数字可能远大于 60）。
-          const audio = msg.audio_sec ? ` · 音频 ${msg.audio_sec.toFixed(1)} s` : "";
-          hint.textContent = `识别完成（${(msg.elapsed_sec || 0).toFixed(2)} s${audio}）`
-            + `· 语种 ${msg.language || "未知"}`;
-        }
+        // 音频时长 + 耗时都报出来 —— 用户能看出「多长的音频被识别了」
+        // （不再有 60 秒截断，所以这个数字可能远大于 60）。
+        const audio = msg.audio_sec ? ` · 音频 ${msg.audio_sec.toFixed(1)} s` : "";
+        this._setHint(`识别完成（${(msg.elapsed_sec || 0).toFixed(2)} s${audio}）`
+          + `· 语种 ${msg.language || "未知"}`);
         break;
       }
       case "stopped": {
@@ -6689,12 +6746,11 @@ const Qwen3Asr = {
         //     没冻过 → 要冻（否则那边停了这边字幕还在滚）。
         const internal = (msg.reason === "internal");
         if (!internal && !this._stopInitiated) this._freezePlayback();
-        const hint = document.getElementById("asr-hint");
-        if (hint && !internal) {
+        if (!internal) {
           const audio = msg.audio_sec
             ? ` · 已识别 ${msg.audio_sec.toFixed(1)} s` : "";
-          hint.textContent = `已停止${audio} —— 已识别的内容保留在下方，`
-            + "要重跑点「开始识别」。";
+          this._setHint(`已停止${audio} —— 已识别的内容保留在下方，`
+            + "要重跑点「开始识别」。");
         }
         break;
       }
