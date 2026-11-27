@@ -5115,7 +5115,8 @@ const Qwen3Asr = {
         items.forEach((it) => {
           const opt = document.createElement("option");
           opt.value = it.id || "";
-          opt.textContent = it.name || it.label || it.id || "";
+          // ⚠️ 同「显示语言」那个下拉**同款排法**（中文名 + 本族名）。
+          opt.textContent = this._trLangLabel(it);
           langSel.appendChild(opt);
         });
         langSel.value = this._dub.targetLang ||
@@ -5234,7 +5235,9 @@ const Qwen3Asr = {
         items.forEach((it) => {
           const opt = document.createElement("option");
           opt.value = it.id || "";
-          opt.textContent = it.name || it.label || it.id || "";
+          // ⚠️ 同「显示语言」那个下拉**同款排法**（中文名 + 本族名）——
+          //    见 `_trLangLabel` 的说明（三处语言下拉是同一套）。
+          opt.textContent = this._trLangLabel(it);
           sel.appendChild(opt);
         });
         if (this._interp.targetLang) sel.value = this._interp.targetLang;
@@ -6588,7 +6591,12 @@ const Qwen3Asr = {
         items.forEach((it) => {
           const o = document.createElement("option");
           o.value = it.id;
-          o.textContent = it.name || it.id;
+          // ⚠️ **显示格式与「实时翻译」的「显示语言」完全一致** ——
+          //    「中文名 本族名」（例：英语 English）⇒ 三个语言下拉看起来
+          //    是**同一套**排法 ⇒ 用户不会以为这是两套东西。
+          // ⚠️ **必须用 `_trLangLabel`**（**同一份**标签表 + 字体兜底）⇒
+          //    别在这里自己拼 ⇒ 标签表只有一份 ⇒ 不会漂。
+          o.textContent = this._trLangLabel(it);
           langSel.appendChild(o);
         });
         // ⚠️ **默认跟随「实时翻译」的显示语言**（没开就退回第一条）。

@@ -182,6 +182,50 @@ def main() -> int:
         check("这张卡里**再没有**叫「目标语言」的标签", not labels["olds"],
               f"实际 {labels['olds']!r}")
 
+        section("B4. 三个语言下拉的**选项排法**必须一致（中文名 + 本族名）")
+        # ⚠️ **为什么要有这条**（2026-11-27）—— 「导出语言」的下拉原先直接用
+        #    `it.name` ⇒ 选项是**纯英文名**（"English" / "Chinese"）⇒ 跟
+        #    「显示语言」那个下拉的「英语 English」**排法完全不一样** ⇒ 看着
+        #    像两套东西 ⇒ 用户以为不是一回事。
+        # ⇒ 现在三个下拉统一走 `_trLangLabel()`（同一份标签表 + 字体兜底）。
+        opts = page.evaluate(
+            """() => {
+                const dump = (id) => {
+                    const el = document.getElementById(id);
+                    if (!el) return [];
+                    return Array.from(el.options || [])
+                        .map((o) => (o.textContent || "").trim());
+                };
+                return {
+                    tr: dump("asr-tr-target"),
+                    interp: dump("asr-interp-target"),
+                    dub: dump("asr-dub-target"),
+                };
+            }""")
+        check("「导出语言」下拉有选项", len(opts["dub"]) > 0,
+              f"实际 {len(opts['dub'])} 项")
+        check("「导出语言」的选项是「中文名 + 本族名」（如「英语 English」）",
+              "英语 English" in opts["dub"], f"实际 = {opts['dub']!r}")
+        # ⚠️ **防回退**：纯英文名（老排法）不许再出现。
+        check("「导出语言」里**没有**纯英文名的选项（老排法）",
+              not any(t in ("English", "Chinese", "Japanese")
+                      for t in opts["dub"]), f"实际 = {opts['dub']!r}")
+        check("「朗读语言」也是同一套排法",
+              "英语 English" in opts["interp"], f"实际 = {opts['interp']!r}")
+        check("「显示语言」也是同一套排法",
+              "英语 English" in opts["tr"], f"实际 = {opts['tr']!r}")
+        # ⚠️ **两个下拉的选项集合不一样，这是对的** ——
+        #   * 「显示语言」= **翻译模型**能翻的（36 种）；
+        #   * 「朗读语言」/「导出语言」= **TTS 能出声**的（10 种）⇒
+        #     有些语言能翻但**不能出声**（例：泰语能翻，但本板念不了）。
+        # ⇒ 契约是「**导出/朗读 ⊆ 显示**」，不是相等。
+        check("「朗读语言」与「导出语言」的选项**集合相同**（都是能出声的那些）",
+              set(opts["dub"]) == set(opts["interp"]),
+              f"dub={opts['dub']!r} interp={opts['interp']!r}")
+        check("「导出语言」的每个语言**在「显示语言」里也找得到**（子集）",
+              set(opts["dub"]) <= set(opts["tr"]),
+              f"导出={opts['dub']!r} 显示={opts['tr']!r}")
+
         section("C. 填**设备端路径** ⇒ 「生成配音版」必须可点")
         page.fill("#asr-source", args.source)
         page.wait_for_timeout(800)
