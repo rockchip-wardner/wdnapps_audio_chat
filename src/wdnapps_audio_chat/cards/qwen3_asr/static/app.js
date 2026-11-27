@@ -137,6 +137,25 @@
    */
   const TR_REQ_MAX_ATTEMPTS = 3;
 
+  /* ASR 报出来的**语种名**（英文名，如 "English" / "Chinese"）⇒ 语言码
+     ⇒ 再走同一份 ``TR_LANG_LABELS``（跟三个语言下拉同款排法）。
+
+     ⚠️ 标签表里的 ``native`` 是「**本族名**」（简体中文 / 日本語…）⇒ 不能
+     拿它反查英文名 ⇒ 这里单列一张「英文名 → 码」的表。 */
+  const TR_LANG_BY_EN = {
+    "english": "en", "chinese": "zh-CN", "mandarin": "zh-CN",
+    "mandarin chinese": "zh-CN", "japanese": "ja", "korean": "ko",
+    "french": "fr", "german": "de", "spanish": "es", "portuguese": "pt",
+    "italian": "it", "russian": "ru", "arabic": "ar", "hebrew": "he",
+    "hindi": "hi", "bengali": "bn", "thai": "th", "vietnamese": "vi",
+    "indonesian": "id", "malay": "ms", "turkish": "tr", "polish": "pl",
+    "dutch": "nl", "czech": "cs", "ukrainian": "uk", "tamil": "ta",
+    "telugu": "te", "urdu": "ur", "gujarati": "gu", "marathi": "mr",
+    "persian": "fa", "tagalog": "tl", "khmer": "km", "myanmar": "my",
+    "burmese": "my", "tibetan": "bo", "kazakh": "kk", "mongolian": "mn",
+    "uyghur": "ug", "nepali": "ne", "swahili": "sw",
+  };
+
   /* ------------------------------------------------------------------ *
    * 翻译目标语言：**中文名 + 本族名**（跟右上角「简体中文」下拉一个排法）
    *
@@ -906,6 +925,9 @@ const Qwen3Asr = {
     $("asr-dub-files")?.addEventListener("change", () => this._dubSyncPlayer());
     this._dubLoadOptions();
     this._dubSyncButtons();
+    // ⚠️ **拉一次上次的作业** —— 刷新页面后也能看到上次的导出结果
+    //    （逐句原文 / 译文 + 两种语言）。
+    this._dubRefreshStatus();
     // ⚠️ **刷新页面后要把「同传还在跑」接回来**（2026-11-25）——
     //
     // 症状（实测）：用户在同传跑着的时候刷新了页面 ⇒ 前端的
@@ -2848,6 +2870,44 @@ const Qwen3Asr = {
     if (!lab) return en;
     const native = _canRender(lab.native) ? lab.native : en;
     return lab.zh + " " + native;
+  },
+
+  /* ------------------------------------------------------------------ *
+   * 配音导出结果面板用的两个语言标签
+   *
+   * ⚠️ **源语言**是 ASR 报出来的**英文名**（"English"）⇒ 先映射回语言码
+   *    ⇒ 再走 ``_trLangLabel`` ⇒ 跟三个语言下拉**同一套排法**
+   *    （「英语 English」）⇒ 映射不到就原样显示（不显示成空白）。
+   *
+   * ⚠️ **导出语言**直接取「导出语言」下拉里那一项的文案 ⇒ 保证跟用户
+   *    在下拉里看到的**一模一样**（不用再维护第二份标签表）。
+   * ------------------------------------------------------------------ */
+  _dubSrcLangLabel(raw) {
+    const name = String(raw || "").trim();
+    if (!name) return "";
+    const code = TR_LANG_BY_EN[name.toLowerCase()];
+    if (code) return this._trLangLabel({ id: code, name: name });
+    return name;
+  },
+
+  _dubTgtLangLabel(code) {
+    const c = String(code || "").trim();
+    if (!c) return "";
+    const sel = document.getElementById("asr-dub-target");
+    if (sel) {
+      const opt = Array.from(sel.options || [])
+        .find((o) => o.value === c);
+      if (opt) return (opt.textContent || "").trim();
+    }
+    // ⚠️ **下拉可能还没填好** —— ``_dubLoadOptions`` 是**异步**的（要拉
+    //    接口）⇒ 进页面第一次渲染时它可能还是空的 ⇒ 退回**标签表**
+    //    （同一份 ``TR_LANG_LABELS`` ⇒ 排法与下拉一致，不会漂）。
+    const lab = TR_LANG_LABELS[c];
+    if (lab) {
+      const native = _canRender(lab.native) ? lab.native : c;
+      return lab.zh + " " + native;
+    }
+    return c;
   },
 
   /**
@@ -6793,6 +6853,12 @@ const Qwen3Asr = {
     this._dub.audioPath = d.audio_path || "";
     this._dub.videoPath = d.video_path || "";
     this._dub.sourcePath = d.source_path || "";
+    // ⚠️ **源语言 + 导出语言**（2026-11-27）—— 结果面板要标这两种语言。
+    if (d.source_lang) this._dub.sourceLang = d.source_lang;
+    if (d.target_lang) this._dub.targetLang = d.target_lang;
+    // ⚠️ **逐句结果** —— 配音导出**做了完整的翻译** ⇒ 原文 + 译文都在
+    //    作业里 ⇒ 这里渲染出来（以前前端根本没读 `sentences`）。
+    this._dubRenderSentences(d.sentences || []);
 
     const pct = Math.round((this._dub.progress || 0) * 100);
     if (this._dub.state === "running") {
@@ -6832,9 +6898,140 @@ const Qwen3Asr = {
     if (stop) stop.disabled = !this._dub.running;
   },
 
+  /**
+   * 拉一次服务端**最新那个作业**的状态。
+   *
+   * ⚠️ **为什么要有它**（2026-11-27）—— 配音导出的作业是**服务端**记着的
+   *    ⇒ 刷新页面后作业还在、结果还在 ⇒ 但页面只在「点了生成配音版」之后
+   *    才开始轮询 ⇒ 刷新一下，上次导出的逐句结果就**看不见了**。
+   * ⇒ 这里进页面先拉一次：把上次的源语言 / 导出语言 / 逐句结果补上。
+   */
+  async _dubRefreshStatus() {
+    let d = null;
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/status", { cache: "no-store" });
+      d = await r.json();
+    } catch (e) {
+      return;
+    }
+    if (!d || !d.id) return;
+    this._dub.sourcePath = d.source_path || "";
+    if (d.source_lang) this._dub.sourceLang = d.source_lang;
+    if (d.target_lang) this._dub.targetLang = d.target_lang;
+    this._dubRenderSentences(d.sentences || []);
+    if (d.state === "running") {
+      this._dub.running = true;
+      this._dubPoll();
+    } else if (d.state === "done") {
+      this._dubSetStatus("完成");
+      await this._dubRefreshFiles();
+    } else if (d.state === "error") {
+      this._dubSetStatus("失败：" + (d.error || "未知错误"));
+      await this._dubRefreshFiles();
+    }
+    this._dubSyncButtons();
+  },
+
   _dubSetStatus(text) {
     const el = document.getElementById("asr-dub-status");
     if (el) el.textContent = text || "";
+  },
+
+  /**
+   * 渲染「配音导出结果」—— 逐句**原文 / 译文**，并标清两种语言。
+   *
+   * ⚠️ **为什么要有这个面板**（2026-11-27 用户要求）——
+   * 配音导出**做了完整的翻译**（ASR → 翻译 → TTS）⇒ 每一句的原文和译文
+   * 都在作业里（``job.sentences``）⇒ 但页面以前只给一句「完成」和一个
+   * 文件下拉 ⇒ 用户**看不到导出的到底是什么**。
+   *
+   * ⚠️ **每行前面挂语言标签** —— 原文那行标**源语言**、译文那行标
+   *    **导出语言** ⇒ 一眼分得清（这正是用户要的）。
+   *
+   * ⚠️ **增量渲染** —— 长音频几千句 ⇒ 每次轮询全量重建 DOM 会越来越慢
+   *    ⇒ 按行号复用已有的行（跟 ``_renderSentences`` 同一个套路）。
+   */
+  _dubRenderSentences(sentences) {
+    const box = document.getElementById("asr-dub-list");
+    const wrap = document.getElementById("asr-dub-out");
+    if (!box || !wrap) return;
+    const list = sentences || [];
+    if (!list.length) {
+      wrap.classList.add("hidden");
+      // ⚠️ **DOM 也要清** —— 只清 ``box._rows``（那个 Map）的话，上一个
+      //    作业的行会**留在屏幕上** ⇒ 新作业还没出句子时，用户看到的是
+      //    **上一次的旧结果**（实测踩到）。
+      if (box._rows) box._rows.clear();
+      while (box.firstChild) box.removeChild(box.firstChild);
+      return;
+    }
+    wrap.classList.remove("hidden");
+
+    const srcLang = this._dubSrcLangLabel(this._dub.sourceLang);
+    const tgtLang = this._dubTgtLangLabel(this._dub.targetLang);
+    const cap = document.getElementById("asr-dub-out-cap");
+    if (cap) {
+      const head = "配音导出结果 · 一句一句";
+      const pair = (srcLang || tgtLang)
+        ? "（源语言：" + (srcLang || "未知") +
+          " → 导出语言：" + (tgtLang || "未知") + "）"
+        : "";
+      cap.textContent = head + pair;
+    }
+
+    if (!box._rows) box._rows = new Map();
+    list.forEach((s, i) => {
+      let row = box._rows.get(i);
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "asr-sent";
+        const src = document.createElement("div");
+        src.className = "asr-sent-src";
+        const dst = document.createElement("div");
+        dst.className = "asr-sent-dst";
+        row.appendChild(src);
+        row.appendChild(dst);
+        box.appendChild(row);
+        box._rows.set(i, row);
+      }
+      const src = row.querySelector(".asr-sent-src");
+      const dst = row.querySelector(".asr-sent-dst");
+      this._dubSetSentText(src, srcLang, s.orig || "");
+      this._dubSetSentText(dst, tgtLang, s.trans || "");
+    });
+    // ⚠️ **新作业比旧的句子少** ⇒ 多出来的那些行要**删掉**
+    //    （留着就是上一轮的旧结果）。
+    for (const [i, row] of Array.from(box._rows.entries())) {
+      if (i < list.length) continue;
+      box._rows.delete(i);
+      if (row.parentNode) row.parentNode.removeChild(row);
+    }
+  },
+
+  /** 一行的内容 = 「语言标签 + 文字」。 */
+  _dubSetSentText(el, lang, text) {
+    if (!el) return;
+    // ⚠️ **只用 textContent** —— 识别出来的文字是**外部内容** ⇒ 别拼
+    //    innerHTML（万一原文里带尖括号就会被当成标签解析）。
+    let tag = el.querySelector(".asr-lang-tag");
+    if (lang) {
+      if (!tag) {
+        tag = document.createElement("span");
+        tag.className = "asr-lang-tag";
+        el.insertBefore(tag, el.firstChild);
+      }
+      if (tag.textContent !== lang) tag.textContent = lang;
+      tag.classList.remove("hidden");
+    } else if (tag) {
+      tag.classList.add("hidden");
+    }
+    let body = el.querySelector(".asr-lang-body");
+    if (!body) {
+      body = document.createElement("span");
+      body.className = "asr-lang-body";
+      el.appendChild(body);
+    }
+    if (body.textContent !== text) body.textContent = text;
   },
 
   /** 重新列一次源文件同级目录里的产物。 */

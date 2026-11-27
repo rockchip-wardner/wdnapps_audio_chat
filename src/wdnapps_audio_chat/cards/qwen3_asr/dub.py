@@ -133,6 +133,9 @@ class DubJob:
     progress: float = 0.0           # 0..1
     message: str = ""
     error: str = ""
+    #: **源语言**（识别出来的那个语种，如 "English"）—— 结果面板要标
+    #: 「源语言 → 导出语言」⇒ 没有它就只标得出导出语言那一头。
+    source_lang: str = ""
     sentences: List[DubSentence] = field(default_factory=list)
     audio_path: str = ""
     video_path: str = ""
@@ -160,6 +163,7 @@ class DubJob:
             "progress": round(float(self.progress), 4),
             "message": self.message,
             "error": self.error,
+            "source_lang": self.source_lang,
             "sentences": [s.as_dict() for s in self.sentences],
             "audio_path": self.audio_path,
             "video_path": self.video_path,
@@ -765,6 +769,11 @@ class DubEngine:
                 if self._cancelled():
                     raise RuntimeError("用户取消了")
                 snap = svc.snapshot()
+                # ⚠️ **源语言**（2026-11-27）—— 结果面板要标
+                # 「源语言 → 导出语言」⇒ 这里顺手记下来。
+                _lang = str(snap.get("language") or "").strip()
+                if _lang and not job.source_lang:
+                    job.source_lang = _lang
                 # ⚠️ **不能用 ``snap["busy"]``** —— 那个字段会被**实时（麦克风）
                 # 会话**盖掉 ⇒ 浏览器开着麦克风时这里会永远等下去。
                 # ⇒ 用 ``file_busy()``（只认文件路径的口径）。
@@ -833,6 +842,11 @@ class DubEngine:
             rec = svc.completed_file_result(str(src))
             if not rec:
                 return []
+            # ⚠️ **源语言**（2026-11-27）—— 复用页面那次识别时，语种是
+            # ASR 服务记下来的（``service.py::_remember_file_result``）。
+            _lang = str(rec.get("language") or "").strip()
+            if _lang:
+                job.source_lang = _lang
             rid = str(rec.get("request_id") or "")
             tr = get_translation_service()
 

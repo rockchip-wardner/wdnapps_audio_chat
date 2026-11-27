@@ -362,21 +362,23 @@ def main() -> int:
                   str(body))
 
         section("F. 等作业跑完 ⇒ 「生成的文件」下拉里有产物")
+        # ⚠️ **等作业「跑完」**，别等「下拉里有文件」——
+        #    「生成的文件」下拉**进页面时就有上一个作业的产物**
+        #    （``_dubRefreshStatus`` 会补上）⇒ 只等下拉会**立刻返回**
+        #    ⇒ 后面 F2 段会在作业**还没跑完**时就断言 ⇒ 假失败。
         deadline = time.time() + 300
         state = ""
         while time.time() < deadline:
             state = page.evaluate(
                 "() => document.getElementById('asr-dub-status')"
                 "?.textContent || ''")
-            opts = page.evaluate(
-                "() => Array.from(document.getElementById('asr-dub-files')"
-                "?.options || []).map(o => o.value).filter(Boolean)")
-            if opts:
+            if "完成" in state or "失败" in state:
                 break
             page.wait_for_timeout(3000)
         opts = page.evaluate(
             "() => Array.from(document.getElementById('asr-dub-files')"
             "?.options || []).map(o => o.value).filter(Boolean)")
+        check("作业跑完了（状态 = 完成）", "完成" in state, f"status={state!r}")
         check("产物下拉里有文件", len(opts) > 0, f"status={state!r}")
         if opts:
             print("    产物:", opts[:3])
@@ -387,6 +389,63 @@ def main() -> int:
                 " document.getElementById('asr-dub-video')?.src || '']")
             check("播放器拿到了产物 URL",
                   any("/api/qwen3-asr/media" in s for s in srcs), str(srcs))
+
+        section("F2. 配音导出结果面板：逐句原文/译文 + **两种语言**")
+        # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
+        #   配音导出**做了完整的翻译**（ASR → 翻译 → TTS）⇒ 逐句的原文和
+        #   译文都在作业里 ⇒ 但页面以前只给一句「完成」和一个文件下拉 ⇒
+        #   用户**看不到导出的到底是什么、翻成了什么语言**。
+        # ⇒ 现在有一个独立的结果面板：逐句「原文 / 译文」+ **两种语言都标**。
+        panel = page.evaluate(
+            """() => {
+                const wrap = document.getElementById('asr-dub-out');
+                const cap = document.getElementById('asr-dub-out-cap');
+                const rows = Array.from(
+                    document.querySelectorAll('#asr-dub-list .asr-sent'));
+                const txt = (el) => (el ? (el.textContent || '').trim() : '');
+                return {
+                    exists: !!wrap,
+                    visible: !!wrap && !wrap.classList.contains('hidden'),
+                    cap: txt(cap),
+                    n: rows.length,
+                    rows: rows.slice(0, 3).map((r) => ({
+                        srcTag: txt(r.querySelector('.asr-sent-src .asr-lang-tag')),
+                        src: txt(r.querySelector('.asr-sent-src .asr-lang-body')),
+                        dstTag: txt(r.querySelector('.asr-sent-dst .asr-lang-tag')),
+                        dst: txt(r.querySelector('.asr-sent-dst .asr-lang-body')),
+                    })),
+                };
+            }""")
+        check("结果面板存在且**可见**", panel["exists"] and panel["visible"],
+              f"exists={panel['exists']} visible={panel['visible']}")
+        check("面板里有逐句结果", panel["n"] > 0, f"行数 = {panel['n']}")
+        check("标题标了「源语言」和「导出语言」",
+              "源语言" in panel["cap"] and "导出语言" in panel["cap"],
+              f"实际 = {panel['cap']!r}")
+        if panel["rows"]:
+            r0 = panel["rows"][0]
+            check("每一句都有**原文**和**译文**",
+                  bool(r0["src"]) and bool(r0["dst"]),
+                  f"实际 = {r0!r}")
+            check("原文那行标了**源语言**", bool(r0["srcTag"]),
+                  f"实际 = {r0['srcTag']!r}")
+            check("译文那行标了**导出语言**", bool(r0["dstTag"]),
+                  f"实际 = {r0['dstTag']!r}")
+            # ⚠️ **不能断言「两种语言一定不同」** —— 导出语言**可以**选成跟
+            #    源语一样（那是**透传**，译文本来就等于原文）⇒ 两个标签相同
+            #    是对的。⇒ 改成断言「译文那行的标签 = 「导出语言」下拉当前
+            #    选中项的文案」（下拉与面板必须说同一件事）。
+            sel_text = page.evaluate(
+                """() => {
+                    const s = document.getElementById('asr-dub-target');
+                    if (!s || !s.selectedOptions || !s.selectedOptions[0]) {
+                        return '';
+                    }
+                    return (s.selectedOptions[0].textContent || '').trim();
+                }""")
+            check("译文那行的标签 = 「导出语言」下拉当前选中的文案",
+                  bool(sel_text) and r0["dstTag"] == sel_text,
+                  f"标签={r0['dstTag']!r} 下拉={sel_text!r}")
 
         check("页面没有 JS 报错", not errors, "; ".join(errors[:3]))
         if bad_responses:

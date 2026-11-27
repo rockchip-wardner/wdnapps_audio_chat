@@ -1624,6 +1624,10 @@ class _AsrManager:
                 "path": want,
                 "request_id": int(rid),
                 "completed_at": time.time(),
+                # ⚠️ **语种一起记**（2026-11-27）—— 配音导出的结果面板要标
+                # 「源语言」⇒ **复用**页面那次识别时也得知道那是什么语
+                # （不记的话，复用路径就没有源语言可显示）。
+                "language": self._language,
             }
         _LOG.info("asr: 记住这次识别（源 %s，rid=%s，配音导出可复用）",
                   want, rid)
