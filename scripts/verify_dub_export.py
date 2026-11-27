@@ -709,6 +709,97 @@ def part_h() -> None:
           f"warnings={job2.warnings}")
 
 
+def part_i(base: str) -> None:
+    section("I. 「清空」：服务端把**结果**清掉（刷新页面不会复活）")
+    # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
+    #   「配音导出」加了「清空」按钮 ⇒ 后端要有一个 ``POST /dub/reset``。
+    # ⚠️ **必须服务端清** —— 页面进时会拉一次**最新那个作业** ⇒ 只清前端
+    #    DOM 的话，用户一刷新页面，上次的逐句结果又回来了。
+    uploads = Path("/userdata/assets/uploads")
+    src = uploads / "asr_en.wav"
+    if not src.is_file():
+        check("源音频存在（%s）" % src, False, "找不到测试素材")
+        return
+
+    code, d = _api("POST", "/api/qwen3-asr/dub/start", {
+        "kind": "audio", "path": str(src), "target_lang": "zh-CN",
+        "ref_speaker": "news_female"}, base=base)
+    check("清空：能起一个作业（用来验「跑着的时候不许清」）",
+          code == 200 and (d or {}).get("ok"), f"得到 {code} {d}")
+    check("清空：作业刚起来是 running",
+          (d or {}).get("state") == "running",
+          f"得到 {(d or {}).get('state')}")
+
+    # ⚠️ **跑着的时候不许清** —— 半路清会留下一个「半截」的作业状态
+    #    （句子清了、作业还在跑）。
+    code, r = _api("POST", "/api/qwen3-asr/dub/reset", {}, base=base)
+    check("清空：作业在跑时**拒掉**（不许清一半）",
+          code == 200 and (r or {}).get("ok") is False,
+          f"得到 {code} {r}")
+    check("清空：拒掉时带了一句人话（能显示给用户）",
+          bool((r or {}).get("reason")), f"得到 {r}")
+
+    # ⇒ 停掉它（别留着占着 ASR 单例），再清。
+    _api("POST", "/api/qwen3-asr/dub/stop", {}, base=base)
+    st = _wait_job(base, job_id=str((d or {}).get("id") or ""))
+    check("清空：停掉之后作业不再 running",
+          st.get("state") in ("stopped", "done", "error"),
+          f"得到 {st.get('state')}")
+
+    before = sorted(p.name for p in uploads.glob("asr_en_*.wav"))
+    code, r = _api("POST", "/api/qwen3-asr/dub/reset", {}, base=base)
+    check("清空：停完之后能清", code == 200 and (r or {}).get("ok") is True
+          and (r or {}).get("cleared") is True, f"得到 {code} {r}")
+
+    st2 = _api("GET", "/api/qwen3-asr/dub/status", base=base)[1] or {}
+    check("清空：服务端**没有作业了**（刷新页面不会复活）",
+          not st2.get("id"), f"得到 {st2.get('id')!r}")
+    check("清空：逐句结果**没了**", not (st2.get("sentences") or []),
+          f"得到 {len(st2.get('sentences') or [])} 句")
+
+    after = sorted(p.name for p in uploads.glob("asr_en_*.wav"))
+    check("清空：生成的文件**没有被删**（清的是结果，不是文件）",
+          before == after, f"清空前 {before} / 清空后 {after}")
+
+    code, r = _api("POST", "/api/qwen3-asr/dub/reset", {}, base=base)
+    check("清空：没有作业时再清一次也不报错",
+          code == 200 and (r or {}).get("ok") is True, f"得到 {code} {r}")
+
+
+def part_j() -> None:
+    section("J. 「清空」的判定逻辑（纯逻辑，不占 NPU）")
+    # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
+    #   「清空」有三种情形：没作业 / 正在跑 / **点过「停止」但还在收尾**。
+    #   第三种最容易漏：``stop()`` 只是置一个取消标志 ⇒ 作业线程要到下一个
+    #   检查点才退出 ⇒ 状态**那几秒里还是 running** ⇒ 用户明明点了「停止」
+    #   却清不掉，提示还写着「先点停止」（已经点过了！）⇒ 必须钉住。
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import DubEngine, DubJob
+
+    eng = DubEngine()
+    r = eng.reset()
+    check("清空：没有作业时**不报错**（ok，但没清掉什么）",
+          r.get("ok") is True and r.get("cleared") is False, f"得到 {r}")
+
+    job = DubJob(id="dub-1", kind="audio", source_path="/uploads/x.wav",
+                 source_name="x.wav", target_lang="zh-CN", state="running")
+    eng._job = job
+    r = eng.reset()
+    check("清空：正在跑 ⇒ **拒掉**（不许清一半）",
+          r.get("ok") is False and r.get("cleared") is False, f"得到 {r}")
+    check("清空：拒掉时带了一句人话（能显示给用户）",
+          bool(r.get("reason")), f"得到 {r}")
+    check("清空：拒掉时**作业还在**（没被清掉）", eng._job is job)
+
+    # ⇒ 点了「停止」⇒ 取消标志置上 ⇒ 状态还停在 running 也允许清。
+    eng._cancel.set()
+    r = eng.reset()
+    check("清空：点过「停止」⇒ **允许清**（不等它收尾）",
+          r.get("ok") is True and r.get("cleared") is True, f"得到 {r}")
+    st = eng.status()
+    check("清空：作业记录被扔掉了（刷新页面不复活）",
+          st.get("state") == "idle" and not st.get("id"), f"得到 {st}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="https://127.0.0.1:8000")
@@ -725,10 +816,12 @@ def main() -> int:
     part_f()
     part_g_logic()
     part_h()
+    part_j()
     if args.http:
         part_c(args.base)
         part_d(args.base)
         part_g_http(args.base)
+        part_i(args.base)
     else:
         print("\n（真机端到端没跑：加 --http）")
     print("\n\033[1m结果\033[0m: 通过 %d，失败 %d" % (_OK, len(_FAIL)))

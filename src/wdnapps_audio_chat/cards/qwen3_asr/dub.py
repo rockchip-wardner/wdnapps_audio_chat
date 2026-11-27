@@ -412,6 +412,39 @@ class DubEngine:
             job.message = "用户取消了"
         return self.status()
 
+    def reset(self) -> Dict[str, Any]:
+        """清掉上一个作业的**结果**（逐句原文 / 译文）。
+
+        ⚠️ **为什么必须服务端清**（2026-11-27 用户要求）——
+        页面进的时候会拉一次**最新那个作业**的状态（``GET /dub/status``）
+        ⇒ 只在前端清 DOM 的话，用户**一刷新页面**，上次的逐句结果又回来了。
+
+        ⚠️ **产物文件不删** —— 生成的配音文件在源文件同级目录里（用户还要
+        拿去播 / 拿去用）⇒ 「清空」只清**结果**，不动文件。
+
+        ⚠️ **正在跑的时候不清** —— 否则会清出一个「半截」的作业状态
+        （句子清了、作业还在跑）⇒ 拒掉，让用户先点「停止」。
+
+        ⚠️⚠️ **但「已经点过停止」的不算「正在跑」**（2026-11-27 踩到）——
+        ``stop()`` 只是**置一个取消标志**（``self._cancel``）⇒ 作业线程要
+        等到下一个检查点才会退出 ⇒ 状态**在那几秒里还是 ``running``** ⇒
+        用户明明点了「停止」，却清不掉 ⇒ 提示还写着「先点停止」（已经点过了！）
+        ⇒ **取消标志已置 ⇒ 允许清**（那个线程已经在收尾，作业对象会被丢开）。
+
+        ⇒ 清完 = **作业记录也扔掉**（``self._job = None``）⇒ 状态回到
+        ``idle`` ⇒ 页面刷新时拉不到作业 ⇒ 结果不会复活。
+        """
+        with self._lock:
+            job = self._job
+            if job is None:
+                return {"ok": True, "cleared": False, "reason": "没有可清的作业"}
+            if job.state == "running" and not self._cancel.is_set():
+                return {"ok": False, "cleared": False,
+                        "reason": "配音导出还在跑，先点「停止」"}
+            self._job = None
+            self._thread = None
+        return {"ok": True, "cleared": True}
+
     def list_outputs(self, source_path: str) -> List[Dict[str, Any]]:
         """列出源文件同级目录里**已经生成**的配音文件（供页面下拉选择）。
 

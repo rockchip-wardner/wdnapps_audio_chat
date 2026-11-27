@@ -233,7 +233,7 @@
                 <button type="button" class="vd-btn" id="asr-tr-model-btn">启用翻译模型</button>
                 <span class="asr-live-status" id="asr-tr-status">翻译未启用</span>
                 <!--
-                  识别控制（清空 / 停止 / 开始识别）搬到这里（2026-11-27 用户要求）
+                  识别控制（开始识别 / 停止 / 清空）搬到这里（2026-11-27 用户要求）
                   ==========================================================
                   原来它们在**页面最底下**（结果框正上方那一行）⇒ 与「配音导出」
                   里「生成配音版 / 停止」那种「控件行里并排」的样式对不上 ——
@@ -242,21 +242,26 @@
                   ⇒ 现在三个按钮与「显示语言」「实时翻译」开关**并排**在这行，
                     中间一条竖线把「翻译这一组」和「识别这一组」分开。
 
+                  ⚠️ **顺序 = 开始识别 → 停止 → 清空**（2026-11-27 用户要求）——
+                    「开始」在最前（它是这一行的主操作，``vd-btn-primary``），
+                    「停止」在中间，「清空」收尾 ⇒ 与下面「配音导出」那一行
+                    （生成配音版 → 停止 → 清空）**同一种读法**。
+
                   ⚠️ 三个按钮**包在一个组里**（``.asr-tr-run``）—— 屏幕窄的时候
-                    整组一起换行，不会出现「清空、停止」留在一行、「开始识别」
+                    整组一起换行，不会出现「开始识别、停止」留在一行、「清空」
                     单独掉到下一行那种断法。
 
                   ⚠️ **JS 零改动** —— 前端一直按 **id** 取元素
                     （``#asr-start-btn`` / ``#asr-stop-btn`` /
-                    ``#asr-reset-btn``）⇒ 搬 DOM 不影响逻辑，回归脚本里那几处
-                    ``getElementById`` / ``page.click("#asr-start-btn")``
-                    也不用动。
+                    ``#asr-reset-btn``）⇒ 搬 DOM / 调顺序都不影响逻辑，
+                    回归脚本里那几处 ``getElementById`` /
+                    ``page.click("#asr-start-btn")`` 也不用动。
                 -->
                 <span class="asr-tr-run">
                   <span class="asr-tr-sep" aria-hidden="true"></span>
-                  <button class="vd-btn" id="asr-reset-btn">清空</button>
-                  <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
                   <button class="vd-btn vd-btn-primary" id="asr-start-btn" disabled>开始识别</button>
+                  <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
+                  <button class="vd-btn" id="asr-reset-btn">清空</button>
                 </span>
               </div>
               <!--
@@ -382,8 +387,24 @@
                 <select id="asr-dub-target" class="tts-select"></select>
                 <label class="asr-file-label" for="asr-dub-voice">音色</label>
                 <select id="asr-dub-voice" class="tts-select"></select>
-                <button type="button" class="vd-btn vd-btn-primary" id="asr-dub-start">生成配音版</button>
-                <button type="button" class="vd-btn" id="asr-dub-stop" disabled>停止</button>
+                <!--
+                  ⚠️ **顺序 = 生成配音版 → 停止 → 清空**（2026-11-27 用户要求）——
+                    与上面「实时翻译」那一行（开始识别 → 停止 → 清空）**同一种
+                    读法** ⇒ 两块控件行一眼就能对上。
+
+                  ⚠️ 三个按钮**包在一个组里**（``.asr-btn-group``）—— 屏幕窄的
+                    时候整组一起换行，不会拆成「生成配音版、停止」一行、「清空」
+                    单独一行那种断法。
+
+                  ⚠️ **「清空」清的是「逐句结果」**（原文 + 译文）——
+                    **不删生成的文件**（产物在源文件同级目录里，用户还要拿去
+                    播）⇒ 「清空」≠「删文件」。
+                -->
+                <span class="asr-btn-group">
+                  <button type="button" class="vd-btn vd-btn-primary" id="asr-dub-start">生成配音版</button>
+                  <button type="button" class="vd-btn" id="asr-dub-stop" disabled>停止</button>
+                  <button type="button" class="vd-btn" id="asr-dub-reset" disabled>清空</button>
+                </span>
                 <span class="asr-live-status" id="asr-dub-status">未开始</span>
               </div>
               <!--
@@ -403,7 +424,7 @@
                        preload="metadata" playsinline></video>
               </div>
               <div class="asr-tr-note" id="asr-dub-hint">
-                生成的文件保存在源文件同级目录，文件名 = 源文件名 + 导出语言 + 音色。
+                生成的文件保存在源文件同级目录，文件名 = 源文件名 + 导出语言 + 音色。「清空」只清掉下面那句一句的导出结果，生成的文件不会删。
               </div>
             </div>
 

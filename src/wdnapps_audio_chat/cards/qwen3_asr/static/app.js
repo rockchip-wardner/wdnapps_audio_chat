@@ -630,8 +630,10 @@ const Qwen3Asr = {
     sourcePath: "",       // 作业的**原始**源路径（列产物用它，别用 _path）
     sourceLang: "",      // 识别出来的语种（如 "English"）—— 结果面板要标「源语言」
     hasRows: false,       // 导出结果面板**有内容**吗 ⇒ 藏掉重复的「实时结果」
+    hasJob: false,        // 服务端**还有导出作业**吗 ⇒ 「清空」该不该可点
     files: [],            // 源文件同级目录里已生成的产物 [{name, path, kind, url}]
     timer: null,          // 轮询定时器
+    gen: 0,               // **代次**（清空时 +1）⇒ 作废在途的那一帧（旧结果不许长回来）
     loaded: false,        // 语言 / 音色下拉拉过了
     langItems: null,
     voiceItems: null,
@@ -924,6 +926,7 @@ const Qwen3Asr = {
     //    允许的；只是不能 import 它的代码）。
     $("asr-dub-start")?.addEventListener("click", () => this._dubStart());
     $("asr-dub-stop")?.addEventListener("click", () => this._dubStop());
+    $("asr-dub-reset")?.addEventListener("click", () => this._dubReset());
     $("asr-dub-files")?.addEventListener("change", () => this._dubSyncPlayer());
     this._dubLoadOptions();
     this._dubSyncButtons();
@@ -6921,6 +6924,45 @@ const Qwen3Asr = {
     this._dubSetStatus("已停止");
   },
 
+  /**
+   * 「配音导出」的**清空**（2026-11-27 用户要求）。
+   *
+   * ⚠️ **清的是「逐句结果」**（原文 + 译文）—— **不删生成的文件**
+   *    （产物在源文件同级目录里，用户还要拿去播 / 拿去用）。
+   *
+   * ⚠️ **服务端也要清**（``POST /dub/reset``）—— 页面进时会拉一次
+   *    **最新那个作业**（``_dubRefreshStatus``）⇒ 只清前端 DOM 的话，
+   *    用户**一刷新页面**，上次的逐句结果又回来了。
+   *
+   * ⚠️ **导出还在跑 ⇒ 不清**（按钮已禁用，服务端也再挡一道）—— 半路清
+   *    会留下一个「半截」的作业状态（句子清了、作业还在跑）。
+   */
+  async _dubReset() {
+    // ⚠️ **先作废在途的那一帧** ⇒ 清空之后旧句子不会长回来。
+    this._dub.gen = (this._dub.gen || 0) + 1;
+    this._dubPollStop();
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/reset", { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || (d && d.ok === false)) {
+        // ⚠️ 服务端拒了（多半是导出还在跑）⇒ 把状态拉回来，别装作清空了。
+        this._dubSetStatus("清不了：" + ((d && d.reason) || "导出还在跑"));
+        await this._dubRefreshStatus();
+        return;
+      }
+    } catch (e) {
+      this._dubSetStatus("清空失败：" + e);
+      await this._dubRefreshStatus();
+      return;
+    }
+    // ⚠️ **本地也清** —— 面板 + DOM + 「实时结果」框的合并规则
+    //    （导出没内容了 ⇒ 「实时结果」框回来）。
+    this._dub.hasJob = false;
+    this._dubClearResult();
+    this._dubSetStatus("已清空");
+    this._dubSyncButtons();
+  },
+
   _dubPollStop() {
     if (this._dub.timer) {
       clearInterval(this._dub.timer);
@@ -6935,6 +6977,10 @@ const Qwen3Asr = {
   },
 
   async _dubTick() {
+    // ⚠️ **代次**（2026-11-27）—— 「清空」会把 ``_dub.gen`` +1 ⇒ 这一帧
+    //    若是清空**之前**发出去的，就**作废**（否则旧句子会在清空之后又
+    //    长回来 —— 跟 ASR 那边 ``_roundGen`` 一个套路）。
+    const gen = this._dub.gen;
     let d = null;
     try {
       const r = await fetch("/api/qwen3-asr/dub/status", { cache: "no-store" });
@@ -6943,6 +6989,19 @@ const Qwen3Asr = {
       return;
     }
     if (!d) return;
+    if (gen !== this._dub.gen) return;   // 清空过 ⇒ 这一帧是旧的
+    // ⚠️ **服务端没有作业了**（被「清空」清掉了 ⇒ 状态里没有 id）⇒
+    //    页面上的结果也得跟着收掉（不然刷新前那一帧的旧句子还挂着）。
+    if (!d.id) {
+      this._dub.running = false;
+      this._dub.hasJob = false;
+      this._dubPollStop();
+      this._dubClearResult();
+      this._dubSetStatus("未开始");
+      this._dubSyncButtons();
+      return;
+    }
+    this._dub.hasJob = true;
     this._dub.state = d.state || "";
     this._dub.phase = d.phase || "";
     this._dub.progress = Number(d.progress) || 0;
@@ -6983,6 +7042,7 @@ const Qwen3Asr = {
     const $ = (id) => document.getElementById(id);
     const start = $("asr-dub-start");
     const stop = $("asr-dub-stop");
+    const reset = $("asr-dub-reset");
     // ⚠️⚠️ **「有源」= 设备端路径 **或** 本机上传的文件**（2026-11-26）。
     //
     // 之前只看 ``_dubSourcePath()``（设备端路径）⇒ **本机上传的文件永远
@@ -6994,6 +7054,19 @@ const Qwen3Asr = {
     const hasSrc = !!(this._path || this._file);
     if (start) start.disabled = this._dub.running || !hasSrc;
     if (stop) stop.disabled = !this._dub.running;
+    // ⚠️ **「清空」只在**真有东西可清**时才点得动**（2026-11-27 用户要求）——
+    //    没有结果可清的时候，按钮灰着（跟「停止」没作业时灰着一个道理）。
+    //
+    // ⚠️ **判据是「面板有内容」**或**「服务端还有作业」** —— 后者补上一个
+    //    缺口：新识别开始时面板被**本地**收起来了（合并规则），但服务端
+    //    那份作业还在 ⇒ 「清空」仍要能点（点了才能把服务端那份也清掉）。
+    //
+    // ⚠️ **导出还在跑 ⇒ 也不许点** —— 半路清掉会留下一个「半截」的作业
+    //    状态（句子清了、作业还在跑）⇒ 服务端也再挡一道。
+    if (reset) {
+      reset.disabled = this._dub.running ||
+        !(this._dub.hasRows || this._dub.hasJob);
+    }
   },
 
   /**
@@ -7013,6 +7086,7 @@ const Qwen3Asr = {
       return;
     }
     if (!d || !d.id) return;
+    this._dub.hasJob = true;
     this._dub.sourcePath = d.source_path || "";
     if (d.source_lang) this._dub.sourceLang = d.source_lang;
     if (d.target_lang) this._dub.targetLang = d.target_lang;

@@ -82,6 +82,7 @@ def main() -> int:
     args = ap.parse_args()
 
     posts: list[dict] = []
+    resets: list[int] = []
     errors: list[str] = []
 
     with sync_playwright() as p:
@@ -101,6 +102,8 @@ def main() -> int:
                     posts.append(json.loads(req.post_data or "{}"))
                 except Exception as exc:  # noqa: BLE001
                     posts.append({"_parse_error": str(exc)})
+            elif req.method == "POST" and "/api/qwen3-asr/dub/reset" in req.url:
+                resets.append(1)
 
         page.on("request", on_request)
 
@@ -341,6 +344,53 @@ def main() -> int:
         check("「实时结果」框顶上有一行语言提示的元素", cap_exist["exists"])
         check("语言提示在「实时结果」框**里面**", cap_exist["inLive"])
 
+        section("B7. 两块控件行的按钮顺序必须一致（2026-11-27 用户要求）")
+        # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
+        #   「实时翻译」那一行原来是「清空 / 停止 / 开始识别」⇒ 主操作
+        #   「开始识别」在**最后**，跟「配音导出」那一行（生成配音版 / 停止）
+        #   的读法也不一致 ⇒ 用户要求改成「开始识别 → 停止 → 清空」，
+        #   「配音导出」也补一个「清空」⇒ 两行**同一种读法**。
+        order = page.evaluate(
+            """() => {
+                const x = (id) => {
+                    const e = document.getElementById(id);
+                    if (!e) return -1;
+                    return Math.round(e.getBoundingClientRect().x);
+                };
+                const txt = (id) => {
+                    const e = document.getElementById(id);
+                    return e ? (e.textContent || '').trim() : '';
+                };
+                const trIds = ['asr-start-btn', 'asr-stop-btn', 'asr-reset-btn'];
+                const dubIds = ['asr-dub-start', 'asr-dub-stop', 'asr-dub-reset'];
+                const grp = document.querySelector('#asr-dub-block .asr-btn-group');
+                return {
+                    trText: trIds.map(txt),
+                    trX: trIds.map(x),
+                    dubText: dubIds.map(txt),
+                    dubX: dubIds.map(x),
+                    dubGrouped: (() => {
+                        if (!grp) return false;
+                        return dubIds.every((id) => !!grp.querySelector('#' + id));
+                    })(),
+                    dubVisible: (() => {
+                        const d = document.getElementById('asr-dub-block');
+                        return !!d && !d.classList.contains('hidden');
+                    })(),
+                };
+            }""")
+        check("「实时翻译」三个按钮的顺序 = 开始识别 → 停止 → 清空",
+              order["trText"] == ["开始识别", "停止", "清空"]
+              and order["trX"] == sorted(order["trX"]),
+              f"实际 = {order['trText']!r} x={order['trX']!r}")
+        check("「配音导出」三个按钮的顺序 = 生成配音版 → 停止 → 清空",
+              order["dubText"] == ["生成配音版", "停止", "清空"]
+              and order["dubX"] == sorted(order["dubX"]),
+              f"实际 = {order['dubText']!r} x={order['dubX']!r}")
+        check("「配音导出」的三个按钮成组（窄屏整组换行，不拆散）",
+              order["dubGrouped"])
+        check("配音导出块是显示的（否则 x 坐标没意义）", order["dubVisible"])
+
         section("C. 填**设备端路径** ⇒ 「生成配音版」必须可点")
         page.fill("#asr-source", args.source)
         page.wait_for_timeout(800)
@@ -496,6 +546,80 @@ def main() -> int:
         #    （那一行就是原文，没有译文）⇒ 只钉「源语言」。
         check("语言提示里标了「源语言」",
               "源语言" in merge["capText"], f"实际 = {merge['capText']!r}")
+
+        section("G. 「配音导出」的「清空」按钮")
+        # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
+        #   「配音导出」原来只有「生成配音版 / 停止」⇒ 跑完之后那面板一直
+        #   挂着 ⇒ 下一轮作业的句子会跟它混在一起 ⇒ 用户要一个「清空」。
+        # ⇒ 语义：**清掉逐句结果**，**不删生成的文件**（产物还在源目录里，
+        #   用户还要拿去播）。
+        rst = page.evaluate(
+            """() => {
+                const b = document.getElementById('asr-dub-reset');
+                return {exists: !!b, disabled: b ? b.disabled : null};
+            }""")
+        check("「配音导出」块里有「清空」按钮", rst["exists"])
+        check("有结果时「清空」是可点的", rst["disabled"] is False,
+              f"disabled={rst['disabled']}")
+
+        try:
+            page.click("#asr-dub-reset")
+        except Exception as exc:  # noqa: BLE001
+            check("点得到「清空」按钮", False, str(exc)[:120])
+        page.wait_for_timeout(2000)
+        check("发出了 POST /api/qwen3-asr/dub/reset", len(resets) > 0)
+
+        cleared = page.evaluate(
+            """() => {
+                const wrap = document.getElementById('asr-dub-out');
+                const rows = document.querySelectorAll('#asr-dub-list .asr-sent');
+                const live = document.getElementById('asr-live');
+                const sents = document.getElementById('asr-sentences');
+                const b = document.getElementById('asr-dub-reset');
+                const hid = (el) => !!el && el.classList.contains('hidden');
+                return {
+                    panelHidden: hid(wrap),
+                    n: rows.length,
+                    liveHidden: hid(live),
+                    sentsHidden: hid(sents),
+                    resetDisabled: b ? b.disabled : null,
+                };
+            }""")
+        check("结果面板被藏了（清空了）", cleared["panelHidden"])
+        check("面板里没有残留的行", cleared["n"] == 0, f"行数 = {cleared['n']}")
+        check("「实时结果」框回来了（导出没内容 ⇒ 合并规则解除）",
+              not cleared["liveHidden"])
+        check("「清空」按钮又变灰了（没东西可清）",
+              cleared["resetDisabled"] is True,
+              f"disabled={cleared['resetDisabled']}")
+
+        # ⚠️ **服务端也要清** —— 页面进时会拉一次**最新那个作业**
+        #    ⇒ 只清前端 DOM 的话，用户**一刷新页面**，上次的逐句结果又回来了。
+        srv = page.evaluate(
+            """async () => {
+                const r = await fetch('/api/qwen3-asr/dub/status',
+                                     {cache: 'no-store'});
+                const d = await r.json();
+                return {id: d.id || '', n: (d.sentences || []).length};
+            }""")
+        check("服务端也没有作业了（刷新页面不会复活）",
+              not srv["id"] and srv["n"] == 0, f"实际 = {srv!r}")
+
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(2500)
+        skip = page.locator("text=跳过向导").first
+        if skip.count():
+            skip.click()
+            page.wait_for_timeout(1500)
+        again = page.evaluate(
+            """() => {
+                const wrap = document.getElementById('asr-dub-out');
+                const rows = document.querySelectorAll('#asr-dub-list .asr-sent');
+                const hid = (el) => !!el && el.classList.contains('hidden');
+                return {panelHidden: hid(wrap), n: rows.length};
+            }""")
+        check("刷新页面后导出结果没有复活（服务端清生效）",
+              again["panelHidden"] and again["n"] == 0, f"实际 = {again!r}")
 
         check("页面没有 JS 报错", not errors, "; ".join(errors[:3]))
         if bad_responses:

@@ -1181,6 +1181,20 @@ async def post_dub_stop() -> dict:
     return {"ok": True, **get_dub_engine().stop()}
 
 
+@router.post("/dub/reset")
+async def post_dub_reset() -> dict:
+    """清掉上一个配音导出作业的**结果**（逐句原文 / 译文）。
+
+    ⚠️ **产物文件不动** —— 生成的文件在源文件同级目录里，用户还要拿去播
+    ⇒ 「清空」= 清**结果**，不是删文件。
+
+    ⇒ ``{ok, cleared}``；正在跑 ⇒ ``{ok: False, reason}``（前端也拦一道）。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    return get_dub_engine().reset()
+
+
 @router.get("/dub/files")
 async def get_dub_files(path: str = Query(..., description="设备端源文件绝对路径")) -> dict:
     """列出源文件同级目录里**已经生成**的配音文件（页面下拉用）。"""
