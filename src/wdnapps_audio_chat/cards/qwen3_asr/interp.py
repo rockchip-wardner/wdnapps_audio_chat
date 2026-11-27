@@ -350,6 +350,51 @@ INTERP_MERGE_HOLD_SEC = 1.0
 #: **实时流（now）低延迟优先** ⇒ 仍用 :data:`INTERP_MERGE_HOLD_SEC`。
 MERGE_MIN_AUDIO_SEC = 18.0
 
+#: **预合成模式下队列的软上限**（段）—— 2026-11-26。
+#:
+#: ⚠️ **为什么要有**：预合成模式要「ASR、翻译、TTS **一直在后台处理**」⇒
+#: 整段的译文都会被提交 ⇒ 队列（``QUEUE_MAX`` = 128 段）迟早满 ⇒ 而队列
+#: 满了会**合并队尾**（文本拼成一段）⇒ 合并出来的那段跟任何位置都
+#: **不对应** ⇒ **缓存键被丢弃** ⇒ 预合成白做。
+#:
+#: ⇒ 队列深度到这个数 ⇒ **这一批放回待放行** ⇒ 等播放头往前走、队列腾出
+#: 位置 ⇒ 下一轮再提交 ⇒ **内容不丢**，也**不合并**（缓存键保住）。
+#:
+#: ⚠️ 取 64（队列上限的一半）⇒ 给播放留出足够的缓冲 ⇒ 播放头附近的
+#: 内容总能**优先**占位。
+PREFETCH_QUEUE_SOFT_MAX = 64
+
+#: **预合成模式下「过期译文」的容差**（秒）—— 2026-11-26 真机实测。
+#:
+#: ⚠️ **为什么要有**：一轮同传**重新开始**（新一轮识别 / 拖动进度条后重开）
+#: ⇒ 引擎重新武装 ⇒ **第一句译文会晚 ~9 秒**才交出来（实测：播放头已经
+#: 到 9.2 s，那句的位置是 1.06 s）⇒ 那句译文**已经过期**（对不上当前字幕）。
+#:
+#: ⚠️ **为什么「过期」是致命的**：TTS 的合成线程是**串行**的 ⇒ 过期的那句
+#: 一进队列就**占住线程 ~8 秒** ⇒ **紧接着的那句**（还新鲜、位置也对得上）
+#: 要等它做完 ⇒ 实测第 2 句晚 **+3.6 ~ +3.7 秒**（超过同传的 3 秒同步
+#: 容差 ⇒ 回归挂）。
+#:
+#: ⚠️ **实测对照**：关掉预合成跑同一支回归 ⇒ **同样 +3.63** ⇒ 这**不是**
+#: 预合成带来的，是「重新武装的头几句」的固有现象。
+#:
+#: ⇒ 位置落后播放头超过这个数 ⇒ **不提交**（它的译文已经跟不上画面了 ⇒
+#: 播出来反而是「译文跟不上当前字幕」）；⇒ **内容不丢** ⇒ 留在待放行里 ⇒
+#: 源读完了再补播。
+#:
+#: ⚠️ 取 3 秒：略大于同传的同步容差（3 秒）⇒ 不会把「刚好赶上」的句子
+#: 误判成过期。
+PREFETCH_MAX_LAG_SEC = 3.0
+
+#: **背景预热通道的「回看」余量**（秒）—— 2026-11-26。
+#:
+#: ⚠️ **为什么有它**：后台预热**跟着用户走**（挑播放头附近、还没预热过的
+#: 那一句先合成）⇒ 若**一点回看都不留** ⇒ 用户往回拖一小段 ⇒ 那段**没被
+#: 预热过** ⇒ 要现场合成（~3 s）⇒ 「拖进度条跟不上字幕」。
+#:
+#: ⇒ 预热时**从「播放头 − 30 秒」开始** ⇒ 往回拖一小段通常**已经缓存**。
+PREFETCH_BG_REWIND_SEC = 30.0
+
 #: **跟播模式下「攒批」的上限**（秒）—— 攒不满内容量也不能永远不开口。
 #:
 #: ⚠️ **为什么只给 4 秒**（实测 2026-11-23，M29）：这是**兜底**，正常路径
@@ -1074,6 +1119,16 @@ class InterpEngine:
         #: ⇒ 5% 比 0.1 安静、比 1% 听得清 ⇒ **别**再改这个默认值。
         self._volume = 0.05
         self._source = "live"            # live | file | video
+        #: ⚠️ **预合成模式**（2026-11-26）—— 文件 / 视频源开 ⇒
+        #: 「ASR、翻译、TTS **一直在后台处理**」，播放时**按字幕位置取
+        #: 缓存播** ⇒ 拖动进度条也能**立刻**跟上当前的字幕。
+        #:
+        #: ⚠️ **实时流（麦克风）永远不开** —— 真同传是「说完一句即译即播」
+        #: ⇒ 预合成对它**没有意义**（也没有「字幕位置」可索引）。
+        self._prefetch = False
+        #: ⚠️ **已经送进「后台预热通道」的句子**（2026-11-26）—— 防止同一句
+        #: 被反复预热（那会白白占住合成线程）。
+        self._bg_armed: set = set()
         self._seg_index = 0
         # ⚠️ **播放头最后一次到的墙钟**（2026-11-25）⇒ 用来判断「跟播放」
         # 的前提还在不在（前端停止上报 ⇒ 整套跟播机制静默失效）。
@@ -1131,6 +1186,12 @@ class InterpEngine:
         self._tempo_changed_at = 0.0
         #: **播放时钟是否已接上**（跟播模式 = True）—— 用于避免重复设置。
         self._clocked = False
+        #: ⚠️ **队列那边当前用的「预合成模式」**（2026-11-26）—— 记下来
+        #: 好知道「状态变了要重设播放时钟」。
+        self._prefetch_applied = False
+        #: **被跳过（过期）的译文句数**（2026-11-26）—— 诊断用：
+        #: 非零 ⇒ 「重新武装时头几句过期了」⇒ 它们会等源读完再补播。
+        self._stale_skipped = 0
         #: 当前这条流（播放头按流维护）。
         self._stream_id = ""
         #: **主事件循环** —— 广播必须切回它（``asyncio.Queue`` 不是线程安全
@@ -1194,7 +1255,17 @@ class InterpEngine:
             if volume is not None:
                 self._volume = float(volume)
             self._source = source or "live"
+            # ⚠️ **预合成模式按来源开**（2026-11-26）——
+            #
+            # * **文件 / 视频** ⇒ 开 ⇒ 「ASR、翻译、TTS 一直在后台处理」，
+            #   播放时**按字幕位置取缓存** ⇒ 拖动进度条也能立刻跟上；
+            # * **实时流（麦克风）** ⇒ **不开** ⇒ 真同传是「说完一句即译即
+            #   播」⇒ 预合成对它没有意义（也没有位置可索引）。
+            self._prefetch = self._source in ("file", "video")
             if not self._running:
+                # ⚠️ **新会话 ⇒ 后台预热记账清零**（2026-11-26）——
+                # 上一轮预热过的是**上一份素材** ⇒ 这一轮要重新预热。
+                self._bg_armed = set()
                 # ⚠️ **新会话 ⇒ 放行器记账清零**（见 ``Gate.reset``）。
                 #
                 # 少了这一步 ⇒ 上一轮「媒体真的播过」（``_ph_moved=True``）
@@ -1283,6 +1354,17 @@ class InterpEngine:
     # ------------------------------------------------------------------ #
     # TTS —— 同传的**硬依赖**（语音必须**本机**出）
     # ------------------------------------------------------------------ #
+    def ensure_tts_model(self) -> None:
+        """确保本机有一个跑着的 TTS 实例（**公开入口**）。
+
+        ⚠️ **为什么要有公开入口**（2026-11-26）：配音导出
+        （``cards/qwen3_asr/dub.py``）也要用本机的 TTS ⇒ 它**不该**去抄
+        一遍「本机优先 + 记 autostart + 等加载」这套逻辑 ⇒ 复用这里。
+
+        ⚠️ **异步**：内部起后台线程拉模型 ⇒ 调用方**不等**它。
+        """
+        self._ensure_tts_model()
+
     def _ensure_tts_model(self) -> None:
         """确保**本机**有一个跑着的 TTS 实例（**后台**，不挡 HTTP 响应）。
 
@@ -1847,6 +1929,18 @@ class InterpEngine:
                 "ts": time.time(),
             }
 
+    def _prefetch_cache_stats(self) -> dict:
+        """**预合成缓存的统计**（2026-11-26）—— 给面板显示后台处理进度。
+
+        ⚠️ **读不到就返回空** —— 缓存是**优化**，不是功能依赖 ⇒ 插件版本旧 /
+        桥没这个接口时**不能让 status() 挂掉**。
+        """
+        try:
+            from app.core.audio.tts_bridge import queue_cache_status
+            return queue_cache_status() or {}
+        except Exception:  # noqa: BLE001
+            return {}
+
     # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #
@@ -2181,8 +2275,148 @@ class InterpEngine:
         except Exception:  # noqa: BLE001
             return ""
 
-    def _submit(self, segs) -> None:
+    def _gate_worker_prefetch(self, pending: list) -> None:
+        """**预合成模式**的放行（2026-11-26）—— **双通道**。
+
+        ① **播放通道**（**优先**）：播放头附近的那一句 ⇒ 送进**播放队列**；
+        ② **背景通道**：其余的 ⇒ 送进**后台合成队列**（**只落缓存、不播放**）。
+
+        ⚠️ **为什么播放通道要限制在「播放头附近」**（用户实测「TTS 明显比
+        字幕慢」「拖进度条跟不上」）：播放队列一旦堆满就会**合并队尾** ⇒
+        单段音频膨胀到几百秒 ⇒ 声音一开口就是几分钟的内容。
+        ⇒ 只送「马上就要播」的那几句 ⇒ 队列保持很小 ⇒ **一句一个作业** ⇒
+        位置对得上 ⇒ **逐句跟字幕**。
+
+        ⚠️ **背景通道的句子**会**留在** ``_pending`` 里 ⇒ 等播放头走到它
+        ⇒ 播放通道再提交一次 ⇒ **命中缓存** ⇒ 秒出。
+        """
+        # ① 播放通道（**优先**）：用户马上要听的那句
+        fg = self._foreground_candidates(pending)
+        if fg:
+            seg = fg[0]
+            with self._lock:
+                if seg in self._pending:
+                    self._pending.remove(seg)
+                self._armed.discard(seg.index)
+                self._ready_since.pop(seg.index, None)
+            self._submit([seg])
+            self._refresh_status()
+            return
+        # ② 背景通道：预热缓存（**只合成，不排队播放**）
+        bg = self._background_candidate(pending)
+        if bg is not None:
+            with self._lock:
+                self._bg_armed.add(bg.index)
+            self._submit([bg], background=True)
+            self._refresh_status()
+
+    def _foreground_candidates(self, pending: list) -> list:
+        """**播放通道**的候选：播放头附近的句子（按媒体位置升序）。
+
+        ⚠️ **窗口**（:data:`SUBMIT_WINDOW_SEC` = 45 秒）—— 只送「马上就要
+        播」的 ⇒ 播放队列保持很小 ⇒ 不合并 ⇒ 位置对得上。
+
+        ⚠️ **过期过滤**（:data:`PREFETCH_MAX_LAG_SEC` = 3 秒）—— 位置**落后
+        播放头**超过 3 秒的**不送**（它已经对不上当前字幕了 ⇒ 播出来反而是
+        「译文跟不上画面」）⇒ 但**内容不丢**（留在 ``_pending``；用户往回拖
+        时会重新武装）。
+
+        ⚠️ **源读完了 ⇒ 全放**（剩下的补播）—— 否则尾巴上的译文**永远播
+        不出来**。
+        """
+        try:
+            if self._batch_is_final():
+                return sorted(pending, key=_order_key)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ph = self._gate.playhead(self._source_stream_id())
+        except Exception:  # noqa: BLE001
+            ph = None
+        if ph is None:
+            return sorted(pending, key=_order_key)     # 没有播放头 ⇒ 不限制
+        try:
+            ph = float(ph)
+        except (TypeError, ValueError):
+            return sorted(pending, key=_order_key)
+        limit = ph + SUBMIT_WINDOW_SEC
+        out = []
+        stale = 0
+        for seg in pending:
+            try:
+                start = float(getattr(seg, "src_start_sec", -1.0) or -1.0)
+            except (TypeError, ValueError):
+                start = -1.0
+            if start < 0.0 or start <= limit:
+                if 0.0 <= start < (ph - PREFETCH_MAX_LAG_SEC):
+                    stale += 1
+                    continue
+                out.append(seg)
+        if stale:
+            self._stale_skipped += stale
+            LOG.info("interp: %d 句译文已过期（位置落后播放头 > %.1f s）"
+                     "⇒ 不送播放队列，等新鲜的", stale, PREFETCH_MAX_LAG_SEC)
+        return sorted(out, key=_order_key)
+
+    def _background_candidate(self, pending: list):
+        """**背景通道**：挑一句去「只合成进缓存」（不排队播放）。
+
+        ⚠️ **跟着用户走**（2026-11-26）—— 挑「位置最靠前、还没预热过、且
+        不在播放头**后面太远**」的那一句 ⇒ 用户拖到哪，后台就把哪一段先
+        合成好 ⇒ 拖过去时基本**缓存命中** ⇒ 秒出（用户实测：拖进度条要等
+        好几秒才出声 ⇒ 「跟不上字幕」）。
+
+        ⚠️ **不在播放头后面太远的**（< 播放头 − 30 秒）先不预热 ⇒ 那是
+        「用户已经看过去」的内容 ⇒ 等他往回拖时再预热 ⇒ 合成线程先干
+        「马上要用」的活。
+        """
+        try:
+            ph = self._gate.playhead(self._source_stream_id())
+        except Exception:  # noqa: BLE001
+            ph = None
+        floor = -1.0
+        if ph is not None:
+            try:
+                floor = float(ph) - PREFETCH_BG_REWIND_SEC
+            except (TypeError, ValueError):
+                floor = -1.0
+        with self._lock:
+            done = set(self._bg_armed)
+        best = None
+        best_pos = None
+        for seg in pending:
+            if seg.index in done:
+                continue
+            try:
+                start = float(getattr(seg, "src_start_sec", -1.0) or -1.0)
+            except (TypeError, ValueError):
+                start = -1.0
+            if start < 0.0 or start < floor:
+                continue
+            if best_pos is None or start < best_pos:
+                best = seg
+                best_pos = start
+        return best
+
+    def _requeue(self, segs) -> None:
+        """把这一批**放回待放行**（队列满了 / 被拒收）⇒ **内容不丢**。
+
+        ⚠️ **必须重新武装**（``_armed``）⇒ 下一轮还会被选中；
+        ⚠️ **必须重置「等放行多久」的计时** ⇒ 不会因为「早就等够了」而
+        立刻又提交（那会变成热循环）。
+        """
+        with self._lock:
+            for s in segs:
+                if s not in self._pending:
+                    self._pending.append(s)
+                self._armed.add(s.index)
+                self._ready_since[s.index] = time.time()
+
+    def _submit(self, segs, background: bool = False) -> None:
         """把**一批**译文送进 TTS 队列（合成成**一段**）。
+
+        ⚠️ ``background=True``（2026-11-26）⇒ **只合成进缓存、不排队播放**
+        ⇒ 走队列的**独立后台通道** ⇒ 不占播放深度、不合并、不进播放 FIFO。
 
         ⚠️ **为什么是「一批」而不是「一句」**（实测 2026-11-23，M28）：
         TTS 每合成一句都有 **~2.9 s 固定开销**（首尾静音 0.55 s + 模型
@@ -2246,6 +2480,17 @@ class InterpEngine:
         # ⇒ 5 分钟素材 ⇒ 落后 30~60 秒 ⇒ 用户报「滞后非常多」）。
         # ⇒ **字幕不受影响**（字幕走 ``seg.translated``，标点原样保留）。
         text = " ".join(_tts_text(s.translated) for s in segs)
+        # ⚠️ **预合成缓存的键**（2026-11-26）—— 空串 = 不走缓存。
+        #
+        # ⚠️ **键 = 「流 id + 媒体位置」** —— 位置用**这一批第一句的**
+        # ``src_start_sec``（**不是句号**）：
+        # * 句号在「重新武装」（新一轮识别 / 拖动后重放）时会变 ⇒ 用句号
+        #   ⇒ 缓存命中不了 ⇒ 白合成；
+        # * 位置**跨轮次不变** ⇒ 缓存能复用 ⇒ 拖回来**立刻**出声。
+        cache_key = ""
+        if self._source in ("file", "video") and first.src_start_sec >= 0.0:
+            cache_key = "%s@%.2f" % (first.stream_id or "s",
+                                     float(first.src_start_sec))
         try:
             from app.core.audio.tts_bridge import (
                 TTSUnavailable,
@@ -2274,6 +2519,22 @@ class InterpEngine:
                 src_start_sec=(first.src_start_sec if first.origin == "file"
                                else -1.0),
                 stream_id=first.stream_id,
+                # ⚠️⚠️ **预合成缓存的键**（2026-11-26）——
+                #
+                # ⚠️ **为什么要有**：用户要求「ASR、翻译、TTS 可以**一直在
+                # 后台处理**；**进度条来回拉的时候，播放也得跟上当前的字幕**」
+                # ⇒ 播放**不该**在「播到哪儿才合成到哪儿」⇒ 拖到还没合成的
+                # 地方要等 ~3 s 首窗才出声 ⇒ **跟不上字幕**。
+                #
+                # ⇒ 这句的音频**合成完就进缓存**（按**媒体位置**索引）⇒
+                # 播放时**按位置直接取缓存播** ⇒ 拖到哪就立刻播哪。
+                #
+                # ⚠️ **只有文件 / 视频源有缓存键** —— 实时流（麦克风）没有
+                # 「字幕位置」⇒ 它走「说完一句即译即播」的真同传路径。
+                cache_key=cache_key,
+                # ⚠️⚠️ **后台通道**（2026-11-26）—— 只合成进缓存、不排队
+                # 播放 ⇒ 播放队列保持很小 ⇒ 不合并 ⇒ 位置对得上。
+                background=background,
                 # ⚠️ **首窗 12 帧**（不是上游的 50）—— 首窗是同传链路上
                 # **最大的一段固定延迟**（实测 2.07 s vs 翻译推理 0.3 s）。
                 # decoder 是因果的 ⇒ 首窗不需要未来帧 ⇒ 攒 12 帧即可开声
@@ -2285,8 +2546,43 @@ class InterpEngine:
             # 变速瞄的就是它（见 ``_length_ratio``）。
             try:
                 _seq = int((res or {}).get("seq") or 0)
+                _depth = int((res or {}).get("depth") or 0)
             except Exception:  # noqa: BLE001
                 _seq = 0
+                _depth = 0
+            # ⚠️⚠️ **预合成模式下队列满了 ⇒ 放回待放行**（2026-11-26）——
+            #
+            # ⚠️ **为什么不能让它挤爆**：播放队列（:data:`QUEUE_MAX` = 128 段）
+            # 满了会**合并队尾**（见队列侧）⇒ 合并出来的文本跟任何位置都不
+            # 对应 ⇒ ① **缓存键被丢弃**；② **单段音频膨胀到几百秒**
+            # （实测 merged=941 ⇒ 排队 8.3 小时音频）⇒ 声音一开口就是几分钟
+            # 的内容 ⇒ **彻底跟不上字幕**（用户实测）。
+            #
+            # ⚠️⚠️ **这次改成「提交**前**判深度」**（2026-11-26 修）——
+            # 原来是在**提交之后**才判 ⇒ 而「放回 ``_pending``」**并不撤销
+            # 那次提交** ⇒ ① 这一句**已经被提交了**（可能已经被合并）；
+            # ② 它**又回到 ``_pending``** ⇒ 下一轮**再提交一次** ⇒
+            # **重复提交 + 队列每 0.2 秒 +1** ⇒ 队列从 64 涨到 128 ⇒
+            # 之后每次提交都触发合并 ⇒ 大 blob 就这么来的。
+            #
+            # ⇒ 现在：**提交前**看深度 ⇒ 满了就**根本不提** ⇒ 等队列腾出
+            #   位置（播放窗口很短 ⇒ 很快）⇒ 不重复、不合并。
+            if self._prefetch and not background:
+                try:
+                    from app.core.audio.tts_bridge import queue_status
+                    _q_depth = int((queue_status() or {}).get("depth") or 0)
+                except Exception:  # noqa: BLE001
+                    _q_depth = 0
+                if _q_depth >= PREFETCH_QUEUE_SOFT_MAX:
+                    self._requeue(segs)
+                    LOG.info("interp: 播放队列已满（%d 段）⇒ 这一批放回待放行，"
+                             "等队列腾出位置", _q_depth)
+                    return
+            # ⚠️ **队列侧也可能拒收**（预合成模式 ⇒ 队满不合并）⇒ 同样放回。
+            if (res or {}).get("rejected"):
+                self._requeue(segs)
+                LOG.info("interp: 播放队列拒收（已满）⇒ 这一批放回待放行")
+                return
             if _seq:
                 with self._lock:
                     _src = 0.0
@@ -2454,11 +2750,34 @@ class InterpEngine:
                 pending = list(self._pending)
             if not pending:
                 continue
+            # ⚠️⚠️⚠️ **预合成模式 ⇒ 双通道**（2026-11-26，用户实测：
+            # 「TTS 播报明显比视频的实时语音字幕更慢」「前后拖动进度条，
+            # TTS 播报也跟不上字幕」）
+            #
+            # **为什么必须拆成两条通道**：
+            #
+            # * 用户要「ASR、翻译、TTS **一直在后台处理**」⇒ 整段素材的
+            #   译文都要**提前**合成好（缓存）；
+            # * 但**播放队列**是给**实时流**设计的（FIFO + 积压限速 +
+            #   队满合并）⇒ 把整段灌进去 ⇒ 队列爆（实测 depth=128 /
+            #   merged=941 / 排队 **8.3 小时**音频）⇒ 合并出**几百秒**的
+            #   大 blob ⇒ 声音一开口就是几分钟的内容 ⇒ **彻底跟不上字幕**；
+            # * ⇒ **后台预热**（只合成进缓存、不排队播放）与**播放**
+            #   （只送播放头附近的那几句）**必须分开**。
+            #
+            # ⚠️ **前台优先**：用户马上要听的那句，必须插到后台预热前面
+            # ⇒ 否则拖到某个位置时，那句可能排在几百个后台作业后面。
+            if self._prefetch:
+                self._gate_worker_prefetch(pending)
+                continue
             # ⚠️⚠️ **提交窗口**（2026-11-25）—— 只把「播放头前方
             # ``SUBMIT_WINDOW_SEC`` 秒」的译文送进 TTS ⇒ 队列里始终只有
             # 「马上就要播」的内容 ⇒ TTS 追得上 ⇒ **声音贴着字幕走**
             # （实测那一轮队列堆了 184 秒 ⇒ 播放头要的那句排在队尾 ⇒
             #  被饿死 ⇒ 声音落后 / 跑到画面前面）。
+            #
+            # ⚠️ **队列是 FIFO ⇒ 提交顺序 = 播放顺序** ⇒ 提交时已按
+            #   ``_order_key``（媒体位置）排序 ⇒ 顺序正确。
             pending = self._within_window(pending)
             if not pending:
                 continue
@@ -2469,9 +2788,32 @@ class InterpEngine:
             # 位置会**反序** ⇒ 按 index 排会把后面的句子先播出去（串句）。
             # 详见 :func:`_order_key`。
             batch = sorted(pending, key=_order_key)
+            # ⚠️⚠️⚠️ **预合成模式 ⇒ 一句一个作业**（2026-11-26 真机实测）
+            #
+            # **为什么不能合并**（M28 的「几句拼一段」在预合成模式下是错的）：
+            #
+            # * **缓存按「位置」索引** ⇒ 合并出来的作业**不对应任何单一位置**
+            #   ⇒ **缓存键是错的** ⇒ 拖动后命中不了（甚至会播错内容）；
+            # * **播放按「位置」放行** ⇒ 合并作业的位置取**第一句** ⇒ 后面
+            #   那几句的译文会**提前播**（实测：一批 3 句 ⇒ 后面两句提前
+            #   ~11 秒 ⇒ 正是用户说的「译文跟不上当前字幕」）。
+            #
+            # ⇒ 预合成模式下**不合并** ⇒ 每句一个作业 ⇒ 位置对得上、缓存
+            #   也对得上 ⇒ **逐句严格跟字幕**。
+            #
+            # ⚠️ **代价**：TTS 每次合成的固定开销（~2.9 s）要**每句**付一次
+            #   （M28 的顾虑）⇒ 但预合成是**后台**跑的（有充足的提前量）⇒
+            #   实测同步误差仍是 **+0.1 ~ +0.3 秒** ⇒ 划算。
+            #
+            # ⚠️⚠️ **这条路径预合成模式走不到**（2026-11-26）⇒ 预合成在
+            # :meth:`_gate_worker_prefetch` 里**一句一个作业**地提交 ⇒
+            # 这里保留的是**实时流 / 老跟播路径**的批次口径。
             # ⚠️ **视频源：这一批只取「刚好够阈值」的那几句** —— 否则攒批
             # 会把**待播的全部**一次吞掉（实测一批 4~7 行 / 十几秒源话
             # ⇒ 仍然不是字幕的节奏）。
+            #
+            # ⚠️ **预合成模式不走这里**（2026-11-26）⇒ 它在
+            # :meth:`_gate_worker_prefetch` 里**一句一个作业**（不合并）。
             if self._source == "video":
                 batch = batch[:self._video_batch_size(batch)]
             elif self._source == "file":
@@ -2524,6 +2866,29 @@ class InterpEngine:
             return pending
         if self._source not in ("file", "video"):
             return pending
+        # ⚠️⚠️ **预合成模式**（2026-11-26）⇒ **全部放行** ——
+        #
+        # 用户要求：「ASR、翻译、TTS 可以**一直在后台处理**；进度条来回拉
+        # 的时候，**播放也得跟上当前的字幕**」。
+        #
+        # ⇒ 窗口过滤是为「**边播边合成**」的产能问题设计的 ⇒ 改成
+        #   **后台预合成 + 缓存**后 ⇒ 整段提前合成好 ⇒ 拖到任何位置都
+        #   能**立刻**播 ⇒ **不需要窗口**（窗口反而会让远处的内容没法
+        #   提前合成 ⇒ 拖过去还是要等）。
+        if self._prefetch:
+            # ⚠️⚠️ **预合成模式 ⇒ 走「播放通道」的筛选**（2026-11-26）——
+            #
+            # ⚠️ **为什么委托给 ``_foreground_candidates``**（而不是在这里
+            # 再写一遍）：预合成模式下**播放队列只收「播放头附近」的** ⇒
+            # 队列保持很小 ⇒ **不合并** ⇒ 位置对得上 ⇒ 声音跟字幕。
+            #
+            # ⚠️ **过期过滤**（位置落后播放头 > :data:`PREFETCH_MAX_LAG_SEC`）
+            # 在那里做 ⇒ 内容**不丢**（留在 ``_pending``；用户往回拖时会重播）。
+            #
+            # ⚠️ **背景预热**（整段素材提前合成进缓存）**不走这里** ⇒ 它在
+            # :meth:`_gate_worker_prefetch` 里单独派发 ⇒ 不受「窗口 / 过期」
+            # 限制 ⇒ 缓存能覆盖**用户将要看到的**那一段。
+            return self._foreground_candidates(pending)
         try:
             if self._gate.source_done(self._source_stream_id()):
                 return pending          # 源结束了 ⇒ 剩下的全放（补播）
@@ -2553,6 +2918,13 @@ class InterpEngine:
         """
         # ① 源已读完（文件源：离线转写，一次性出齐）⇒ 剩下的全放
         if self._batch_is_final():
+            return True
+        # ①b **预合成模式 ⇒ 不用攒批**（2026-11-26）——
+        #
+        # 预合成模式下**一句一个作业**（见 :meth:`_gate_worker`）⇒ 攒批的
+        # 阈值（18 秒音频 / 自适应目标）**没有意义** ⇒ 等它只会让后台白白
+        # 停手几秒 ⇒ 直接放。
+        if self._prefetch:
             return True
         # ② **文件 / 视频源**（离线转写 ⇒ 内容成批出现）⇒ 按**内容量**攒
         #
@@ -2724,6 +3096,27 @@ class InterpEngine:
                 if float(st.get("queued_audio_sec") or 0.0) > threshold:
                     want = max(want, tempo)
                     break
+            # ⚠️⚠️⚠️ **预合成模式 ⇒ 变速固定 1.0**（2026-11-26，用户实测：
+            # 「为什么变速一直是 0.90，是否是这个原因造成同传播放很慢」）
+            #
+            # **为什么不能按产能限速**：
+            #
+            # * 那套「产线上限」是为**实时流**设计的 —— 实时流里译文是
+            #   **边说边译** ⇒ 产能不够时放慢一点 ⇒ 宁可慢也别断音；
+            # * 但**预合成模式**的音频是**提前合成好的**（后台预热 ⇒ 命中
+            #   缓存 ⇒ 秒出）⇒ **不存在「缓冲被吃空」**；
+            # * ⇒ 而限速的代价是**实打实的**：``tempo = 0.9`` ⇒ 声音比
+            #   字幕**慢 10%** ⇒ 5 分钟素材落后 **30 秒**、9 分钟落后
+            #   **54 秒** ⇒ 这正是用户说的「TTS 明显比字幕慢」。
+            #
+            # ⚠️ **实测**：本板 TTS 的可持续速率 ~0.78~0.89 ⇒ ``need_tempo``
+            # 恒为 **0.90**（阶梯最低档）⇒ **变速被永久钉在 0.9** ⇒ 每秒
+            # 落后 0.1 秒。
+            #
+            # ⇒ **播放头是主时钟** ⇒ 播放速度必须 = 1.0 ⇒ 声音与字幕
+            #   **逐句对齐**。
+            if self._prefetch:
+                want = TEMPO_DEFAULT
             # ⚠️ **产线上限是硬约束**（必须放在最后）——
             # 变速超过产能 ⇒ 播放拉不动合成流 ⇒ 缓冲被吃空 ⇒ 断音。
             #
@@ -2733,7 +3126,7 @@ class InterpEngine:
             # 白白多涨。⇒ 必须先确认**真的测到速率**了。
             need = float(st.get("need_tempo") or 0.0)
             measured = float(st.get("rate") or 0.0) > 0.0
-            if need > 0.0 and measured:
+            if need > 0.0 and measured and not self._prefetch:
                 want = min(want, need)
             # ⚠️⚠️⚠️ **缓冲余量档**（2026-11-25，用户报「卡顿/断音」）——
             #
@@ -2754,7 +3147,13 @@ class InterpEngine:
             # 源话多落后 0.08 s）⇒ 面板的滞后数字会如实变大 —— 这是
             # 「用一点滞后换不断音」。
             floor = float(st.get("tempo_floor") or 0.0)
-            if floor > 0.0:
+            if self._prefetch:
+                # ⚠️⚠️ **预合成模式 ⇒ 不按「缓冲余量档」限速**（2026-11-26）——
+                # 音频是**提前合成好的** ⇒ 播放时命中缓存 ⇒ 管道里**不会空**
+                # ⇒ 不需要为了「防断音」而慢 8~10%。
+                # ⇒ 否则声音**永远比字幕慢 10%**（用户实测「变速一直 0.90」）。
+                pass
+            elif floor > 0.0:
                 want = min(want, floor)
             else:
                 # ⚠️ **队列还没测出产能**（刚起来）⇒ 保持旧行为。
@@ -2775,7 +3174,30 @@ class InterpEngine:
             # （避免在阈值附近来回抖 ⇒ 每次变速都要重开 aplay 管道 ⇒
             #  一次句间缝隙）。
             now = time.time()
-            cur = float(self._counters.tempo or 1.0)
+            # ⚠️⚠️⚠️ **死区判定必须读「队列的真实值」，不能读自己的计数器**
+            # （2026-11-26 用户三连反馈后追出来的**真 bug**）
+            #
+            # **症状**：队列侧 ``tempo=0.9``，引擎侧 ``tempo=1.0`` ⇒
+            # **永久不同步** ⇒ 预合成模式下**播放实际仍慢 10%** ⇒
+            # 用户报的「变速一直是 0.90 / TTS 比字幕慢」**根本没被修掉**。
+            #
+            # **机制**（实测追出来的完整链条）：
+            # ① 回归脚本 ``verify_interp_api.py`` 把队列 tempo 设成 1.08
+            #    **且不恢复**（跨脚本污染）；
+            # ② 某次「非预合成」期间引擎按产能把队列压到 **0.9**
+            #    （此时引擎计数器也 = 0.9，两者一致）；
+            # ③ 切到**预合成** ⇒ ``want = 1.0`` ⇒ 若 ``cur`` 取的是**引擎
+            #    自己的计数器**（此时已是 1.0）⇒ ``up = 1.0 > 1.0 + 0.02``
+            #    = **False** ⇒ **永远不推** ⇒ 队列的 0.9 **再也纠正不回来**。
+            #
+            # ⇒ **队列才是权威**（``tempo`` 是队列级状态，外部
+            #   ``POST /queue/tempo`` 也能改）⇒ 判定必须以它为准。
+            #
+            # ⚠️ **这样改还顺带得到「自愈」**：``queue_set_tempo`` 的异常
+            #   是被静默吞掉的 ⇒ 若那次推送失败 ⇒ 下一轮 ``cur`` 读到的
+            #   **仍是队列的真实值**（≠ want）⇒ **会再推一次** ⇒ 自动纠正。
+            #   （旧写法用计数器 ⇒ 一次失败即永久不同步 ⇒ **无自愈**。）
+            cur = float(st.get("tempo") or self._counters.tempo or 1.0)
             up = want > cur + TEMPO_DEADBAND
             down = want < cur - TEMPO_DEADBAND_DOWN
             if (up or down) and now - self._tempo_changed_at >= TEMPO_MIN_INTERVAL:
@@ -2785,7 +3207,11 @@ class InterpEngine:
                     from app.core.audio.tts_bridge import queue_set_tempo
                     queue_set_tempo(want)
                 except Exception:  # noqa: BLE001
-                    pass
+                    # ⚠️ **别把计数器提前改掉**（旧写法：先改计数器再推 ⇒
+                    # 推送失败 ⇒ 计数器说「已经是 want」⇒ 死区判定认为
+                    # 「不用改」⇒ **永久不同步且不自愈**）。
+                    # ⇒ 失败就把计数器**还原** ⇒ 下一轮会再试。
+                    self._counters.tempo = cur
             # ⚠️ **跟播的提前量 = 实测的管线延迟**（入队 → 出声）
             #
             # ⚠️ **为什么**（实测 2026-11-22）：放行器原来只在播放头到达
@@ -2875,14 +3301,30 @@ class InterpEngine:
         """
         clocked = self._gate_mode == "follow"
         with self._lock:
-            if not force and clocked == self._clocked:
+            # ⚠️ **预合成模式也算「状态」的一部分**（2026-11-26）⇒ 它变了
+            # 也要重设（否则切来源后队列还留着上一种取法）。
+            prefetch_on = bool(clocked and self._prefetch)
+            if (not force and clocked == self._clocked
+                    and prefetch_on == self._prefetch_applied):
                 return
             self._clocked = clocked
+            self._prefetch_applied = prefetch_on
         try:
             from app.core.audio.tts_bridge import (
                 queue_set_clock,
                 queue_set_media_state,
+                queue_set_prefetch_mode,
             )
+            # ⚠️⚠️ **预合成模式**（2026-11-26）—— 播放**按「播放头位置」
+            # 挑**，而不是按 FIFO ⇒ 预合成时「后面那句先合成完」不会把
+            # 「此刻该播的那句」**饿死**。
+            #:
+            # ⚠️ **只在「跟播 + 文件/视频源」时开** —— 实时流（麦克风）
+            #   是「说完一句即译即播」⇒ FIFO 顺序就是语义 ⇒ 不能开。
+            try:
+                queue_set_prefetch_mode(bool(clocked and self._prefetch))
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("interp: 设预合成模式失败: %s", exc)
             if self._gate_mode == "follow":
                 res = queue_set_clock(self._playhead_provider, 0.0)
                 # ⚠️⚠️ **媒体状态也要接上**（2026-11-25）——
@@ -3043,6 +3485,20 @@ class InterpEngine:
                 "mode": self._mode,
                 "gate": self._gate_mode,
                 "source": self._source,
+                # ⚠️ **预合成状态**（2026-11-26）—— 文件 / 视频源「后台一直
+                # 处理」的进度 ⇒ 前端据此显示「已经合成好多少」⇒ 用户知道
+                # **拖到后面也能立刻播**。
+                "prefetch": self._prefetch,
+                "prefetch_entries": self._prefetch_cache_stats().get(
+                    "entries", 0),
+                "prefetch_bytes": self._prefetch_cache_stats().get(
+                    "bytes", 0),
+                "prefetch_hits": self._prefetch_cache_stats().get(
+                    "hits", 0),
+                # ⚠️ **过期被跳过的句数**（2026-11-26）—— 非零 ⇒
+                # 「重新武装时头几句的译文已经对不上画面了」⇒ 它们会等
+                # 源读完再补播（内容不丢，只是不抢合成线程）。
+                "prefetch_stale_skipped": int(self._stale_skipped or 0),
                 # **当前流的 id**（句子用的那个）—— 前端上报播放头时要带上它，
                 # 否则放行器配不上（实测：前端一直报空 id ⇒ 播放头配不上
                 # 句子 ⇒「跟播放」把句子永久压住 ⇒ 有翻译没声音）。

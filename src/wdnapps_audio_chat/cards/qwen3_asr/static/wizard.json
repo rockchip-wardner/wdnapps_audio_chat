@@ -37,22 +37,11 @@
             { "value": "off", "label": "不翻译", "selected": true }
           ] }
       ] },
-    { "id": "interp", "title": "同声传译（可选）", "kind": "form",
+    { "id": "dub", "title": "配音导出（可选）", "kind": "form",
       "fields": [
-        { "id": "asr-interp-enabled", "ui_key": "interp",
-          "label": "开启同声传译（把译文用板载喇叭念出来；同时会加载语音合成模型，独占一张计算卡，约占 1.9 GB。用麦克风时请戴耳机，避免回声）",
-          "summary_label": "同声传译",
-          "type": "checkbox", "default": false },
-        { "id": "asr-interp-lang", "ui_key": "interpLang",
-          "label": "朗读语言（只列能用语音播报的 10 种语言；选其它语言时自动降级为只显示字幕）",
-          "summary_label": "朗读语言",
-          "type": "select",
-          "options": [
-            { "value": "", "label": "跟随翻译目标语言", "selected": true }
-          ] },
-        { "id": "asr-interp-voice", "ui_key": "interpVoice",
-          "label": "音色",
-          "summary_label": "音色",
+        { "id": "asr-dub-voice", "ui_key": "dubVoice",
+          "label": "配音音色（生成配音版时用；本板只有参考音色能出声）",
+          "summary_label": "配音音色",
           "type": "select",
           "options": [] }
       ] },

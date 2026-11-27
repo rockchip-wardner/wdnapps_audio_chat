@@ -60,8 +60,10 @@ socket，不会两条流交错。
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
+import wave
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -108,6 +110,12 @@ TEMPO_LADDER = (0.92, 0.96, 1.0, 1.04, 1.08, 1.15)
 #: **播放时钟卡住多久就放弃等待**（秒）—— 源不再往前走时不能把译文
 #: **永久压住**（否则「有翻译、一声不响」，踩过好几次）。
 _CLOCK_STALL_SEC = 8.0
+
+#: ⚠️ **预合成模式：按位置挑时的容差**（秒，2026-11-26）——
+#:
+#: 位置**正好等于**播放头的那一句也可能要挑出来 ⇒ 留一点容差 ⇒
+#: ``pos <= ph - tol`` 就算「已到位置」。
+_PREFETCH_PICK_TOL_SEC = 0.05
 
 
 #: **空闲多久就把 aplay 关掉**（秒）—— 复用 writer 的代价是**占着 ALSA
@@ -292,6 +300,138 @@ class _JobStream:
             return self._finished and self._pos >= len(self._chunks)
 
 
+class _AudioCache:
+    """**预合成音频缓存**（2026-11-26）—— 文件 / 视频源的后台预合成产物。
+
+    为什么要有
+    ----------
+    用户要求（2026-11-26）：「ASR、翻译、TTS 可以**一直在后台处理**，
+    播放节奏保证能跟上字幕；**进度条来回拉的时候，播放也得跟上当前的
+    字幕**」。
+
+    ⇒ 播放**不该**在「播到哪儿才合成到哪儿」—— 那样拖动进度条到还没
+    合成的地方 ⇒ 要等 ~3 s 首窗 + 推理才出声 ⇒ **播放跟不上字幕**。
+
+    ⇒ 这里把合成好的音频**按「媒体时间轴上的位置」存起来** ⇒ 播放时
+    **按位置直接取缓存播** ⇒ 拖到哪就立刻播哪。
+
+    为什么用**位置**做键
+    ------------------
+    句号在「重新武装」（新一轮识别 / 拖动后重放）时会变 ⇒ 用句号做键
+    ⇒ 缓存命中不了 ⇒ 白合成。位置（``src_start_sec``）**跨轮次不变** ⇒
+    缓存能复用。
+
+    容量
+    ----
+    eMMC 有限（实测同传一次会议能写几百 MB）⇒ **按总字节数封顶** ⇒
+    **LRU 淘汰**（最久没用的先删）。
+    """
+
+    def __init__(self, max_bytes: int = 192 * 1024 * 1024,
+                 root: Optional[str] = None) -> None:
+        self._max_bytes = int(max_bytes)
+        self._root = root
+        self._lock = threading.Lock()
+        #: key → (wav 路径, 音频秒数, 字节数)
+        self._items: "dict[str, tuple[str, float, int]]" = {}
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+
+    # -- 路径 ------------------------------------------------------------- #
+    def _dir(self) -> str:
+        if self._root:
+            return self._root
+        import tempfile
+        return os.path.join(tempfile.gettempdir(), "wdnwebui-tts-cache")
+
+    def _path_for(self, key: str) -> str:
+        # ⚠️ 键里可能有 ``:`` / ``.`` ⇒ 做一次安全化（只留字母数字与 ``_-.``）。
+        safe = "".join(c if (c.isalnum() or c in "_-.") else "_" for c in key)
+        return os.path.join(self._dir(), safe + ".wav")
+
+    # -- 写 --------------------------------------------------------------- #
+    def put(self, key: str, wav_path: str, audio_sec: float) -> None:
+        if not key or not wav_path:
+            return
+        try:
+            size = os.path.getsize(wav_path)
+        except OSError:
+            return
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old:
+                self._bytes -= old[2]
+                try:
+                    os.unlink(old[0])
+                except OSError:
+                    pass
+            self._items[key] = (wav_path, float(audio_sec), int(size))
+            self._bytes += int(size)
+            self._evict_locked()
+
+    def _evict_locked(self) -> None:
+        """**LRU 淘汰**（调用方持锁）—— 超了容量就删最久没用的。
+
+        ⚠️ **不留「至少一条」的底线**（2026-11-26）—— 底线会让
+        「单个文件就超过上限」时**永远超限**（实测：48 KB 的文件 vs 10 B
+        上限 ⇒ 留 1 条仍是 48 KB）⇒ 缓存能**无限涨** ⇒ eMMC 撑爆。
+        ⇒ 宁可**删光**（下一轮重新合成）⇒ **磁盘占用有硬上限**。
+        """
+        while self._bytes > self._max_bytes and self._items:
+            # ⚠️ ``dict`` 保序 ⇒ 第一个就是最久没**写入**的 ⇒ 近似 LRU。
+            oldest = next(iter(self._items))
+            item = self._items.pop(oldest)
+            self._bytes -= item[2]
+            try:
+                os.unlink(item[0])
+            except OSError:
+                pass
+
+    # -- 读 --------------------------------------------------------------- #
+    def get(self, key: str) -> Optional[tuple]:
+        """命中 ⇒ 返回 ``(wav 路径, 音频秒数)``；没命中 ⇒ ``None``。"""
+        if not key:
+            return None
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                self._misses += 1
+                return None
+            self._hits += 1
+            # ⚠️ **命中就挪到最后** ⇒ 真正的 LRU（被播过的不会被先删）。
+            del self._items[key]
+            self._items[key] = item
+            return (item[0], item[1])
+
+    def has(self, key: str) -> bool:
+        if not key:
+            return False
+        with self._lock:
+            return key in self._items
+
+    # -- 清 --------------------------------------------------------------- #
+    def clear(self) -> None:
+        with self._lock:
+            for path, _sec, _size in self._items.values():
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            self._items.clear()
+            self._bytes = 0
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "entries": len(self._items),
+                "bytes": self._bytes,
+                "max_bytes": self._max_bytes,
+                "hits": self._hits,
+                "misses": self._misses,
+            }
+
+
 @dataclass
 class TTSJob:
     """队列里的一句。"""
@@ -336,6 +476,37 @@ class TTSJob:
     #: ``src_start_sec`` 才把这一句写进管道 ⇒ **译文跟源话对齐**
     #: （合成提前跑，播放按源话走 ⇒ 既有缓冲余量，又不滞后）。
     src_start_sec: float = -1.0
+    #: ⚠️ **预合成缓存的键**（2026-11-26）—— 空串 = 不走缓存。
+    #:
+    #: ⚠️ **为什么需要**：文件 / 视频源是「**后台一直处理**」的 ⇒ ASR、翻译、
+    #: TTS 都提前跑完 ⇒ 播放时**不该再合成**（合成要 ~3 s 首窗 ⇒ 拖动
+    #: 进度条后要等好几秒才出声 ⇒ 用户报「进度条来回拉的时候，播放跟不上
+    #: 当前的字幕」）。
+    #:
+    #: ⇒ 合成完的音频**按「媒体时间轴上的位置」存起来** ⇒ 播放时**按位置
+    #: 直接取缓存播** ⇒ 拖到哪就立刻播哪 ⇒ **严格跟字幕**。
+    #:
+    #: ⚠️ **键用位置（``src_start_sec``）而不是句号** —— 句号在「重新武装」
+    #: 时会变（新一轮识别）⇒ 位置不变 ⇒ 缓存能跨轮次复用。
+    cache_key: str = ""
+    #: ⚠️⚠️ **后台合成作业**（2026-11-26）—— **只合成进缓存、不排队播放**。
+    #:
+    #: ⚠️ **为什么要有这条通道**（用户实测：「TTS 播报明显比视频的实时语音
+    #: 字幕更慢」「前后拖动进度条，TTS 播报跟不上字幕」）：
+    #:
+    #: * 用户要求「ASR、翻译、TTS 可以**一直在后台处理**」⇒ 整段素材的
+    #:   译文都要**提前**合成好（缓存）；
+    #: * 但**播放队列**是给**实时流**设计的：FIFO + 「积压越大越慢」的
+    #:   自动变速 + 「队满就把队尾和新句拼成一段」；
+    #: * ⇒ 把整段灌进播放队列 ⇒ 队列爆（实测 depth=128 / merged=941 /
+    #:   排队 8.3 小时音频）⇒ 合并出**几百秒**的大 blob ⇒ 声音一开口就是
+    #:   几分钟的内容 ⇒ **彻底跟不上字幕**。
+    #:
+    #: ⇒ **后台合成与播放分离**：后台作业进**独立的队列** ⇒ 不占播放深度、
+    #: **不触发合并**、合成完**只落缓存** ⇒ 播放时按位置命中缓存 ⇒ 秒出。
+    background: bool = False
+    #: **预合成缓存里那份音频的时长**（秒）；0 = 还没合成好。
+    cached_audio_sec: float = 0.0
     created_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
@@ -412,6 +583,31 @@ class TTSQueue:
     def __init__(self) -> None:
         self._cond = threading.Condition(threading.Lock())
         self._jobs: List[TTSJob] = []
+        #: ⚠️⚠️ **后台合成队列**（2026-11-26）—— 「只合成进缓存、不排队播放」
+        #: 的作业。
+        #:
+        #: ⚠️ **为什么与播放队列分开**（用户实测「TTS 明显比字幕慢」「拖进度条
+        #: 跟不上」）：播放队列是给**实时流**设计的 ⇒ 它满的时候会**合并队尾**
+        #: （把两句拼成一段）⇒ 而预合成要求「**一句一个作业**」（缓存按位置
+        #: 索引、播放按位置放行）⇒ 合并会把缓存键丢掉、让单段音频膨胀到几百
+        #: 秒 ⇒ 声音彻底跟不上字幕。
+        #:
+        #: ⇒ 后台作业走这条队列 ⇒ **不占播放深度**、**不合并**、**不进播放
+        #: FIFO** ⇒ 合成完只落缓存 ⇒ 播放时按位置命中缓存 ⇒ **秒出**。
+        self._bg_jobs: List[TTSJob] = []
+        #: ⚠️ **正在合成的后台作业**（2026-11-26）—— 与播放侧的 ``_playing``
+        #: 分开 ⇒ ``clear()`` 不会把它作废 ⇒ **缓存不白做**。
+        self._bg_playing: Optional[TTSJob] = None
+        #: ⚠️ **预合成模式下「队满不合并」**（2026-11-26）⇒ 队满时**拒收**
+        #: （让调用方把这一批放回待放行）⇒ 缓存键保住、句子不被拼成大 blob。
+        self._no_merge: bool = False
+        #: ⚠️ **预合成音频缓存**（2026-11-26）—— 文件 / 视频源「后台一直
+        #: 处理」的产物 ⇒ 播放时**按位置直接取缓存播** ⇒ 拖动进度条也能
+        #: **立刻**跟上当前的字幕。
+        #:
+        #: ⚠️ **麦克风（实时流）不用它** —— 实时流没有「字幕位置」⇒ 没有
+        #: 缓存键 ⇒ 它走的是「说完一句即译即播」的真同传路径。
+        self._cache = _AudioCache()
         #: 已从 ``_jobs`` 取出、但**还没播完**的 job（合成中 / 等播 / 播中）。
         #:
         #: ⚠️ **必须算进积压** —— 两段流水线之后，「已合成、等播」的那几句
@@ -459,12 +655,24 @@ class TTSQueue:
         #: **播放**由**源话的播放头**驱动（等源话点到那一句才放出来）
         #: ⇒ 两件事各归各管。
         self._clock_provider = None
+        # ⚠️ **预合成模式**（2026-11-26）—— 文件 / 视频源开 ⇒ 播放**按
+        #: 「播放头位置」挑**，而不是按 FIFO ⇒ 预合成时「后合成的先合成完」
+        #: 不会把「此刻该播的那句」饿死。
+        #:
+        #: ⚠️ **实时流（麦克风）不开** ⇒ 老的顺序语义完全不变。
+        self._prefetch_mode = False
         #: **播放时钟的偏移**（秒）—— 播放头到达 ``src_start − offset``
         #: 才放这句译文。offset > 0 ⇒ 译文比源话**晚** offset 秒。
         self._clock_offset = 0.0
         #: **时钟卡住多久就放弃等待**（秒）—— 源不再往前走时不能把译文
         #: 永久压住（否则「有翻译、一声不响」）。
-        self._clock_stall_at = 0.0
+        #:
+        #: ⚠️⚠️ **初始值必须是 ``time.time()`` 而不是 0.0**（2026-11-26）：
+        #: ``clock_stall_sec = time.time() - _clock_stall_at`` ⇒ 初值 0.0
+        #: 会让这个字段报出 **17.9 亿秒**（= 从 1970 年算起的墙钟秒）⇒
+        #: 诊断时一眼看去像「时钟停滞了半个世纪」，**严重误导排障**
+        #: （实测：差点误判成「时钟卡死」）。⇒ 哨兵值也要用「现在」。
+        self._clock_stall_at = time.time()
         self._clock_last = -1.0
         #: **媒体状态**（跟播用）—— 一个返回「媒体状态字典」的可调用对象；
         #: ``None`` = 不知道媒体状态（按老规矩走）。
@@ -570,6 +778,30 @@ class TTSQueue:
                             return None
                         self._fifo_cond.wait(min(remain, 0.05))
                         continue
+                # ⚠️⚠️ **预合成模式 ⇒ 按「播放头位置」取**（2026-11-26）——
+                #
+                # ⚠️ **为什么必须按位置取**：预合成模式下，后面的句子**可能
+                # 先合成完**（内容短）⇒ FIFO 的队头是「位置靠后但已合成」的
+                # 那一段 ⇒ 播放时钟说「还没到它的位置」⇒ 它被放回队头
+                # ⇒ **播放头此刻要的那一句被压在队尾** ⇒ **饿死**。
+                #
+                # ⇒ 这里**在 FIFO 里找「位置已到播放头」的那一段**，把它
+                #   提到队头取出来 ⇒ **播放永远取的是「此刻该播的那句」**。
+                #
+                # ⚠️ **只在「预合成模式」开**（``_prefetch_mode``）⇒ 实时流
+                #   与老的跟播路径**完全不受影响**（顺序语义不变）。
+                if self._prefetch_mode:
+                    picked = self._pick_by_position()
+                    if picked is not None:
+                        idx, job, chunk, ts = picked
+                        del self._fifo[idx]
+                        if chunk is not None:
+                            try:
+                                self._fifo_sec -= int(chunk.size) / float(
+                                    _SAMPLE_RATE)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        return job, chunk, ts
                 job, chunk, _ts = self._fifo.popleft()
                 if chunk is not None:
                     try:
@@ -577,6 +809,66 @@ class TTSQueue:
                     except Exception:  # noqa: BLE001
                         pass
                 return job, chunk, _ts
+
+    def _pick_by_position(self):
+        """**预合成模式**：在 FIFO 里找「位置已到播放头」的那一段。
+
+        ⚠️ **返回** ``(下标, job, chunk, ts)``；找不到 ⇒ ``None``（⇒ 走
+        正常的 FIFO 队头）。
+
+        ⚠️ **判据**：``src_start_sec`` **不大于**播放头（减一个容差）⇒
+        「这一刻该播它了」。
+        ⚠️ **位置未知**（``src_start_sec < 0``）⇒ **不参与**位置挑选
+        （只能按 FIFO 出）。
+        """
+        provider = self._clock_provider
+        if provider is None:
+            return None
+        try:
+            ph = provider()
+        except Exception:  # noqa: BLE001
+            ph = None
+        if ph is None:
+            return None
+        try:
+            ph = float(ph)
+        except (TypeError, ValueError):
+            return None
+        limit = ph - float(self._clock_offset or 0.0) - _PREFETCH_PICK_TOL_SEC
+        best = None
+        best_pos = None
+        for i, (job, chunk, ts) in enumerate(self._fifo):
+            try:
+                pos = float(getattr(job, "src_start_sec", -1.0) or -1.0)
+            except (TypeError, ValueError):
+                continue
+            if pos < 0.0:
+                # ⚠️ **位置未知**（实时流）⇒ 不参与挑选（只能按 FIFO 出）。
+                continue
+            if pos > limit:
+                # ⚠️ **还没到位置** ⇒ **不能 break**！
+                #
+                # ⚠️ FIFO 里**不一定按位置排**（预合成时「后面那句可能先
+                # 合成完」⇒ 它的位置更靠后却排在前面）⇒ 队头位置靠后**不代表
+                # 后面就更靠后** ⇒ 必须**继续往下扫**。
+                continue
+            # ⚠️⚠️ **同位置必须取「第一个」候选**（2026-11-26 实测踩坑）——
+            #
+            # ⚠️ **不能写 `>=`** —— FIFO 里**同一句的多个分片 + 结束标记
+            # （``chunk=None``）共享同一个 ``src_start_sec``** ⇒ 用 `>=`
+            # ⇒ **最后一个**候选胜出 ⇒ **结束标记被第一个取走** ⇒
+            #   * ``_finish_job`` 在**一个字都没播**时就结算 ⇒
+            #     ``t_play = 0``（「这句没出过声」的假象）⇒ 面板/回归
+            #     统计出来的「出声句数」**严重偏少**；
+            #   * 这一句的**音频分片还留在 FIFO 里** ⇒ 后面会**倒着播**
+            #     （chunk N → N-1 → … → 1）⇒ 听到的是**反的**译文。
+            #
+            # ⇒ 用 `>` ⇒ 同位置的**第一个**分片胜出 ⇒ FIFO 顺序保持 ⇒
+            #   **音频先播、结束标记最后** ⇒ 语义正确。
+            if best_pos is None or pos > best_pos:
+                best = (i, job, chunk, ts)
+                best_pos = pos
+        return best
 
     def _media_state(self) -> dict:
         """读一次**媒体状态**（拿不到 ⇒ 空 dict ⇒ 按老规矩走）。
@@ -762,7 +1054,9 @@ class TTSQueue:
                       src_end_ts: float = 0.0, src_start_ts: float = 0.0,
                       src_start_sec: float = -1.0, stream_id: str = "",
                       play_to: str = PLAY_BOTH,
-                      first_window_frames: int = 0) -> dict:
+                      first_window_frames: int = 0,
+                      cache_key: str = "",
+                      background: bool = False) -> dict:
         text = (text or "").strip()
         if not text:
             raise ValueError("text 不能为空")
@@ -796,11 +1090,42 @@ class TTSQueue:
             src_start_ts=float(src_start_ts or 0.0),
             src_start_sec=float(src_start_sec if src_start_sec is not None
                                 else -1.0),
+            cache_key=str(cache_key or ""),
+            background=bool(background),
             created_at=time.time(),
             est_audio_sec=_estimate_audio_sec(text),
         )
         with self._cond:
+            # ⚠️⚠️ **后台合成作业**（2026-11-26）⇒ 进**独立的队列** ⇒
+            # 不占播放深度、不合并、不进播放 FIFO。
+            if background:
+                self._bg_jobs.append(job)
+                self._cond.notify()
+                return {
+                    "seq": job.seq,
+                    "queued": len(self._bg_jobs),
+                    "depth": len(self._jobs),
+                    "background": True,
+                }
             if len(self._jobs) >= QUEUE_MAX:
+                # ⚠️⚠️ **预合成模式 ⇒ 队满「拒收」而不是「合并」**（2026-11-26）——
+                #
+                # **为什么**：合并出来的文本跟任何单一位置都不对应 ⇒
+                # ① **缓存键被丢弃** ⇒ 拖动后命中不了；
+                # ② **单段音频膨胀到几百秒**（实测 merged=941 ⇒ 排队 8.3 小时
+                #    音频 / 单段几百秒）⇒ 声音一开口就是几分钟的内容 ⇒
+                #    **彻底跟不上字幕**（用户实测）。
+                #
+                # ⇒ 拒收 ⇒ 调用方（引擎）把这一批**放回待放行** ⇒ 等播放队列
+                #   腾出位置再提交 ⇒ 内容不丢、缓存键保住、**一句一个作业**。
+                if self._no_merge:
+                    return {
+                        "seq": 0,
+                        "queued": len(self._jobs),
+                        "est_audio_sec": round(job.est_audio_sec, 2),
+                        "depth": len(self._jobs),
+                        "rejected": True,
+                    }
                 # 队满 ⇒ **合并队尾两段**（内容不丢，只是那句更长）。
                 tail = self._jobs.pop()
                 job.text = tail.text + " " + job.text
@@ -809,6 +1134,15 @@ class TTSQueue:
                 job.merged = tail.merged + 1
                 job.src_end_ts = tail.src_end_ts or job.src_end_ts
                 job.src_start_ts = tail.src_start_ts or job.src_start_ts
+                # ⚠️⚠️ **合并后**缓存键**不能沿用**（2026-11-26）——
+                #
+                # 合并出来的这段**文本已经变了**（两段拼一起）⇒ 它跟
+                # 任何单一位置的原文都**不对应** ⇒ 用它当缓存键 ⇒ 以后
+                # 命中缓存会播出**错误的内容**（两段混在一起）。
+                #
+                # ⇒ **丢弃缓存键**（不缓存）⇒ 这段老老实实现场合成。
+                # ⇒ 队满只发生在「后台预合成赶不上」时 ⇒ 少见。
+                job.cache_key = ""
                 self._c.merged += 1
             self._jobs.append(job)
             self._cond.notify()
@@ -846,18 +1180,43 @@ class TTSQueue:
     # ------------------------------------------------------------------ #
     # 控制
     # ------------------------------------------------------------------ #
-    def clear(self) -> dict:
-        """清空**没开始播**的 job（正在合成的那句跑完）。"""
+    def clear(self, include_background: bool = True) -> dict:
+        """清空**没开始播**的 job（正在合成的那句跑完）。
+
+        ⚠️ ``include_background=False`` ⇒ **后台预热作业留着**（2026-11-26）——
+        ⇒ **seek 之后**用它（见 :meth:`flush_by_position`）⇒ 缓存预热**不白做**
+        ⇒ 用户拖完进度条，后台仍在把「他要看的那一段」合成好。
+        """
         cleared = 0
         with self._cond:
             cleared += len(self._jobs)
             self._jobs.clear()
+            if include_background:
+                cleared += len(self._bg_jobs)
+                self._bg_jobs.clear()
             self._c.dropped += cleared
             self._cond.notify_all()
             # ⚠️⚠️ **正在播 / 正在合成的那句要留着**（2026-11-25，用户报
             # 「切音」）：它的 PCM 已经合成好了 ⇒ 丢掉就是**拦腰截断**。
             # ⇒ 这两句的 FIFO 音频**保留** ⇒ 放完再接下一轮的内容。
             keep = [j for j in (self._speaking, self._playing) if j is not None]
+            # ⚠️⚠️⚠️ **「正在合成但还没出声」的那句 ⇒ 作废**（2026-11-26 真机
+            # 实测）——
+            #
+            # **问题**：上一轮遗留的句子如果留着 ⇒ 它合成完之后**会新一轮
+            # 里播出来** ⇒ 用户听到**不相干的译文**（上一轮的句子串到这一轮）。
+            #
+            # ⚠️ **它还会污染回归**：端到端回归的「同步误差」是按队列的
+            # 每句 timing 算的 ⇒ 一条 src=99.99 的遗留句 ⇒ 误差 = 播放头 −
+            # 99.99 ≈ **−40 秒** ⇒ 「译文贴着字幕位置」那条断言**直接挂**
+            # （实测：套件里 ``verify_prefetch_cache`` 刚跑完就撞上）。
+            #
+            # ⇒ 只留**正在出声**的那句（切音保护）⇒ **合成中的**作废 ⇒
+            #   它剩下的分片进 FIFO 时会被播放线程丢掉（``job.cancelled``）。
+            if (self._playing is not None
+                    and self._playing is not self._speaking):
+                self._playing.cancelled = True
+                keep = [j for j in keep if j is not self._playing]
         # ⚠️ **FIFO 里还没播的音频**也清掉（上一轮的内容不该接着播）。
         fifo_cleared = self._fifo_clear(keep_jobs=keep)
         if fifo_cleared:
@@ -874,6 +1233,67 @@ class TTSQueue:
         if speaking is None:
             self._close_writer()
         return {"cleared": cleared}
+
+    # ------------------------------------------------------------------ #
+    # **预合成音频缓存**（2026-11-26）
+    # ------------------------------------------------------------------ #
+    def cache_stats(self) -> dict:
+        """缓存统计（条目数 / 字节数 / 命中 / 未命中）。"""
+        return self._cache.stats()
+
+    def cache_has(self, key: str) -> bool:
+        """缓存里**有没有**这一句。"""
+        return self._cache.has(key)
+
+    def cache_clear(self) -> dict:
+        """清空缓存（换素材 / 换语言时用）。"""
+        # ⚠️ ``stats()["entries"]`` 是**整数**（条目数）⇒ 不能 ``len()``。
+        n = int(self._cache.stats().get("entries") or 0)
+        self._cache.clear()
+        return {"cleared": n}
+
+    def set_prefetch_mode(self, on: bool) -> dict:
+        """开关**预合成模式**（2026-11-26）。
+
+        ⚠️ **开 ⇒ 播放按「播放头位置」挑**（而不是 FIFO）⇒ 配合预合成
+        缓存 ⇒ 拖动进度条也能立刻跟上当前的字幕。
+        ⚠️ **关 ⇒ 老的 FIFO 顺序**（实时流 / 老的跟播路径）。
+
+        ⚠️⚠️ **开 ⇒ 队满「拒收」而不是「合并」**（2026-11-26）——
+        预合成要求「一句一个作业」（缓存按位置索引、播放按位置放行）⇒
+        合并会把两段拼成一段 ⇒ 缓存键丢失 + 单段音频膨胀到几百秒 ⇒
+        声音彻底跟不上字幕（用户实测：merged=941 / 排队 8.3 小时音频）。
+        ⇒ 队满 ⇒ **拒收** ⇒ 调用方把这一批放回待放行 ⇒ 不合并、内容不丢。
+
+        ⚠️⚠️ **开 ⇒ 立刻把变速拉回 1.0**（2026-11-26 用户三连反馈后）：
+        从**实时流**切进来时，队列里可能还留着「按产能限速」的 **0.9**
+        （实测踩到：队列侧 0.9 / 引擎侧 1.0 ⇒ **永久不同步** ⇒ 播放
+        实际仍慢 10% ⇒ 用户报「变速怎么还是 0.90」）。
+
+        ⇒ 而引擎的推送有**死区 + 最小间隔（8 s）** ⇒ 等它推要**慢 8 秒**
+        ⇒ 用户能感知到。⇒ **这里立刻纠正** ⇒ 一开就是 1.0。
+
+        ⚠️ 引擎侧也已经改成「死区判定读队列的**真实值**」⇒ 即使这次
+        推送失败，下一轮也会**自动再推一次** ⇒ **自愈**（旧写法用引擎
+        自己的计数器 ⇒ 一次失败即永久不同步 ⇒ 无自愈）。
+        """
+        self._prefetch_mode = bool(on)
+        self._no_merge = bool(on)
+        if self._prefetch_mode:
+            with self._cond:
+                if self._tempo != 1.0:
+                    LOG.info("tts-queue: 进预合成模式 ⇒ 变速 %.2f → 1.00"
+                             "（播放头是主时钟）", self._tempo)
+                    self._tempo = 1.0
+                    for job in self._jobs:
+                        job.tempo = 1.0
+        LOG.info("tts-queue: 预合成模式 %s",
+                 "开（按播放头位置取 + 队满不合并 + 变速 1.0）" if self._prefetch_mode
+                 else "关（FIFO）")
+        return {"prefetch": self._prefetch_mode}
+
+    def prefetch_mode(self) -> bool:
+        return bool(self._prefetch_mode)
 
     def _close_writer(self) -> None:
         """关掉复用的 aplay 管道（释放 ALSA 设备）。
@@ -960,7 +1380,10 @@ class TTSQueue:
         ⇒ 用户会听到**一句**旧内容 ⇒ 但**后面**全是新位置的 ⇒ 可接受。
         """
         pos = float(pos_sec or 0.0)
-        res = self.clear()
+        # ⚠️⚠️ **后台预热作业留着**（2026-11-26）—— seek 只该清「播放队列」，
+        # 不该把「后台正在合成的缓存预热」也扔掉 ⇒ 否则用户每拖一次进度条，
+        # 背景预热就从头再来 ⇒ 拖到哪都要等重新合成 ⇒ 「跟不上字幕」。
+        res = self.clear(include_background=False)
         with self._cond:
             # ① 正在合成的那句也作废 —— 它的 PCM 进了 FIFO 之后，
             #    播放线程看到 ``job.cancelled`` 会**跳过**（不播）。
@@ -1046,9 +1469,25 @@ class TTSQueue:
         return {"reserve": round(v, 2)}
 
     def set_tempo(self, tempo: float) -> dict:
-        """改**未开始** job 的变速（积压一降就自动回落 1.0）。"""
+        """改**未开始** job 的变速（积压一降就自动回落 1.0）。
+
+        ⚠️⚠️ **预合成模式 ⇒ 变速只能是 1.0**（2026-11-26 用户三连反馈后）：
+        播放头是主时钟 ⇒ 播放速度必须 = 1.0 ⇒ 声音与字幕逐句对齐。
+
+        ⚠️ **为什么在队列侧强制**（而不是只靠引擎每秒推一次）：
+        引擎的推送有**死区 + 最小间隔**（8 秒）⇒ 从实时流切进预合成时，
+        队列里可能还留着「按产能限速」的 0.9 ⇒ **最多 8 秒**播放仍慢 10%
+        ⇒ 用户会感知到「变速怎么还是 0.9」。
+
+        ⇒ 这里**夹到 1.0** ⇒ **一进预合成就立刻是 1.0**，不必等推一次。
+
+        ⚠️ 这也保证「预合成 ⇒ 变速恒 1.0」这条不变量**物理上成立**，
+        而不依赖「引擎记得推」——外部 ``POST /queue/tempo`` 也改不动它。
+        """
         t = self._clamp_tempo(tempo)
         with self._cond:
+            if self._prefetch_mode and t != 1.0:
+                t = 1.0
             self._tempo = t
             for job in self._jobs:
                 job.tempo = t
@@ -1097,6 +1536,9 @@ class TTSQueue:
         return {
             "depth": depth,
             "inflight": inflight,
+            # ⚠️⚠️ **后台预热队列**（2026-11-26）—— 「只合成进缓存」的作业
+            # ⇒ 它**不算播放积压** ⇒ 面板不能把它算进「排队多少秒」。
+            "bg_depth": len(self._bg_jobs),
             "queued_audio_sec": round(queued_sec, 2),
             "playing": busy,
             "playing_seq": shown.seq if shown is not None else None,
@@ -1277,13 +1719,28 @@ class TTSQueue:
         """
         while True:
             with self._cond:
-                while not self._jobs and not self._stop:
+                while not self._jobs and not self._bg_jobs and not self._stop:
                     self._cond.wait(timeout=1.0)
                 if self._stop:
                     return
-                job = self._jobs.pop(0)
-                self._playing = job
-                self._inflight.append(job)
+                # ⚠️⚠️ **前台优先**（2026-11-26）—— 用户**马上要听**的那句
+                # 必须插到后台预热前面。
+                #
+                # ⚠️ **为什么**：后台通道会把「整段素材」都合成一遍（缓存预热）
+                # ⇒ 如果不插队 ⇒ 用户拖到某个位置时，那句可能排在**几百个
+                # 后台作业**后面 ⇒ 要等好几分钟才出声 ⇒ 「拖进度条跟不上字幕」。
+                if self._jobs:
+                    job = self._jobs.pop(0)
+                    self._playing = job
+                    self._inflight.append(job)
+                else:
+                    # ⚠️ **后台作业** ⇒ 不占播放的在途计数、不进播放 FIFO。
+                    # ⚠️ **也不占 ``_playing``**（2026-11-26）—— ``_playing``
+                    # 是**播放侧**的记账 ⇒ ``clear()`` 会把「正在合成但还没
+                    # 出声」的那句**作废** ⇒ 后台作业被作废 ⇒ **缓存白做**
+                    # （这一段得重新合成）。
+                    job = self._bg_jobs.pop(0)
+                    self._bg_playing = job
                 job.started_at = time.time()
             job.stream = _JobStream()
             try:
@@ -1314,10 +1771,15 @@ class TTSQueue:
                         pass
                 # ⚠️ **结束标记** —— 播放线程据此判定「这句的音频全部写进
                 # 管道了」⇒ 记账（播完时刻 / 滞后 / 分段计时）。
-                self._fifo_push(job, None)
+                # ⚠️ **后台作业没有结束标记**（它压根不在播放 FIFO 里）。
+                if not job.background:
+                    self._fifo_push(job, None)
                 self._note_rate(job)
                 with self._cond:
-                    self._playing = None
+                    if job.background:
+                        self._bg_playing = None
+                    else:
+                        self._playing = None
                     self._cond.notify_all()
 
     def _note_rate(self, job: TTSJob) -> None:
@@ -1354,6 +1816,72 @@ class TTSQueue:
                 else:
                     self._sustain_rate = 0.6 * self._sustain_rate + 0.4 * overall
 
+    # -- 写 --------------------------------------------------------------- #
+    def _cache_store(self, job: TTSJob, chunks: list) -> None:
+        """把刚合成好的 PCM **落盘**成 WAV ⇒ 进预合成缓存。
+
+        ⚠️ **为什么自己写 WAV**（而不是复用 TTS 服务的 ``save_wav``）：
+        服务的 ``save_wav`` 走的是**它自己的请求对象** ⇒ 同传队列是
+        ``play_to=queue``（会话只产 PCM、不落盘）⇒ 这里要**自己**把
+        收到的 PCM 攒起来写文件。
+        """
+        if not job.cache_key or not chunks:
+            return
+        try:
+            # ⚠️⚠️ **必须统一 ravel 成 1 维**（2026-11-26 实测）——
+            #
+            # TTS 的分片**形状不一致**：第一片（首窗）是 **1 维** `(N,)`，
+            # 后续片是 **2 维** `(1, N)` ⇒ 直接 ``np.concatenate`` 报
+            #   "all the input arrays must have same number of dimensions"
+            # ⇒ 缓存**永远存不进去**（实测 entries 恒为 0 ⇒ 拖动后命中不了）。
+            #
+            # ⇒ 每片先 ``reshape(-1)`` 摊平 ⇒ 拼出来的就是一条连续的 PCM。
+            # （播放端不受影响：``tobytes()`` 对 1 维 / 2 维 (1,N) 结果一样。）
+            pcm = np.concatenate(
+                [np.asarray(c, dtype=np.float32).reshape(-1) for c in chunks])
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("tts-queue: 缓存拼 PCM 失败: %s", exc)
+            return
+        if pcm.size <= 0:
+            return
+        path = self._cache._path_for(job.cache_key)
+        try:
+            os.makedirs(self._cache._dir(), exist_ok=True)
+            # ⚠️ **s16 落盘**（float32 的 WAV Python ``wave`` 不认 ⇒ 板载
+            # codec 也不认）⇒ 统一转成 **16 bit 有符号**。
+            clipped = np.clip(pcm, -1.0, 1.0)
+            pcm16 = (clipped * 32767.0).astype(np.int16)
+            with wave.open(path, "wb") as fh:
+                fh.setnchannels(1)
+                fh.setsampwidth(2)
+                fh.setframerate(_SAMPLE_RATE)
+                fh.writeframes(pcm16.tobytes())
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("tts-queue: 缓存写 WAV 失败: %s", exc)
+            return
+        audio_sec = pcm.size / float(_SAMPLE_RATE)
+        job.cached_audio_sec = audio_sec
+        self._cache.put(job.cache_key, path, audio_sec)
+        LOG.info("tts-queue: 预合成缓存已存 key=%s %.2fs",
+                 job.cache_key, audio_sec)
+
+    def _cache_load_pcm(self, key: str):
+        """从缓存读回 PCM（命中 ⇒ ``np.ndarray``；没命中 ⇒ ``None``）。"""
+        hit = self._cache.get(key)
+        if not hit:
+            return None
+        path = hit[0]
+        try:
+            with wave.open(path, "rb") as fh:
+                if fh.getnchannels() != 1 or fh.getsampwidth() != 2:
+                    return None
+                if fh.getframerate() != _SAMPLE_RATE:
+                    return None
+                raw = fh.readframes(fh.getnframes())
+        except Exception:  # noqa: BLE001
+            return None
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
+
     def _synthesize(self, job: TTSJob) -> None:
         """合成一句（重试 3 次）。
 
@@ -1362,6 +1890,35 @@ class TTSQueue:
 
         """
         from wdnapps_audio_chat.cards.tts.service import get_session
+
+        # ⚠️⚠️ **预合成缓存命中 ⇒ 直接播**（2026-11-26）——
+        #
+        # 用户要求：「ASR、翻译、TTS 可以**一直在后台处理**；进度条来回拉
+        # 的时候，**播放也得跟上当前的字幕**」。
+        #
+        # ⇒ 这句的音频**早就合成好了**（后台跑完了）⇒ **不该再合成一次**
+        # ⇒ 合成要 ~3 s 首窗 ⇒ 拖动进度条后要等好几秒才出声 ⇒ 播放跟不上。
+        #
+        # ⇒ **命中缓存 ⇒ 直接把 PCM 推进 FIFO** ⇒ 播放线程立刻能取到
+        # ⇒ **拖到哪就立刻播哪**。
+        if job.cache_key:
+            pcm = self._cache_load_pcm(job.cache_key)
+            if pcm is not None and pcm.size > 0:
+                job.synth_first_pcm_at = time.time()
+                job.cached_audio_sec = pcm.size / float(_SAMPLE_RATE)
+                try:
+                    job.stream.push(pcm, _SAMPLE_RATE)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning("tts-queue: 缓存音频入队失败: %s", exc)
+                    return
+                # ⚠️ **后台作业不进播放 FIFO**（2026-11-26）⇒ 它只用来
+                # 确认「这段已经有音频了」⇒ 不该被播出来。
+                if not job.background:
+                    self._fifo_push(job, pcm)
+                LOG.info("tts-queue: 命中预合成缓存 key=%s %.2fs（跳过合成%s）",
+                         job.cache_key, job.cached_audio_sec,
+                         "，后台" if job.background else "")
+                return
 
         last_err = None
         for attempt in range(3):
@@ -1377,7 +1934,16 @@ class TTSQueue:
                 push = job.stream.push
                 fifo_push = self._fifo_push
 
-                def _sink(chunk, sr, _push=push, _job=job, _fp=fifo_push):
+                # ⚠️ **预合成缓存**（2026-11-26）—— 文件 / 视频源要「后台
+                # 一直处理」⇒ 合成的同时**把 PCM 落盘**成 WAV ⇒ 播放时
+                # **按字幕位置直接取缓存播** ⇒ 拖动进度条也能立刻跟上。
+                #
+                # ⚠️ **实时流（麦克风）没有 ``cache_key``** ⇒ 这条路径
+                # 完全不启用 ⇒ 真同传的延迟不受影响。
+                wav_chunks = [] if job.cache_key else None
+
+                def _sink(chunk, sr, _push=push, _job=job, _fp=fifo_push,
+                          _wav=wav_chunks):
                     if not _job.synth_first_pcm_at:
                         _job.synth_first_pcm_at = time.time()
                     # ⚠️ **裁掉这段开头的那截静音**（实测 2026-11-23，M29）——
@@ -1389,9 +1955,24 @@ class TTSQueue:
                             chunk = trimmed
                             _job.head_trimmed = True
                     _push(chunk, sr)      # 记账（时长 / 产量标记）
-                    _fp(_job, chunk)      # 真正的音频通道
+                    if _wav is not None:
+                        try:
+                            # ⚠️ **统一摊平成 1 维**（首窗 1 维、后续 2 维 ⇒
+                            # 形状不一致 ⇒ 拼接会失败 ⇒ 缓存存不进去）。
+                            _wav.append(
+                                np.asarray(chunk, dtype=np.float32).reshape(-1))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # ⚠️⚠️ **后台作业不进播放 FIFO**（2026-11-26）⇒
+                    # 它的音频只落缓存 ⇒ **不会被播出来**（否则用户会听到
+                    # 一大段「还没轮到」的译文）。
+                    if not _job.background:
+                        _fp(_job, chunk)      # 真正的音频通道
 
                 sess.run_queued(job, sink=_sink)
+                # ⚠️ **落盘入缓存**（合成完 ⇒ 缓存里有这一份了）。
+                if wav_chunks is not None:
+                    self._cache_store(job, wav_chunks)
                 return
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
@@ -1784,6 +2365,7 @@ class TTSQueue:
         with self._cond:
             self._stop = True
             self._jobs.clear()
+            self._bg_jobs.clear()
             self._cond.notify_all()
         # ⚠️ **唤醒播放线程**（它在 FIFO 上等）—— 用一个空标记。
         self._fifo_push(None, None)
@@ -1814,14 +2396,24 @@ def submit_queued(text: str, language: str = "auto", speaker: str = "",
                   src_end_ts: float = 0.0, src_start_ts: float = 0.0,
                   src_start_sec: float = -1.0, stream_id: str = "",
                   play_to: str = PLAY_BOTH,
-                  first_window_frames: int = 0) -> dict:
-    """⚠️ ``tempo=None``（默认）⇒ **继承队列当前的变速**；给数值 = 覆盖。"""
+                  first_window_frames: int = 0,
+                  cache_key: str = "",
+                  background: bool = False) -> dict:
+    """⚠️ ``tempo=None``（默认）⇒ **继承队列当前的变速**；给数值 = 覆盖。
+
+    ⚠️ ``cache_key``（2026-11-26）—— 非空 ⇒ 这句进**预合成缓存**：
+    文件 / 视频源用它实现「后台一直处理 + 播放按字幕位置取缓存」。
+
+    ⚠️ ``background=True``（2026-11-26）—— **只合成进缓存、不排队播放**
+    ⇒ 走**独立的队列** ⇒ 不占播放深度、不合并、不进播放 FIFO。
+    """
     return get_queue().submit_queued(
         text=text, language=language, speaker=speaker, ref_speaker=ref_speaker,
         volume=volume,
         tempo=tempo, src_end_ts=src_end_ts, src_start_ts=src_start_ts,
         src_start_sec=src_start_sec, stream_id=stream_id,
-        play_to=play_to, first_window_frames=first_window_frames)
+        play_to=play_to, first_window_frames=first_window_frames,
+        cache_key=cache_key, background=background)
 
 
 def snapshot() -> dict:
@@ -1854,6 +2446,43 @@ def set_media_state(provider=None) -> dict:
 def set_reserve(seconds: float) -> dict:
     """设**延迟线留量**（FIFO 里留多少秒不播）—— 见宿主桥同名函数。"""
     return get_queue().set_reserve(seconds)
+
+
+# --------------------------------------------------------------------------- #
+# **预合成音频缓存**（2026-11-26）的模块级薄封装
+# --------------------------------------------------------------------------- #
+# ⚠️ **必须是模块级函数**，不能只有实例方法 ——
+#   * 宿主桥 ``app/core/audio/tts_bridge.py`` 用
+#     ``getattr(queue_module, "cache_stats", None)`` 找函数 ⇒ 只有实例
+#     方法的话它拿到 ``None`` ⇒ **静默降级**成「缓存永远是空的」。
+#   * 插件自己的 ``cards/tts/api.py`` 直接 ``q.cache_stats()`` ⇒ 没有模块级
+#     函数就是 **HTTP 500**（实测 2026-11-26）。
+# ⇒ 一律按本模块既有惯例（``snapshot()`` / ``clear()`` / ``set_tempo()``）
+#    提供模块级薄封装。
+
+def cache_stats() -> dict:
+    """缓存统计（条目数 / 字节数 / 命中 / 未命中）。"""
+    return get_queue().cache_stats()
+
+
+def cache_has(key: str) -> bool:
+    """缓存里**有没有**这一句（按媒体位置索引）。"""
+    return get_queue().cache_has(key)
+
+
+def cache_clear() -> dict:
+    """清空预合成缓存（换素材 / 换语言时用）。"""
+    return get_queue().cache_clear()
+
+
+def set_prefetch_mode(on: bool) -> dict:
+    """开关**预合成模式**（播放按播放头位置取，而不是 FIFO）。"""
+    return get_queue().set_prefetch_mode(bool(on))
+
+
+def prefetch_mode() -> bool:
+    """当前是不是**预合成模式**。"""
+    return get_queue().prefetch_mode()
 
 
 def shutdown() -> None:

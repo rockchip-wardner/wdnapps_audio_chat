@@ -253,6 +253,14 @@
               ======================
               ASR 卡里的一个**模式**（与「实时翻译」并列）⇒ 切句 → 翻译 → 播报。
 
+              ⚠️ **2026-11-26 起只对「麦克风」两种来源开放**
+              （板载麦克风 / 浏览器麦克风）⇒ 文件类来源（音频文件 /
+              含音轨的视频）**不再同传**，改成下面的「配音导出」。
+
+              理由：同传是「边识别边念」—— 它跟**播放头**绑死，适合麦克风
+              这种**没有文件**的实时场景；文件类来源要的是**处理好的成品**
+              （一条目标语言的音轨 / 一个烧了双字幕的视频）。
+
               * 切句档位：**稳**（实时流用 endpoint 静音 1200 ms；文件流用标点）
                 / **快**（实时流用稳定前缀；文件流用更短的强制切句）。
               * 播放时机：**不等播放** / **跟播放**（只有文件 / 视频源有播放头
@@ -261,7 +269,7 @@
               ⚠️ 板端**没有 emoji / 符号字体** ⇒ 图标一律用内联 SVG，
               文字只用普通汉字。
             -->
-            <div class="asr-block asr-tr-block asr-interp-block" id="asr-interp-block">
+            <div class="asr-block asr-tr-block asr-interp-block hidden" id="asr-interp-block">
               <div class="asr-tr-title">同声传译</div>
               <div class="asr-tr-head">
                 <label class="asr-file-label" for="asr-interp-mode">切句</label>
@@ -291,6 +299,49 @@
               </div>
               <div class="asr-tr-note" id="asr-interp-hint">
                 同传把识别结果翻译后从板载扬声器播报。一句话都不会丢（逐句结果见页面底部）。
+              </div>
+            </div>
+
+            <!--
+              配音导出（2026-11-26）
+              ======================
+              **音频文件** / **含音轨的视频** 两个来源用这一块（麦克风两种
+              来源用上面的「同声传译」）。
+
+              做什么：
+                * 音频文件     ⇒ 生成**目标语言的音频文件**
+                                   （ASR → 翻译 → TTS）；
+                * 含音轨的视频 ⇒ ① 目标语言的音频文件
+                                   ② **双字幕**（原文 + 译文）烧进画面
+                                   ③ ①② 重新封装成一个音视频文件。
+
+              文件名 = **源文件名 + 目标语言 + 音色**，存在**源文件同级目录**
+              ⇒ 生成完可以在下面**挑一个文件播放**。
+
+              ⚠️ 这一块与「实时翻译」「字幕实时显示」**并行**：翻译照旧实时
+              显示在页面底部，配音版是**另外**跑一遍导出的产物。
+            -->
+            <div class="asr-block asr-tr-block asr-dub-block hidden" id="asr-dub-block">
+              <div class="asr-tr-title">配音导出</div>
+              <div class="asr-tr-head">
+                <label class="asr-file-label" for="asr-dub-target">目标语言</label>
+                <select id="asr-dub-target" class="tts-select"></select>
+                <label class="asr-file-label" for="asr-dub-voice">音色</label>
+                <select id="asr-dub-voice" class="tts-select"></select>
+                <button type="button" class="vd-btn vd-btn-primary" id="asr-dub-start">生成配音版</button>
+                <button type="button" class="vd-btn" id="asr-dub-stop" disabled>停止</button>
+                <span class="asr-live-status" id="asr-dub-status">未开始</span>
+              </div>
+              <div class="asr-tr-head">
+                <label class="asr-file-label" for="asr-dub-files">生成的文件</label>
+                <select id="asr-dub-files" class="tts-select"></select>
+                <audio id="asr-dub-player" class="asr-preview asr-preview-audio"
+                       controls preload="metadata"></audio>
+                <video id="asr-dub-video" class="asr-preview hidden" controls
+                       preload="metadata" playsinline></video>
+              </div>
+              <div class="asr-tr-note" id="asr-dub-hint">
+                生成的文件保存在**源文件同级目录**，文件名 = 源文件名 + 目标语言 + 音色。
               </div>
             </div>
 

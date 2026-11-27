@@ -655,6 +655,51 @@
 }
 
 /* ------------------------------------------------------------------ *
+ * 配音导出（2026-11-26）
+ *
+ * 「音频文件」/「含音轨的视频」两个来源用这一块（麦克风用「同声传译」）。
+ * ------------------------------------------------------------------ */
+.asr-dub-block {
+  border-color: #bbf7d0;
+  background: #f4fdf7;
+}
+
+/* 产物播放器 —— 音频与视频**二选一**（下拉选中哪个就显示哪个）。 */
+.asr-dub-block .asr-preview {
+  max-width: 100%;
+}
+
+.asr-dub-block #asr-dub-player {
+  width: 360px;
+  max-width: 100%;
+}
+
+.asr-dub-block #asr-dub-video {
+  width: 480px;
+  max-width: 100%;
+  display: block;
+  margin-top: 6px;
+  border-radius: 6px;
+  background: #000;
+}
+
+/* 进度条 —— 导出是长任务（ASR + 翻译 + TTS + 烧字幕）⇒ 给个进度。 */
+.asr-dub-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: #e5e7eb;
+  overflow: hidden;
+  margin: 4px 0 6px;
+}
+
+.asr-dub-bar-fill {
+  height: 100%;
+  width: 0;
+  background: #22c55e;
+  transition: width 0.3s ease;
+}
+
+/* ------------------------------------------------------------------ *
  * 句子流（结果框按句排版）
  *
  * 一句一句，**原文 + 译文成对** —— 译文挂在它自己的原文下面 ⇒

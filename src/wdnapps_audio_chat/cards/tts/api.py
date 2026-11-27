@@ -767,11 +767,15 @@ async def tts_queue_submit(payload: Optional[dict] = Body(None)) -> dict:
     """把一句译文排队（同传引擎的唯一入口）。
 
     Body: ``{text, language, speaker, ref_speaker, volume, tempo,
-    src_end_ts, stream_id, play_to}`` ⇒ ``{seq, queued, est_audio_sec,
-    depth}``。
+    src_end_ts, src_start_sec, stream_id, play_to, cache_key}`` ⇒
+    ``{seq, queued, est_audio_sec, depth}``。
 
     ⚠️ **``speaker``（内置音色）和 ``ref_speaker``（参考音色）是两个不同的
     SDK 参数** —— 本板只有参考音色 ⇒ 必须走 ``ref_speaker``。
+
+    ⚠️ **``cache_key``**（2026-11-26）—— 非空 ⇒ 这句进**预合成缓存**
+    （按「媒体时间轴上的位置」索引）⇒ 文件 / 视频源可以「后台一直处理」，
+    播放时**按字幕位置直接取缓存播** ⇒ 拖动进度条也能立刻跟上。
     """
     payload = payload or {}
     text = str(payload.get("text") or "").strip()
@@ -790,6 +794,12 @@ async def tts_queue_submit(payload: Optional[dict] = Body(None)) -> dict:
             _vol = 0.5 if _vol is None else float(_vol)
         except (TypeError, ValueError):
             _vol = 0.5
+        # ⚠️ **位置**（媒体时间轴上的秒）—— 播放时钟靠它对齐。
+        _pos = payload.get("src_start_sec")
+        try:
+            _pos = -1.0 if _pos is None else float(_pos)
+        except (TypeError, ValueError):
+            _pos = -1.0
         return q.submit_queued(
             text=text,
             language=str(payload.get("language") or "auto"),
@@ -798,8 +808,10 @@ async def tts_queue_submit(payload: Optional[dict] = Body(None)) -> dict:
             volume=_vol,
             tempo=(float(_tempo) if _tempo is not None else None),
             src_end_ts=float(payload.get("src_end_ts", 0.0) or 0.0),
+            src_start_sec=_pos,
             stream_id=str(payload.get("stream_id") or ""),
             play_to=str(payload.get("play_to") or PLAY_BOTH),
+            cache_key=str(payload.get("cache_key") or ""),
         )
     except ValueError as exc:
         # 目标语不可出声 ⇒ 400（调用方据此降级为仅字幕）
@@ -812,6 +824,19 @@ async def tts_queue_status() -> dict:
     from wdnapps_audio_chat.cards.tts import queue as q
 
     return q.snapshot()
+
+
+@router.get("/queue/cache")
+async def tts_queue_cache() -> dict:
+    """**预合成音频缓存**的统计（2026-11-26）。
+
+    ⚠️ **用途**：文件 / 视频源「后台一直处理」⇒ 面板与回归脚本要看
+    「已经合成好多少段 / 拖动后命中了多少次」⇒ 这是「拖动也能立刻跟上」的
+    直接证据。
+    """
+    from wdnapps_audio_chat.cards.tts import queue as q
+
+    return q.cache_stats()
 
 
 @router.post("/queue/clear")

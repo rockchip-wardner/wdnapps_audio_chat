@@ -45,7 +45,7 @@ def register_shutdown() -> None:
     import traceback
 
     cleanup_targets = []
-    for subname in ("service", "board_mic", "translation"):
+    for subname in ("service", "board_mic", "translation", "dub"):
         try:
             cleanup_targets.append(importlib.import_module(
                 "wdnapps_audio_chat.cards.qwen3_asr." + subname))

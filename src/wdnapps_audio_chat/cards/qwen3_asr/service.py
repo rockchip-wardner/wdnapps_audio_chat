@@ -1536,6 +1536,18 @@ class _AsrManager:
         with self._lock:
             return list(self._rounds)
 
+    def file_busy(self) -> bool:
+        """**文件 / 视频路径**的识别自己还在跑吗。
+
+        ⚠️ **不能用** ``snapshot()["busy"]`` —— 那个字段会被**实时（麦克风）
+        会话**盖掉（见 :meth:`snapshot` 末尾）⇒ 配音导出那个线程拿它判断
+        「识别跑完了没」时，只要浏览器还开着麦克风就会**永远等下去**。
+
+        ⇒ 这里给一个**只认文件路径**的口径（内部状态，不受实时会话影响）。
+        """
+        with self._lock:
+            return self._state == self.STATE_RUNNING
+
     def rounds_source(self) -> Dict[str, Any]:
         """这批轮次归属的来源（见 :attr:`_rounds_source`）。"""
         with self._lock:

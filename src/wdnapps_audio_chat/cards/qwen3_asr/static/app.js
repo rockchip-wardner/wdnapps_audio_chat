@@ -586,6 +586,37 @@ const Qwen3Asr = {
     autoAt: 0,           // 自己最后一次滚动的时刻（判「用户滚的」）
   },
 
+  /* ---------------- 配音导出状态（2026-11-26） ---------------- */
+  /**
+   * 「音频文件」/「含音轨的视频」两个来源用**配音导出**（不再同传）。
+   *
+   * 产物：ASR → 翻译 → TTS ⇒ 一条目标语言的音轨；视频还会再烧一层
+   * **双字幕**（原文 + 译文）并与新音轨重新封装。
+   *
+   * ⚠️ 文件名规则在**服务端**（``dub.py::_output_path``）—— 前端只负责
+   * 把生成的文件列出来让用户挑着播。
+   */
+  _dub: {
+    targetLang: "",       // 目标语言（provider 的语言 key）
+    speaker: "",          // 内置音色（SDK 的 SPK_ID）
+    refSpeaker: "",       // 参考音色（voice-clone）—— 本板只有这类可用
+    running: false,       // 导出作业在跑吗
+    state: "",            // 后端回的状态（idle/running/done/error/stopped）
+    phase: "",            // 人话状态（「识别中」…）
+    progress: 0,          // 0..1
+    message: "",
+    error: "",
+    audioPath: "",        // 生成的目标语言音频文件
+    videoPath: "",        // 生成的双字幕视频文件（视频来源才有）
+    sourcePath: "",       // 作业的**原始**源路径（列产物用它，别用 _path）
+    files: [],            // 源文件同级目录里已生成的产物 [{name, path, kind, url}]
+    timer: null,          // 轮询定时器
+    loaded: false,        // 语言 / 音色下拉拉过了
+    langItems: null,
+    voiceItems: null,
+    wizardVoice: "",      // 向导里选的音色（"kind:id"）—— 换步会重建 body，得记住
+  },
+
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
   _tr: {
     enabled: false,      // 「实时翻译」开关
@@ -862,6 +893,15 @@ const Qwen3Asr = {
     });
     this._interpLoadOptions();
     this._interpSyncUi();
+
+    // ---- 配音导出（2026-11-26）----
+    // ⚠️ 语音生成卡的音色表在**别的卡**里 ⇒ 拉它的接口（跨卡 HTTP 是
+    //    允许的；只是不能 import 它的代码）。
+    $("asr-dub-start")?.addEventListener("click", () => this._dubStart());
+    $("asr-dub-stop")?.addEventListener("click", () => this._dubStop());
+    $("asr-dub-files")?.addEventListener("change", () => this._dubSyncPlayer());
+    this._dubLoadOptions();
+    this._dubSyncButtons();
     // ⚠️ **刷新页面后要把「同传还在跑」接回来**（2026-11-25）——
     //
     // 症状（实测）：用户在同传跑着的时候刷新了页面 ⇒ 前端的
@@ -1029,6 +1069,14 @@ const Qwen3Asr = {
     this._syncVideoPlayer();     // 视频来源才有播放器
     this._syncAudioPlayer();     // 音频文件源的播放器（2026-11-21，同传的播放头）
     this._interpSyncUi();        // 播放时机的可用性跟着来源走
+    // ⚠️ **配音导出**（2026-11-26）—— 切到文件类来源 ⇒ 把下拉（语言 /
+    // 音色）和「已生成的产物」拉出来；切走 ⇒ 停掉轮询（别在后台问）。
+    if (this._isFileSource()) {
+      this._dubLoadOptions();
+      this._dubRefreshFiles();
+    } else {
+      this._dubPollStop();
+    }
     // 显示模式要跟着来源走：视频来源下「文字显示框」是字幕同款转写框，
     // 音频文件来源下才是原来的单行「实时结果」。
     this._applyMode();
@@ -2393,6 +2441,9 @@ const Qwen3Asr = {
       }
       this._boardState = d;
       this._boardRender();
+      // ⚠️⚠️ **板载麦 ⇒ 自动开同传**（真同传，2026-11-26）——
+      // 与浏览器麦同一套逻辑（见 ``_autoStartInterpForMic``）。
+      await this._autoStartInterpForMic();
     } catch (e) {
       if (status) status.textContent = "启动失败：" + e;
     }
@@ -2489,6 +2540,29 @@ const Qwen3Asr = {
     // 页面底部 ⇒ **不再跟着那一整块一起隐藏** ⇒ 必须**单独**管显隐。
     const rtSents = $("asr-rt-sentences");
     if (rtSents) rtSents.classList.toggle("hidden", this._isFileSource());
+    // ⚠️ **「生成配音版」的按钮状态**（2026-11-26）——
+    //   源变了（选了文件 / 填了路径 / 切了页签）就得重算 ⇒ 否则按钮**一直
+    //   是禁用的**（用户实测：「选好音频文件，生成配音版不能点击」）。
+    this._dubSyncButtons();
+    // ⚠️⚠️ **两块功能按来源二选一**（2026-11-26）：
+    //   * 「板载麦克风 / 浏览器麦克风」⇒ **同声传译**（边识别边念）；
+    //   * 「音频文件 / 含音轨的视频」⇒ **配音导出**（产出成品文件）。
+    //
+    // ⇒ 两块**互斥**：文件类来源**不再**有同传（用户要求），麦克风来源
+    //    **不做**导出（没有文件可导）。
+    const interpBlock = $("asr-interp-block");
+    if (interpBlock) {
+      interpBlock.classList.toggle("hidden", this._isFileSource());
+    }
+    const dubBlock = $("asr-dub-block");
+    if (dubBlock) {
+      dubBlock.classList.toggle("hidden", !this._isFileSource());
+    }
+    // ⚠️ **切到文件类来源 ⇒ 同传必须停** —— 引擎是**服务端全局单例**，
+    // 留着它会继续念（用户已经切走了）。
+    if (this._isFileSource() && this._interp.running) {
+      this._interpStop();
+    }
     // ⚠️⚠️ **合并规则**（2026-11-25）—— 同传在跑 ⇒ 只留「同传结果」一个
     // 列表（它是「实时结果」的更完整版本）⇒ 同一批句子**不显示两遍**。
     // ⇒ 显隐的**最终口径**统一在 ``_syncResultBoxes`` 里（那里还多一条
@@ -2796,6 +2870,16 @@ const Qwen3Asr = {
    */
   _trRequestLines(force) {
     if (this._trMode !== "line") return;
+    // ⚠️⚠️ **麦克风来源不走前端驱动**（2026-11-26）——
+    //
+    // ⚠️ **为什么**：麦克风的字幕翻译是**服务端驱动**的（实时会话结束一句
+    // 就自己送去翻译）⇒ 前端这套「按行要译文」在麦克风下**没有对应的行**
+    // ⇒ 只会**空转**（每 600 ms 跑一轮，什么也做不了）。
+    //
+    // ⇒ 麦克风 ⇒ 字幕由服务端推 ⇒ 前端**不主动要**。
+    // ⇒ 语音播报走**同传**（``_autoStartInterpForMic`` 自动开）。
+    const src = this._source || "file";
+    if (src === "board" || src === "browser") return;
     if (!this._tr.enabled) return;
     // ⚠️ **翻译模型没就绪 ⇒ 别要** —— 服务端会回「翻译模型未启用」
     //    （``status=unavailable``）⇒ 白白占队列、还把「失败」计数刷上去。
@@ -3740,6 +3824,36 @@ const Qwen3Asr = {
     }
   },
 
+  /**
+   * **麦克风来源 ⇒ 自动开同传**（真同传，2026-11-26）。
+   *
+   * ⚠️ **用户要求**（2026-11-26）：「板载麦克风」「浏览器麦克风」这两种
+   * 输入**做成真实的同传逻辑**。
+   *
+   * ⇒ 麦克风下**不该**还要用户再点一次「开始同传」⇒ 识别一开始 ⇒
+   *   **同传就跟着开** ⇒ 「说一句 → 立刻翻译 → 立刻念出来」。
+   *
+   * ⚠️ **为什么不需要播放头**：麦克风没有「字幕位置」⇒ 播放时机只能是
+   * 「不等播放」（``gate=now``）⇒ 译文**合成完就播** —— 这正是真人同传
+   * 的行为（用户说完一句，译文几秒后接上）。
+   *
+   * ⚠️ **失败不打断识别** —— 同传起不来（TTS 没装 / MT 没装）⇒ 识别照样
+   *   跑 ⇒ 只是没有语音播报。
+   */
+  async _autoStartInterpForMic() {
+    // ⚠️ **只有麦克风两类**才自动开（文件 / 视频要用户点「开始同传」——
+    // 那是「按字幕播」的另一种逻辑，见 ``_interpStart``）。
+    const src = this._source || "file";
+    if (src !== "board" && src !== "browser") return;
+    // ⚠️ **已经在跑 ⇒ 不重复开**（否则会清掉已有的同传结果）。
+    if (this._interp.running) return;
+    try {
+      await this._interpStart();
+    } catch (e) {
+      console.warn("[qwen3-asr] 麦克风来源自动开同传失败:", e);
+    }
+  },
+
   async _liveStart() {
     const L = this._live;
     if (L.active || L.starting) return;
@@ -3791,6 +3905,9 @@ const Qwen3Asr = {
       await this._liveOpenMic();
       L.active = true;
       this._liveStatus("识别中 · 说句话试试");
+      // ⚠️⚠️ **麦克风 ⇒ 自动开同传**（真同传，2026-11-26）——
+      // 「说一句 → 立刻翻译 → 立刻念出来」⇒ 用户不用再点「开始同传」。
+      await this._autoStartInterpForMic();
     } catch (e) {
       // 失败原因要**留住** —— ``_liveAbort(status)`` 不会再用「已停止」盖掉它。
       this._liveStatus("无法开始：" + e);
@@ -4975,10 +5092,13 @@ const Qwen3Asr = {
    *    带 ``data-field-id``，id 由框架生成）⇒ 只能各灌各的。
    */
   async _interpWizardOptions() {
-    const langSel = document.querySelector(
-      '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-lang"]');
+    // ⚠️ **2026-11-26**：向导的「同声传译」步换成了「配音导出」步 ⇒
+    // 同传的两个字段（朗读语言 / 音色）**已经不在向导里了** ⇒ 这里
+    // 改成灌**配音导出的音色**（``asr-dub-voice``）。
     const voiceSel = document.querySelector(
-      '#wd-wizard-root-qwen3-asr [data-field-id="asr-interp-voice"]');
+      '#wd-wizard-root-qwen3-asr [data-field-id="asr-dub-voice"]');
+    const langSel = document.querySelector(
+      '#wd-wizard-root-qwen3-asr [data-field-id="asr-dub-target"]');
     if (!langSel && !voiceSel) return;
 
     if (langSel) {
@@ -4988,21 +5108,17 @@ const Qwen3Asr = {
         const data = r.ok ? await r.json() : null;
         const items = (data && data.items) || [];
         langSel.innerHTML = "";
-        // ⚠️ 第一项 = 「跟随翻译目标语言」（空值）—— 默认项。
-        const follow = document.createElement("option");
-        follow.value = "";
-        follow.textContent = "跟随翻译目标语言";
-        langSel.appendChild(follow);
         items.forEach((it) => {
           const opt = document.createElement("option");
           opt.value = it.id || "";
           opt.textContent = it.name || it.label || it.id || "";
           langSel.appendChild(opt);
         });
-        // 换步会重建 body ⇒ 选回用户上次在这张卡里选过的那个。
-        langSel.value = this._interp.wizardLang || "";
+        langSel.value = this._dub.targetLang ||
+          (items[0] ? items[0].id : "");
+        if (langSel.value) this._dub.targetLang = langSel.value;
       } catch (e) {
-        console.warn("[qwen3-asr] 向导同传语言拉取失败:", e);
+        console.warn("[qwen3-asr] 向导配音语言拉取失败:", e);
       }
     }
 
@@ -5024,14 +5140,21 @@ const Qwen3Asr = {
           opt.textContent = (kind === "ref" ? "参考音色 " : "内置音色 ") + id;
           voiceSel.appendChild(opt);
         });
-        const want = this._interp.wizardVoice || "";
+        const want = this._dub.wizardVoice || "";
         if (want) voiceSel.value = want;
         if (!voiceSel.value && voiceSel.options.length) {
           voiceSel.selectedIndex = 0;
-          this._interp.wizardVoice = voiceSel.options[0].value;
+          this._dub.wizardVoice = voiceSel.options[0].value;
+        }
+        // ⚠️ **默认用参考音色**（本板只有这类能出声）⇒ 内置音色排前面时
+        // 也不能选它。
+        const firstRef = voices.find((v) => (v.kind || "ref") === "ref");
+        if (firstRef) {
+          voiceSel.value = "ref:" + firstRef.id;
+          this._dub.wizardVoice = voiceSel.value;
         }
       } catch (e) {
-        console.warn("[qwen3-asr] 向导同传音色拉取失败:", e);
+        console.warn("[qwen3-asr] 向导配音音色拉取失败:", e);
       }
     }
   },
@@ -5152,6 +5275,15 @@ const Qwen3Asr = {
 
   /** 开始同传。 */
   async _interpStart() {
+    // ⚠️⚠️ **同传只对麦克风两种来源开放**（2026-11-26 用户要求）——
+    // 「音频文件」/「含音轨的视频」改成**配音导出**（见 ``_dubStart``）。
+    // ⇒ 这两类来源点「开始同传」直接拒绝（后端也会拒）。
+    if (this._isFileSource()) {
+      this._interpSetStatus?.("文件类来源不做同传，请用「配音导出」");
+      const el = document.getElementById("asr-interp-status");
+      if (el) el.textContent = "文件类来源不做同传，请用「配音导出」";
+      return;
+    }
     // ⚠️⚠️ **自动播放必须放在最前面（同步执行）** ——
     //
     // 浏览器的自动播放策略：**没有用户手势**时 ``el.play()`` 会被拒绝。
@@ -5541,8 +5673,22 @@ const Qwen3Asr = {
       let text = "同传把识别结果翻译后从板载扬声器播报。一句话都不会丢（逐句结果见页面底部）。";
       if (this._interp.running) {
         if (src === "board" || src === "browser") {
-          text = "实时流：说完一句即译即播。";
+          // ⚠️⚠️ **真同传**（2026-11-26）—— 麦克风是「说一句 → 立刻译 →
+          // 立刻念」⇒ 说清楚这是**实时**的，别让用户以为在等字幕。
+          text = "实时同传：说一句就译一句、译完就念（不等字幕位置）。";
         } else if (this._interp.gate === "follow") {
+          // ⚠️⚠️ **预合成**（2026-11-26）—— 文件 / 视频源「后台一直处理」⇒
+          // 用户能拖到哪就立刻播到哪 ⇒ 提示里要说清「已经合成多少」。
+          const pf = Number(st.prefetch_entries || 0);
+          const pfHits = Number(st.prefetch_hits || 0);
+          // ⚠️ **过期被跳过的句数**（2026-11-26）—— 「重新武装时头几句已经
+          // 对不上画面了」⇒ 它们不播（否则译文跟不上当前字幕）⇒ 让用户
+          // 看见这个数 ⇒ 他就知道「刚才那几句没念是有意的」。
+          const pfStale = Number(st.prefetch_stale_skipped || 0);
+          const pfTxt = pf > 0
+            ? `（后台已合成 ${pf} 段${pfHits > 0 ? `，拖动后直接命中 ${pfHits} 次` : ""}`
+              + `${pfStale > 0 ? `，${pfStale} 句已过期未念（跟不上画面就不念）` : ""}）`
+            : "";
           if (this._interp.mediaBlocked) {
             // ⚠️ **具体原因优先**（比泛泛的「译文跟着播放头走」有用得多）：
             // 浏览器拒了自动播放 / 媒体加载失败 ⇒ 媒体不动 ⇒ 播放头不动
@@ -5561,7 +5707,8 @@ const Qwen3Asr = {
               : "播放头卡住（媒体没在放 / 卡在缓冲）⇒ 译文在等播放头。"
                 + "点播放键，或把播放时机改成「不等播放」。";
           } else {
-            text = "译文跟着播放头走；若媒体没在放，译文不会出声（可切「不等播放」）。";
+            text = "语音跟着当前字幕走（后台已在预合成，拖动进度条也能立刻跟上）"
+              + pfTxt + "。";
           }
         } else {
           // ⚠️ **说清楚代价**（2026-11-25）—— 「不等播放」在有播放头的源
@@ -6408,6 +6555,337 @@ const Qwen3Asr = {
         break;
     }
   },
+
+  /* ------------------------------------------------------------------ *
+   * 配音导出（2026-11-26）
+   *
+   * 「音频文件」/「含音轨的视频」两个来源用这一块（麦克风两种来源用
+   * 「同声传译」）。流程：ASR → 翻译 → TTS ⇒ 目标语言的音轨；视频还会
+   * 再烧一层**双字幕**并与新音轨重新封装。
+   *
+   * ⚠️ 产物落在**源文件同级目录**，文件名 = 源文件名 + 目标语言 + 音色
+   *    ⇒ 生成完把目录里已有的产物列出来，用户可以**挑一个播放**。
+   * ------------------------------------------------------------------ */
+  async _dubLoadOptions() {
+    if (this._dub.loaded) return;
+    this._dub.loaded = true;
+    const $ = (id) => document.getElementById(id);
+
+    // ---- 目标语言：能出声的（TTS 会念的那些）----
+    const langSel = $("asr-dub-target");
+    if (langSel) {
+      try {
+        const r = await fetch("/api/qwen3-asr/interp/languages",
+                              { cache: "no-store" });
+        const d = await r.json();
+        const items = (d && d.items) || [];
+        this._dub.langItems = items;
+        langSel.innerHTML = "";
+        items.forEach((it) => {
+          const o = document.createElement("option");
+          o.value = it.id;
+          o.textContent = it.name || it.id;
+          langSel.appendChild(o);
+        });
+        // ⚠️ 默认跟随「实时翻译」的目标语言（没开就退回第一条）。
+        const want = this._tr.targetLang;
+        const hit = items.find((it) => it.id === want);
+        langSel.value = hit ? hit.id : (items[0] ? items[0].id : "");
+      } catch (e) {
+        langSel.innerHTML = "<option value=''>（语言列表拿不到）</option>";
+      }
+      langSel.addEventListener("change", () => {
+        this._dub.targetLang = langSel.value;
+      });
+      this._dub.targetLang = langSel.value;
+    }
+
+    // ---- 音色：跟「语音生成」卡同一份表（``/api/tts/voices``）----
+    const voiceSel = $("asr-dub-voice");
+    if (voiceSel) {
+      try {
+        const r = await fetch("/api/tts/voices", { cache: "no-store" });
+        const d = await r.json();
+        const voices = (d && d.voices) || [];
+        this._dub.voiceItems = voices;
+        voiceSel.innerHTML = "";
+        voices.forEach((v) => {
+          const o = document.createElement("option");
+          const kind = v.kind || "ref";
+          o.value = kind + ":" + v.id;
+          const tag = kind === "builtin" ? "内置" : (kind === "user" ? "自定义" : "参考");
+          o.textContent = (v.name || v.id) + "（" + tag + "）";
+          voiceSel.appendChild(o);
+        });
+        // ⚠️ 默认用「参考音色」的第一条 —— 本板**只有**参考音色能用
+        // （内置音色 SDK 会打印「not in SPK_ID, skipping」⇒ 音色不生效）。
+        const firstRef = voices.find((v) => (v.kind || "ref") === "ref");
+        voiceSel.value = firstRef ? "ref:" + firstRef.id
+                                  : (voices[0] ? "ref:" + voices[0].id : "");
+      } catch (e) {
+        voiceSel.innerHTML = "<option value=''>（音色列表拿不到）</option>";
+      }
+      voiceSel.addEventListener("change", () => {
+        this._dubSetVoice(voiceSel.value);
+      });
+      this._dubSetVoice(voiceSel.value);
+    }
+  },
+
+  /**
+   * 音色选择框的值（``kind:id``）⇒ 拆成**两个不同的 SDK 参数**。
+   *
+   * ⚠️ **混用 ⇒ 音色不生效**（SDK 打印「not in SPK_ID, skipping」⇒
+   * 每句话音色都不一样）—— 与同传面板同一坑。
+   */
+  _dubSetVoice(value) {
+    const v = String(value || "");
+    const idx = v.indexOf(":");
+    const kind = idx >= 0 ? v.slice(0, idx) : "ref";
+    const vid = idx >= 0 ? v.slice(idx + 1) : v;
+    if (kind === "builtin") {
+      this._dub.speaker = vid;
+      this._dub.refSpeaker = "";
+    } else {
+      this._dub.refSpeaker = vid;
+      this._dub.speaker = "";
+    }
+  },
+
+  /** 配音导出用的源（设备端路径优先 —— 上传的先传上去）。 */
+  _dubSourcePath() {
+    if (this._path) return this._path;
+    return "";
+  },
+
+  /**
+   * 把本机上传的文件**传到设备端**（导出必须在设备端做：产物要落在
+   * 源文件同级目录，而浏览器里的 blob 没有「同级目录」这回事）。
+   */
+  async _dubUpload(file) {
+    try {
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+      const r = await fetch("/api/qwen3-asr/upload", { method: "POST", body: fd });
+      const d = await r.json();
+      if (!r.ok || !d.path) {
+        this._dubSetStatus("上传失败：" + (d.detail || "未知错误"));
+        return "";
+      }
+      // ⚠️ 记住设备端路径 ⇒ 后面「列产物」也有路径可用。
+      this._path = d.path;
+      const el = document.getElementById("asr-source");
+      if (el) el.value = d.path;
+      return d.path;
+    } catch (e) {
+      this._dubSetStatus("上传失败：" + e);
+      return "";
+    }
+  },
+
+  async _dubStart() {
+    const $ = (id) => document.getElementById(id);
+    let path = this._dubSourcePath();
+    if (!path && this._file) {
+      // ⚠️ 本机上传的文件**先传到设备端** —— 导出要在设备端跑，产物也
+      // 要落在设备端（源文件同级目录）。
+      this._dubSetStatus("正在上传到设备端…");
+      path = await this._dubUpload(this._file);
+      if (!path) return;
+    }
+    if (!path) {
+      this._dubSetStatus("先选一个音频文件或含音轨的视频");
+      return;
+    }
+    const target = this._dub.targetLang ||
+      (this._dub.langItems && this._dub.langItems[0]
+        ? this._dub.langItems[0].id : "");
+    if (!target) {
+      this._dubSetStatus("没有可用的目标语言");
+      return;
+    }
+    this._dubSetStatus("正在提交…");
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: this._source === "video" ? "video" : "audio",
+          path: path,
+          target_lang: target,
+          speaker: this._dub.speaker,
+          ref_speaker: this._dub.refSpeaker,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        this._dubSetStatus("起不来：" + (d.detail || d.error || "未知错误"));
+        return;
+      }
+      this._dub.running = true;
+      this._dub.state = d.state || "running";
+      // ⚠️ 记下作业的**原始**源路径 ⇒ 列产物用它（见 ``_dubRefreshFiles``）
+      this._dub.sourcePath = d.source_path || path;
+      this._dubSetStatus("已提交，正在处理…");
+      this._dubPoll();
+    } catch (e) {
+      this._dubSetStatus("提交失败：" + e);
+    }
+  },
+
+  async _dubStop() {
+    try {
+      await fetch("/api/qwen3-asr/dub/stop", { method: "POST" });
+    } catch (e) { /* 忽略 */ }
+    this._dub.running = false;
+    this._dubPollStop();
+    this._dubSetStatus("已停止");
+  },
+
+  _dubPollStop() {
+    if (this._dub.timer) {
+      clearInterval(this._dub.timer);
+      this._dub.timer = null;
+    }
+  },
+
+  _dubPoll() {
+    this._dubPollStop();
+    this._dub.timer = setInterval(() => this._dubTick(), 1500);
+    this._dubTick();
+  },
+
+  async _dubTick() {
+    let d = null;
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/status", { cache: "no-store" });
+      d = await r.json();
+    } catch (e) {
+      return;
+    }
+    if (!d) return;
+    this._dub.state = d.state || "";
+    this._dub.phase = d.phase || "";
+    this._dub.progress = Number(d.progress) || 0;
+    this._dub.message = d.message || "";
+    this._dub.error = d.error || "";
+    this._dub.audioPath = d.audio_path || "";
+    this._dub.videoPath = d.video_path || "";
+    this._dub.sourcePath = d.source_path || "";
+
+    const pct = Math.round((this._dub.progress || 0) * 100);
+    if (this._dub.state === "running") {
+      this._dubSetStatus((this._dub.phase || "处理中") + "（" + pct + "%）");
+    } else if (this._dub.state === "done") {
+      this._dub.running = false;
+      this._dubPollStop();
+      this._dubSetStatus("完成");
+      await this._dubRefreshFiles();
+    } else if (this._dub.state === "error") {
+      this._dub.running = false;
+      this._dubPollStop();
+      this._dubSetStatus("失败：" + (this._dub.error || "未知错误"));
+      await this._dubRefreshFiles();
+    } else if (this._dub.state === "stopped") {
+      this._dub.running = false;
+      this._dubPollStop();
+      this._dubSetStatus("已停止");
+    }
+    this._dubSyncButtons();
+  },
+
+  _dubSyncButtons() {
+    const $ = (id) => document.getElementById(id);
+    const start = $("asr-dub-start");
+    const stop = $("asr-dub-stop");
+    // ⚠️⚠️ **「有源」= 设备端路径 **或** 本机上传的文件**（2026-11-26）。
+    //
+    // 之前只看 ``_dubSourcePath()``（设备端路径）⇒ **本机上传的文件永远
+    // 判成「没源」⇒ 按钮一直点不动**（用户实测：「选好音频文件，生成配音版
+    // 不能点击」）。
+    //
+    // ⇒ 本机上传的文件**也能导** —— ``_dubStart()`` 会先把它传到设备端
+    //    （导出必须在设备端跑，产物也落在设备端）。
+    const hasSrc = !!(this._path || this._file);
+    if (start) start.disabled = this._dub.running || !hasSrc;
+    if (stop) stop.disabled = !this._dub.running;
+  },
+
+  _dubSetStatus(text) {
+    const el = document.getElementById("asr-dub-status");
+    if (el) el.textContent = text || "";
+  },
+
+  /** 重新列一次源文件同级目录里的产物。 */
+  async _dubRefreshFiles() {
+    // ⚠️⚠️ **优先用作业自己的源路径**（``/dub/status`` 里的
+    // ``source_path``）—— ``this._path`` 会被「恢复会话」改写（ASR 会话
+    // 报的可能是**临时音轨**路径，作业结束就没了）⇒ 拿它列产物会 400
+    // （临时目录在资源根之外）。
+    const path = this._dub.sourcePath || this._dubSourcePath();
+    if (!path) return;
+    let items = [];
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/files?path=" +
+                            encodeURIComponent(path), { cache: "no-store" });
+      const d = await r.json();
+      items = (d && d.items) || [];
+    } catch (e) {
+      items = [];
+    }
+    this._dub.files = items;
+    const sel = document.getElementById("asr-dub-files");
+    if (sel) {
+      const prev = sel.value;
+      sel.innerHTML = "";
+      if (!items.length) {
+        const o = document.createElement("option");
+        o.value = "";
+        o.textContent = "（还没有生成的文件）";
+        sel.appendChild(o);
+      } else {
+        items.forEach((it) => {
+          const o = document.createElement("option");
+          o.value = it.url;
+          o.textContent = it.name + "（" +
+            (it.kind === "video" ? "视频" : "音频") + "）";
+          sel.appendChild(o);
+        });
+        // ⚠️ 保持用户当前的选择（刷新列表别把选择冲掉）。
+        if (items.some((it) => it.url === prev)) sel.value = prev;
+      }
+    }
+    this._dubSyncPlayer();
+  },
+
+  /** 下拉里选中的那个文件 ⇒ 播给用户听 / 给他看。 */
+  _dubSyncPlayer() {
+    const $ = (id) => document.getElementById(id);
+    const sel = $("asr-dub-files");
+    const audio = $("asr-dub-player");
+    const video = $("asr-dub-video");
+    if (!sel) return;
+    const url = sel.value || "";
+    const item = this._dub.files.find((it) => it.url === url);
+    const isVideo = item && item.kind === "video";
+    if (video) {
+      video.classList.toggle("hidden", !isVideo);
+      if (isVideo && video.getAttribute("src") !== url) {
+        video.setAttribute("src", url);
+        try { video.load(); } catch (e) { /* noop */ }
+      } else if (!isVideo) {
+        video.removeAttribute("src");
+      }
+    }
+    if (audio) {
+      audio.classList.toggle("hidden", !!isVideo);
+      if (!isVideo && audio.getAttribute("src") !== url) {
+        if (url) audio.setAttribute("src", url);
+        else audio.removeAttribute("src");
+        try { audio.load(); } catch (e) { /* noop */ }
+      }
+    }
+  },
 };
 
 /**
@@ -6543,18 +7021,29 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
   //    放在「有没有源」之后：源都没有就别白加载一个 2.2 GB 的模型了。
   const trTarget = String(o.trTarget || "").trim();
   const trOn = !!trTarget && trTarget !== "off";
-  // ---- 同传（2026-11-25 新增）----
-  // ⚠️ **同传需要译文** ⇒ 同传的目标语言 = 向导的「朗读语言」，
-  //    没选就跟随翻译目标语言。
-  const interpOn = !!o.interp;
-  const interpLang = interpOn ? Qwen3Asr._interpTargetLang() : "";
+  // ⚠️ **同传（2026-11-26 起只对麦克风开放）**——
+  // 向导的流程是**文件类**的（它要一个设备端路径）⇒ 文件类来源**不做**
+  // 同传 ⇒ 这里**不再**按 ``o.interp`` 起同传引擎。
+  const interpOn = false;
+  const interpLang = "";
   if (trOn) {
     await Qwen3Asr._trEnableForWizard(trTarget);
-  } else if (interpOn) {
-    // ⚠️ **字幕翻译选了「不翻译」，但同传开着** ⇒ 目标语字幕还是得显示
-    //    （需求：语音与字幕节奏一致）⇒ 照样把 MT 拉起来，并把翻译目标
-    //    语言设成同传的语言 ⇒ **一个语言概念**。
-    await Qwen3Asr._trEnableForWizard(interpLang);
+  }
+
+  // 4.4) **配音导出的音色**（2026-11-26）—— 向导选的音色回填到卡片页
+  //      的配音下拉 ⇒ 用户在向导里选一次，功能页里就是现成的。
+  const dubVoice = String(o.dubVoice || "").trim();
+  if (dubVoice) {
+    Qwen3Asr._dub.wizardVoice = dubVoice;
+    Qwen3Asr._dubSetVoice(dubVoice);
+    const sel = document.getElementById("asr-dub-voice");
+    if (sel) sel.value = dubVoice;
+  }
+  // 目标语言：跟随「翻译目标语言」（配音版就是「翻成什么语言就念什么语言」）
+  if (trOn) {
+    Qwen3Asr._dub.targetLang = trTarget;
+    const dsel = document.getElementById("asr-dub-target");
+    if (dsel) dsel.value = trTarget;
   }
 
   // 4.5) 同传的参数 —— **先设好，等识别起来之后再起引擎**。

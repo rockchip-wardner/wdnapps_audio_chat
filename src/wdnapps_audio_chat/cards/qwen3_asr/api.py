@@ -953,12 +953,21 @@ async def post_interp_start(payload: Optional[InterpStartPayload] = Body(None)) 
 
     Body: ``{mode, gate, target_lang, speaker, volume, source}``
     ⇒ ``{ok, mode, gate, source, tts, ...}``
+
+    ⚠️ **同传只对麦克风两种来源开放**（2026-11-26 用户要求）——
+    「音频文件」/「含音轨的视频」改成**配音导出**（见 ``/dub/start``）⇒
+    这两类来源的同传请求一律 **400**（前端也把那块藏了）。
     """
     import asyncio
 
     from wdnapps_audio_chat.cards.qwen3_asr.interp import get_interp_engine
 
     data = payload or InterpStartPayload()
+    source = (data.source or "live").strip()
+    if source in ("file", "video"):
+        raise HTTPException(
+            status_code=400,
+            detail="文件类来源不做同传，请用「配音导出」")
     engine = get_interp_engine()
     # ⚠️ 广播要切回**主事件循环**（同传引擎是工作线程 ⇒ ``asyncio.Queue``
     # 不是线程安全的）⇒ 把当前循环记给引擎。
@@ -1071,6 +1080,108 @@ async def post_interp_playhead(payload: Optional[InterpPlayheadPayload] = Body(N
         bool(data.playing), bool(data.ended), bool(data.failed),
         str(data.client_id or ""),
     )
+
+
+# --------------------------------------------------------------------------- #
+# 配音导出（2026-11-26）
+# --------------------------------------------------------------------------- #
+#
+# 「音频文件」/「含音轨的视频」两个来源**不再做同声传译** ⇒ 改成导出：
+#
+# * 音频文件     → 目标语言的音频文件（ASR → 翻译 → TTS）；
+# * 含音轨的视频  → ① 目标语言的音频文件 ② 双字幕视频 ③ 重新封装。
+#
+# 文件名 = **源文件名 + 目标语言 + 音色**，存在**源文件同级目录**。
+
+class DubStartPayload(BaseModel):
+    model_config = {"extra": "ignore"}
+    #: 来源类型："audio"（音频文件）/ "video"（含音轨的视频）
+    kind: str = "audio"
+    #: 设备端源文件路径（**绝对路径**，须在允许的根目录内）
+    path: str = ""
+    #: 目标语言（provider 的语言 key，如 "zh-CN"）
+    target_lang: str = ""
+    #: **内置音色**（SDK 的 SPK_ID）。
+    speaker: Optional[str] = None
+    #: **参考音色**（voice-clone）—— 本板只有这类音色 ⇒ 面板选中参考
+    #: 音色时走这里。
+    #:
+    #: ⚠️ **和 ``speaker`` 是两个不同的 SDK 参数**，混用 ⇒ 音色不生效。
+    ref_speaker: Optional[str] = None
+
+
+@router.post("/dub/start")
+async def post_dub_start(payload: Optional[DubStartPayload] = Body(None)) -> dict:
+    """起一次配音导出。
+
+    Body: ``{kind, path, target_lang, speaker, ref_speaker}``
+
+    ⇒ ``{ok, job_id, state, phase, ...}``
+
+    ⚠️ **慢操作**（ASR + 翻译 + TTS + 烧字幕）⇒ **立即返回**，进度用
+    ``GET /dub/status`` 轮询。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    data = payload or DubStartPayload()
+    raw = (data.path or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="缺少源文件路径")
+    # ⚠️ **路径要过闸** —— 与 ``/media`` 同一个口径（根目录白名单 +
+    # 扩展名白名单）⇒ 不能让这个端点变成「任意路径写文件」的入口。
+    try:
+        src = _resolve_media_path(raw)
+    except HTTPException:
+        raise
+    kind = "video" if _source_kind(src.name) == "video" else "audio"
+    if (data.kind or "").strip() in ("video", "audio"):
+        kind = data.kind.strip()
+    target = (data.target_lang or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="缺少目标语言")
+
+    engine = get_dub_engine()
+    try:
+        out = engine.start(
+            kind=kind,
+            source_path=str(src),
+            target_lang=target,
+            speaker=(data.speaker or ""),
+            ref_speaker=(data.ref_speaker or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, **out}
+
+
+@router.get("/dub/status")
+async def get_dub_status() -> dict:
+    """配音导出的进度 / 状态 / 产出的文件。"""
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    return get_dub_engine().status()
+
+
+@router.post("/dub/stop")
+async def post_dub_stop() -> dict:
+    """停掉正在跑的配音导出。"""
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    return {"ok": True, **get_dub_engine().stop()}
+
+
+@router.get("/dub/files")
+async def get_dub_files(path: str = Query(..., description="设备端源文件绝对路径")) -> dict:
+    """列出源文件同级目录里**已经生成**的配音文件（页面下拉用）。"""
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    try:
+        src = _resolve_media_path(path)
+    except HTTPException:
+        raise
+    return {"items": get_dub_engine().list_outputs(str(src))}
 
 
 @router.websocket("/ws")

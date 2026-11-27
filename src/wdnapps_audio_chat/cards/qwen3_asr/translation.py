@@ -139,6 +139,29 @@ class TranslationService:
         #:
         #: ⇒ 每句话记下入队时的代数；处理前对不上就**丢掉**。
         self._gen = 0
+        #: **结果观察者**（2026-11-26，配音导出用）。
+        #:
+        #: ⚠️ **只是多一个观察者** —— 广播（WS）的行为一个字都不改。
+        #: 配音导出（``dub.py``）要「原文 + 译文 + 时间」三项齐全的数据
+        #: ⇒ 句级翻译的载荷正好三项都有（``source`` / ``text`` /
+        #: ``start_sec`` / ``end_sec``）⇒ 直接旁听它最省事。
+        self._result_listener: Optional[Any] = None
+
+    # ------------------------------------------------------------------ #
+    # 结果观察者（配音导出）
+    # ------------------------------------------------------------------ #
+    def set_result_listener(self, fn: Optional[Any]) -> None:
+        """注册一个「每条译文落地」的回调（``fn(payload: dict)``）。
+
+        ⚠️ **回调在翻译工作线程上被调用** ⇒ 回调里**不要**碰 asyncio
+        队列（不是线程安全的）。
+        """
+        with self._lock:
+            self._result_listener = fn
+
+    def clear_result_listener(self) -> None:
+        with self._lock:
+            self._result_listener = None
 
     # ------------------------------------------------------------------ #
     # 设置 / 状态
@@ -377,6 +400,26 @@ class TranslationService:
                 self._failed += 1
 
         self._broadcast(item, status, text, reason, latency_ms)
+        # ⚠️ **结果观察者**（配音导出）—— **在广播之后**调：观察者挂了
+        # 也不该影响页面的实时译文。
+        with self._lock:
+            listener = self._result_listener
+        if listener is not None:
+            try:
+                listener({
+                    "type": "translation",
+                    "stream_id": item.stream_id,
+                    "index": item.index,
+                    "source": item.text,
+                    "text": text,
+                    "status": status,
+                    "reason": reason,
+                    "latency_ms": latency_ms,
+                    "start_sec": item.start_sec,
+                    "end_sec": item.end_sec,
+                })
+            except Exception as exc:  # noqa: BLE001 — 观察者不许拖垮翻译
+                LOG.warning("translation: 结果观察者抛异常: %s", exc)
 
     # ------------------------------------------------------------------ #
     # 广播
