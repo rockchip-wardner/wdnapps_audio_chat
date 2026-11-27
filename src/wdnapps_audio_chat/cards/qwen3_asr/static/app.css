@@ -702,25 +702,6 @@
   background: #f4fdf7;
 }
 
-/* 块内的**完成信息**（2026-11-27 用户要求）——
-   「实时翻译」的「识别完成（…）」与「配音导出」的「配音完成（…）」是
-   **同一类信息** ⇒ 同一个视觉口径（``.asr-hint`` 那套）⇒ 两块一个读法。
-   ⚠️ **平时是空的 ⇒ 不占位**（``:empty``）—— 否则一个空 div 就在那一行
-   底下留一道白边。 */
-.asr-tr-info,
-.asr-dub-info {
-  font-size: 0.85rem;
-  color: var(--muted, #6b7280);
-  line-height: 1.5;
-  margin: 0 0 8px;
-  padding-left: 6px;
-}
-
-.asr-tr-info:empty,
-.asr-dub-info:empty {
-  display: none;
-}
-
 /* 产物播放器 —— 音频与视频**二选一**（下拉选中哪个就显示哪个）。 */
 .asr-dub-block .asr-preview {
   max-width: 100%;
@@ -767,6 +748,16 @@
      —— 句子是**逐块**排的，pre-wrap 会把模板里的换行变成空行 ⇒ normal。 */
   white-space: normal;
   line-height: 1.6;
+  /* ⚠️⚠️ **别无限加行**（2026-11-27 用户要求）—— 一段长音频几百上千句 ⇒
+     框越撑越高 ⇒ 页面被顶得很长，下面的东西（完整 JSON）都被推走 ⇒
+     **固定上限 + 框内滚动条**（与「识别过程」的 ``.asr-rounds`` 同一口径）。
+
+     ⚠️ **只框住「一句一句」的那个列表**（``.asr-sentences``）——
+     「实时结果」框顶上那行语言提示留在框外不动（用户一眼能看见源/显示
+     语言）；视频来源下的字幕转写框**自带滚动**（``.asr-transcript-body``）
+     ⇒ 不受影响。 */
+  max-height: min(26rem, 45vh);
+  overflow-y: auto;
 }
 
 .asr-sent {

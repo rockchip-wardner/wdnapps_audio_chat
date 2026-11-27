@@ -267,16 +267,19 @@ def main() -> int:
               set(opts["dub"]) <= set(opts["tr"]),
               f"导出={opts['dub']!r} 显示={opts['tr']!r}")
 
-        section("B5. 识别的三个按钮必须与「配音导出」**同一档位置**")
+        section("B5. 识别的按钮必须与「配音导出」**同一档位置**")
         # ⚠️ **为什么要有这条**（2026-11-27 用户要求）——
-        #   「清空 / 停止 / 开始识别」原来挂在**页面最底下**（结果框正上方），
+        #   「停止 / 开始识别」原来挂在**页面最底下**（结果框正上方），
         #   而「配音导出」的「生成配音版 / 停止」是**控件行里并排**的
         #   ⇒ 同一张卡上两套按钮位置完全不一样 ⇒ 用户要求把前者也搬上去，
         #   跟「显示语言」「实时翻译」开关并排。
-        # ⇒ 现在三个按钮在「实时翻译」那一行里 ⇒ 断言钉住，防回退。
+        # ⇒ 现在这两个按钮在「实时翻译」那一行里 ⇒ 断言钉住，防回退。
+        #
+        # ⚠️ **2026-11-27 用户要求：「清空」全部去除** ⇒ 这里只剩**两个**
+        #    按钮（「清空」挪到「实时结果」旁边了 ⇒ 见 G 段）。
         btns = page.evaluate(
             """() => {
-                const ids = ['asr-reset-btn', 'asr-stop-btn', 'asr-start-btn'];
+                const ids = ['asr-stop-btn', 'asr-start-btn'];
                 const tr = document.getElementById('asr-tr-block');
                 const ctrl = document.querySelector('.asr-controls');
                 const row = tr ? tr.querySelector('.asr-tr-head') : null;
@@ -315,14 +318,14 @@ def main() -> int:
                     })(),
                 };
             }""")
-        check("三个按钮都在「实时翻译」块里", len(btns["inTr"]) == 3,
+        check("两个按钮都在「实时翻译」块里", len(btns["inTr"]) == 2,
               f"实际 = {btns['inTr']!r}")
-        check("三个按钮**不在**页面底部的控制行里", not btns["inCtrl"],
+        check("这两个按钮**不在**页面底部的控制行里", not btns["inCtrl"],
               f"实际 = {btns['inCtrl']!r}")
-        check("三个按钮与「显示语言」**并排在同一行**", btns["sameRow"]
+        check("这两个按钮与「显示语言」**并排在同一行**", btns["sameRow"]
               and abs(btns["btnMid"] - btns["selMid"]) <= 12,
               f"按钮中心 y={btns['btnMid']} 下拉中心 y={btns['selMid']}")
-        check("三个按钮**成组**（窄屏时整组换行，不拆散）", btns["oneGroup"])
+        check("这两个按钮**成组**（窄屏时整组换行，不拆散）", btns["oneGroup"])
         check("「配音导出」的「生成配音版」也在它自己的控件行里",
               btns["dubInRow"], "防回退")
         check("底部的「显示模式」下拉还在结果区那边", btns["ctrlHasMode"])
@@ -361,8 +364,8 @@ def main() -> int:
                     const e = document.getElementById(id);
                     return e ? (e.textContent || '').trim() : '';
                 };
-                const trIds = ['asr-start-btn', 'asr-stop-btn', 'asr-reset-btn'];
-                const dubIds = ['asr-dub-start', 'asr-dub-stop', 'asr-dub-reset'];
+                const trIds = ['asr-start-btn', 'asr-stop-btn'];
+                const dubIds = ['asr-dub-start', 'asr-dub-stop'];
                 const grp = document.querySelector('#asr-dub-block .asr-btn-group');
                 return {
                     trText: trIds.map(txt),
@@ -379,15 +382,18 @@ def main() -> int:
                     })(),
                 };
             }""")
-        check("「实时翻译」三个按钮的顺序 = 开始识别 → 停止 → 清空",
-              order["trText"] == ["开始识别", "停止", "清空"]
+        # ⚠️ **顺序里没有「清空」了**（2026-11-27 用户要求）—— 两个「清空」
+        #    按钮**都去掉**，统一挪到「实时结果」旁边（见 G2 段）⇒ 这里只
+        #    剩「开始识别 → 停止」/「生成配音版 → 停止」。
+        check("「实时翻译」两个按钮的顺序 = 开始识别 → 停止",
+              order["trText"] == ["开始识别", "停止"]
               and order["trX"] == sorted(order["trX"]),
               f"实际 = {order['trText']!r} x={order['trX']!r}")
-        check("「配音导出」三个按钮的顺序 = 生成配音版 → 停止 → 清空",
-              order["dubText"] == ["生成配音版", "停止", "清空"]
+        check("「配音导出」两个按钮的顺序 = 生成配音版 → 停止",
+              order["dubText"] == ["生成配音版", "停止"]
               and order["dubX"] == sorted(order["dubX"]),
               f"实际 = {order['dubText']!r} x={order['dubX']!r}")
-        check("「配音导出」的三个按钮成组（窄屏整组换行，不拆散）",
+        check("「配音导出」的两个按钮成组（窄屏整组换行，不拆散）",
               order["dubGrouped"])
         check("配音导出块是显示的（否则 x 坐标没意义）", order["dubVisible"])
 
@@ -553,29 +559,34 @@ def main() -> int:
         #   跑完也该有一条**同样口径**的完成信息（耗时 · 音频时长 · 句数 ·
         #   源语言 → 导出语言）⇒ 否则用户只看到一个「完成」。
         #
-        # ⚠️ **位置 = 按钮组下方新起一整行**（用户选定）⇒ 断言它**在按钮组
-        #   下面**、**在配音导出块里**、**可见**。
+        # ⚠️⚠️ **位置 = 「显示模式」的上一行**（2026-11-27 用户要求：两个块
+        #   里**都不显示**这些信息，**统一**显示在那一行 ⇒ **哪个后做就覆盖
+        #   前面的**）⇒ 那就是**全局提示行**（``#asr-hint``）⇒ 断言：
+        #   * 提示行里是「配音完成（…）」
+        #   * **配音导出块里没有**完成信息了
         info = page.evaluate(
             """() => {
-                const el = document.getElementById('asr-dub-info');
-                const grp = document.querySelector('#asr-dub-block .asr-btn-group');
-                const blk = document.getElementById('asr-dub-block');
                 const hint = document.getElementById('asr-hint');
+                const blk = document.getElementById('asr-dub-block');
+                const mode = document.getElementById('asr-mode');
+                const ctrl = document.getElementById('asr-controls');
+                const el = document.getElementById('asr-dub-info');
                 const r = (e) => (e ? e.getBoundingClientRect() : null);
-                const box = r(el), gbox = r(grp);
-                const cs = el ? getComputedStyle(el) : null;
+                const hbox = r(hint), mbox = r(mode);
+                const cs = hint ? getComputedStyle(hint) : null;
                 return {
-                    exists: !!el,
-                    text: el ? (el.textContent || '').trim() : '',
-                    visible: !!el && !!cs && cs.display !== 'none'
-                             && !!box && box.height > 0,
-                    inBlock: !!(blk && el && blk.contains(el)),
-                    belowGroup: !!(box && gbox && box.top >= gbox.bottom - 1),
-                    hintText: hint ? (hint.textContent || '').trim() : '',
+                    text: hint ? (hint.textContent || '').trim() : '',
+                    visible: !!hint && !!cs && cs.display !== 'none'
+                             && !!hbox && hbox.height > 0,
+                    // ⚠️ **提示行在「显示模式」的上一行**（几何位置）
+                    aboveMode: !!(hbox && mbox && hbox.bottom <= mbox.top + 1),
+                    inBlock: !!(blk && hint && blk.contains(hint)),
+                    // ⚠️ **配音导出块里不再有完成信息那一行**
+                    blockHasInfo: !!el,
+                    blkText: blk ? (blk.textContent || '').trim() : '',
                 };
             }""")
-        check("有完成信息那一行（#asr-dub-info）", info["exists"])
-        check("跑完后那一行**有内容**", bool(info["text"]),
+        check("跑完后提示行**有内容**", bool(info["text"]),
               f"实际 = {info['text']!r}")
         check("内容是「配音完成（…）」", info["text"].startswith("配音完成（"),
               f"实际 = {info['text']!r}")
@@ -586,14 +597,15 @@ def main() -> int:
         check("内容里标了**源语言 → 导出语言**",
               "源语言" in info["text"] and "导出语言" in info["text"],
               f"实际 = {info['text']!r}")
-        check("那一行在「配音导出」块里", info["inBlock"])
-        check("那一行在**按钮组下方**（用户选定的位置）", info["belowGroup"])
+        check("那一行**在「显示模式」的上一行**", info["aboveMode"])
         check("那一行**可见**", info["visible"])
-        # ⚠️ **别写进全局提示行**（#asr-hint）—— 那是**识别**那条「识别完成
-        #    （…）」的家 ⇒ 配音写进去会把识别的信息覆盖掉。
-        check("**没有**写进全局提示行（#asr-hint）",
-              "配音完成" not in info["hintText"],
-              f"实际 = {info['hintText']!r}")
+        # ⚠️ **两个块里都不显示**这些信息（用户要求）⇒ 配音导出块里既没有
+        #    专门的完成信息行，也**不含**「配音完成」这几个字。
+        check("「配音导出」块里**没有**完成信息那一行了",
+              not info["blockHasInfo"])
+        check("「配音导出」块里**不含**「配音完成」这几个字",
+              "配音完成" not in info["blkText"],
+              f"实际 = {info['blkText'][:120]!r}")
         print("    完成信息:", info["text"])
 
         # ⚠️ **刷新页面后完成信息也要在** —— 作业还在服务端 ⇒ 状态拉得到
@@ -604,20 +616,11 @@ def main() -> int:
         if skip.count():
             skip.click()
             page.wait_for_timeout(1500)
-        # ⚠️ **刷新后来源会回到默认** ⇒ 配音导出块是藏着的 ⇒ 先切回
-        #    「音频文件」再看那一行。
-        page.click(".asr-source-tab[data-source='file']")
-        page.wait_for_timeout(1200)
         re_info = page.evaluate(
-            """() => {
-                const el = document.getElementById('asr-dub-info');
-                const blk = document.getElementById('asr-dub-block');
-                const hid = (el) => !!el && el.classList.contains('hidden');
-                return {
-                    text: el ? (el.textContent || '').trim() : '',
-                    blockVisible: !hid(blk),
-                };
-            }""")
+            """() => ({
+                text: (document.getElementById('asr-hint')
+                       ?.textContent || '').trim(),
+            })""")
         check("刷新页面后完成信息**还在**（服务端作业还在）",
               re_info["text"].startswith("配音完成（"),
               f"实际 = {re_info['text']!r}")
@@ -628,20 +631,43 @@ def main() -> int:
         #   挂着 ⇒ 下一轮作业的句子会跟它混在一起 ⇒ 用户要一个「清空」。
         # ⇒ 语义：**清掉逐句结果**，**不删生成的文件**（产物还在源目录里，
         #   用户还要拿去播）。
+        #
+        # ⚠️⚠️ **2026-11-27 用户要求**：两个「清空」（「实时翻译」行的 +
+        #   「配音导出」行的）**全部去除**，**统一挪到「实时结果」旁边**
+        #   （``#asr-reset-btn``）⇒ **一个按钮清所有结果**（含这里的逐句
+        #   导出结果）⇒ 这里点的是**那个统一按钮**。
         rst = page.evaluate(
             """() => {
-                const b = document.getElementById('asr-dub-reset');
-                return {exists: !!b, disabled: b ? b.disabled : null};
+                const b = document.getElementById('asr-reset-btn');
+                const blk = document.getElementById('asr-dub-block');
+                const tr = document.getElementById('asr-tr-block');
+                const all = Array.from(document.querySelectorAll(
+                    '#page-qwen3-asr button')).filter((x) =>
+                        (x.textContent || '').trim() === '清空');
+                return {
+                    exists: !!b,
+                    disabled: b ? b.disabled : null,
+                    // ⚠️ **两个块里都不该再有「清空」按钮**
+                    dubHasClear: !!(blk && blk.querySelector(
+                        'button[id="asr-dub-reset"]')),
+                    trHasClear: !!(tr && tr.querySelector(
+                        'button[id="asr-reset-btn"]')),
+                    clearCount: all.length,
+                };
             }""")
-        check("「配音导出」块里有「清空」按钮", rst["exists"])
+        check("有统一的「清空」按钮（#asr-reset-btn）", rst["exists"])
         check("有结果时「清空」是可点的", rst["disabled"] is False,
               f"disabled={rst['disabled']}")
+        check("「配音导出」块里**没有**「清空」按钮了", not rst["dubHasClear"])
+        check("「实时翻译」块里**没有**「清空」按钮了", not rst["trHasClear"])
+        check("整张卡上**只有一个**「清空」按钮", rst["clearCount"] == 1,
+              f"个数 = {rst['clearCount']}")
 
         try:
-            page.click("#asr-dub-reset")
+            page.click("#asr-reset-btn")
         except Exception as exc:  # noqa: BLE001
             check("点得到「清空」按钮", False, str(exc)[:120])
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(2500)
         check("发出了 POST /api/qwen3-asr/dub/reset", len(resets) > 0)
 
         cleared = page.evaluate(
@@ -650,7 +676,7 @@ def main() -> int:
                 const rows = document.querySelectorAll('#asr-dub-list .asr-sent');
                 const live = document.getElementById('asr-live');
                 const sents = document.getElementById('asr-sentences');
-                const b = document.getElementById('asr-dub-reset');
+                const b = document.getElementById('asr-reset-btn');
                 const hid = (el) => !!el && el.classList.contains('hidden');
                 return {
                     panelHidden: hid(wrap),
@@ -658,7 +684,7 @@ def main() -> int:
                     liveHidden: hid(live),
                     sentsHidden: hid(sents),
                     resetDisabled: b ? b.disabled : null,
-                    infoText: (document.getElementById('asr-dub-info')
+                    hintText: (document.getElementById('asr-hint')
                                ?.textContent || '').trim(),
                 };
             }""")
@@ -669,10 +695,11 @@ def main() -> int:
         check("「清空」按钮又变灰了（没东西可清）",
               cleared["resetDisabled"] is True,
               f"disabled={cleared['resetDisabled']}")
-        # ⚠️ **完成信息也清掉** —— 那一行讲的是「上次导出了什么」⇒ 结果都
-        #    清了 ⇒ 那一行不该留着（「已清空」由状态位说，不重复）。
-        check("清空后完成信息也清掉了",
-              cleared["infoText"] == "", f"实际 = {cleared['infoText']!r}")
+        # ⚠️ **提示行写「已清空」** —— 完成信息现在**统一**写在那一行 ⇒
+        #    清空后它该被「已清空」接管（不该还留着「配音完成（…）」）。
+        check("清空后提示行 = 「已清空」",
+              cleared["hintText"] == "已清空",
+              f"实际 = {cleared['hintText']!r}")
 
         # ⚠️ **服务端也要清** —— 页面进时会拉一次**最新那个作业**
         #    ⇒ 只清前端 DOM 的话，用户**一刷新页面**，上次的逐句结果又回来了。
@@ -700,14 +727,15 @@ def main() -> int:
                 return {
                     panelHidden: hid(wrap),
                     n: rows.length,
-                    infoText: (document.getElementById('asr-dub-info')
+                    hintText: (document.getElementById('asr-hint')
                                ?.textContent || '').trim(),
                 };
             }""")
         check("刷新页面后导出结果没有复活（服务端清生效）",
               again["panelHidden"] and again["n"] == 0, f"实际 = {again!r}")
         check("刷新页面后完成信息也没有复活",
-              again["infoText"] == "", f"实际 = {again['infoText']!r}")
+              "配音完成" not in again["hintText"],
+              f"实际 = {again['hintText']!r}")
 
         section("H. 「实时翻译」与「配音导出」**互斥**（2026-11-27 用户要求）")
         # ⚠️ **为什么要有这一段** —— 两个**都可能用到 ASR + 翻译** ⇒ 同时跑会把

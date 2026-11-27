@@ -926,7 +926,6 @@ const Qwen3Asr = {
     //    允许的；只是不能 import 它的代码）。
     $("asr-dub-start")?.addEventListener("click", () => this._dubStart());
     $("asr-dub-stop")?.addEventListener("click", () => this._dubStop());
-    $("asr-dub-reset")?.addEventListener("click", () => this._dubReset());
     $("asr-dub-files")?.addEventListener("change", () => this._dubSyncPlayer());
     this._dubLoadOptions();
     this._dubSyncButtons();
@@ -3617,39 +3616,16 @@ const Qwen3Asr = {
   },
 
   /**
-   * 写「清空」按钮**右边**那个状态位（``#asr-tr-clear-status``）。
-   *
-   * ⚠️ **位置和风格跟「配音导出」那一行一致**（2026-11-27 用户要求）——
-   *    它的 ``#asr-dub-status`` 就在按钮组右边、样式 ``.asr-live-status``
-   *    ⇒ 同一张卡上两处**一模一样** ⇒ 用户一眼能找到「刚才清过」。
-   */
-  _trSetClearStatus(text) {
-    const el = document.getElementById("asr-tr-clear-status");
-    if (el) el.textContent = text || "";
-  },
-
-  /**
-   * 写「实时翻译」块里的**完成信息**那一行（``#asr-tr-info``）。
-   *
-   * ⚠️ **它原来在页面最底下的全局提示行**（2026-11-27 用户要求搬过来）——
-   *    「开始识别 / 停止 / 清空」按钮在这一块里 ⇒ 完成信息就该挨着按钮 ⇒
-   *    不该掉到卡片底部（「显示模式」上面那一行）。
-   *
-   * ⚠️ **别塞进 ``#asr-tr-status``**（翻译模型的状态）或
-   *    ``#asr-tr-clear-status``（「已清空」）⇒ 一个元素一个意思。
-   */
-  _trSetInfo(text) {
-    const el = document.getElementById("asr-tr-info");
-    if (el) el.textContent = text || "";
-  },
-
-  /**
    * 页面上**还有结果**吗 ⇒ 「清空」该不该可点。
    *
-   * ⚠️ **「没东西可清就灰着」**（2026-11-27 用户要求）—— 与「配音导出」的
-   *    「清空」同一个口径 ⇒ 用户点完清空，按钮**变灰**（不是还能再点）。
+   * ⚠️ **「没东西可清就灰着」**（2026-11-27 用户要求）—— 用户点完清空，
+   *    按钮**变灰**（不是还能再点）。
    *
    * ⚠️ **正在跑的时候不许灰** —— 那时「清空」= 停止 + 清空 ⇒ 有用。
+   *
+   * ⚠️⚠️ **现在「清空」是**一个**按钮，清**所有**结果**（2026-11-27 用户
+   *    要求：两个「清空」都去掉，统一挪到「实时结果」旁边）⇒ 判据要算上
+   *    **配音导出**那边（它有逐句结果 + 服务端还留着作业）。
    */
   _hasResults() {
     if (this._busy() || this._starting) return true;
@@ -3657,6 +3633,8 @@ const Qwen3Asr = {
     if (this._tr && this._tr.items && this._tr.items.length) return true;
     if (this._interp && this._interp.segs && this._interp.segs.size) return true;
     if (this.snapshot && this.snapshot.last_result) return true;
+    // ⚠️ **配音导出那边也算**（逐句结果，或服务端还有作业）。
+    if (this._dub && (this._dub.hasRows || this._dub.hasJob)) return true;
     return false;
   },
 
@@ -3664,15 +3642,22 @@ const Qwen3Asr = {
   _syncResetBtn() {
     const btn = document.getElementById("asr-reset-btn");
     if (!btn) return;
+    // ⚠️ **配音导出在跑 ⇒ 不许点**（2026-11-27）—— 服务端会拒（`ok:false`
+    //    「配音导出还在跑，先点「停止」」）⇒ 点下去会变成「识别那边清了、
+    //    配音那边没清」的**半截状态** ⇒ 让用户先点「停止」。
+    if (this._dub && this._dub.running) {
+      btn.disabled = true;
+      return;
+    }
     btn.disabled = !this._hasResults();
   },
 
   _trStatusText() {
     // ⚠️ **这里只管「翻译模型」的状态**（翻译未启用 / 就绪 · 已开启 · 已译
-    //    N 句）⇒ **不塞「已清空」**（2026-11-27 用户要求）——「已清空」在
-    //    **「清空」按钮右边**那个专属状态位里（``#asr-tr-clear-status``，
-    //    与「配音导出」的 ``#asr-dub-status`` 同位置同风格）⇒ 塞这里会把
-    //    模型状态顶掉（用户就看不到模型在不在了）。
+    //    N 句）⇒ **不塞「已清空」也不塞「识别完成（…）」**（2026-11-27 用户
+    //    要求）——「已清空」与完成信息都写在**「显示模式」上一行**那条
+    //    **全卡共用**的提示行里 ⇒ 塞这里会把模型状态顶掉（用户就看不到
+    //    模型在不在了）。
     const bits = [this._tr.modelStatus || "翻译未启用"];
     if (this._tr.enabled) {
       bits.push("实时翻译已开启");
@@ -4011,6 +3996,24 @@ const Qwen3Asr = {
     const t = text || "";
     hint.textContent = t;
     hint.classList.toggle("hidden", !t);
+    // ⚠️ **默认这条不是「结果」** —— 「结果」消息（识别完成 / 配音完成 /
+    //    已清空 / 失败）用 ``_setOutcome`` 写 ⇒ 标记一下 ⇒ 「没选源」那句
+    //    空态提示**不去盖它**（否则刷新页面时那个提示会把「配音完成（…）」
+    //    冲掉 ⇒ 用户看不到上次导出了什么）。
+    this._hintOutcome = false;
+  },
+
+  /**
+   * 写一条**「结果」消息**（识别完成 / 配音完成 / 已清空 / 失败）。
+   *
+   * ⚠️ **与 ``_setHint`` 的区别** —— 这一行是**全卡共用**的（2026-11-27
+   *    用户要求：「识别完成（…）」与「配音完成（…）」**都显示在「显示模式」
+   *    的上一行** ⇒ **哪个后做就覆盖前面的**）⇒ 后面来的空态提示不该把它
+   *    冲掉 ⇒ 打个标记（``_hintOutcome``）。
+   */
+  _setOutcome(text) {
+    this._setHint(text);
+    this._hintOutcome = true;
   },
 
   /**
@@ -4032,7 +4035,13 @@ const Qwen3Asr = {
   _updateHint() {
     const st = (this.snapshot && this.snapshot.state) || "";
     if (!this._hasSource()) {
-      this._setHint("选择一个音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。");
+      // ⚠️⚠️ **别盖掉「结果」消息**（2026-11-27）—— 提示行是**全卡共用**的
+      //    ⇒ 「配音完成（…）」也写在这儿 ⇒ 一进页面（还没选源）这句空态
+      //    提示就把它冲掉 ⇒ 用户看不到上次导出了什么 ⇒ **有结果消息就
+      //    跳过这句**。
+      if (!this._hintOutcome) {
+        this._setHint("选择一个音频来源后点「开始识别」。模型按 1 秒一块增量解码，输出实时刷新。");
+      }
     } else if (this._busy()) {
       this._setHint("识别中…… 已确认的文本会实时出现，蓝色是尚未确认的部分。");
     } else if (st === "stopped" && !this._seekBusy) {
@@ -4789,12 +4798,11 @@ const Qwen3Asr = {
     // ⚠️ **改完要立刻重画状态行** —— 否则那一行还挂着上一轮的状态
     //    （要等下一帧译文才刷新 ⇒ 中间那几秒是错的）。
     this._trSyncUi();
-    // ⚠️ **新一轮识别 ⇒ 「已清空」状态位清掉**（结果马上会长出来 ⇒ 不该
-    //    还挂着「已清空」）+ 刷「清空」按钮（识别中 ⇒ 它可点）。
-    this._trSetClearStatus("");
-    // ⚠️ **上一轮的完成信息也清掉** —— 它讲的是**上一次**识别（耗时/时长/
-    //    语种）⇒ 新一轮还没跑完 ⇒ 留着就是旧数据。
-    this._trSetInfo("");
+    // ⚠️ **新一轮识别 ⇒ 上一轮的完成信息让位**（2026-11-27）—— 完成信息
+    //    现在统一写在**「显示模式」上一行**那条提示行里 ⇒ 新一轮还没跑完
+    //    ⇒ 那一行不该还挂着上一轮的「识别完成（…）」⇒ 提示行由
+    //    「识别中……」接管（快照到了会自动写）。
+    this._setHint("识别中……");
     this._syncResetBtn();
     // ⚠️⚠️ **识别一开始 ⇒「生成配音版」立刻就灰**（2026-11-27 用户要求：
     //    两者互斥）—— 别等服务端确认（WS 那一帧要 ~0.3 s）⇒ 这中间用户
@@ -5009,13 +5017,13 @@ const Qwen3Asr = {
     this._trSyncUi();
     // ⚠️ **提示行也写「已清空」**（2026-11-27 用户要求）—— 免得上面那行
     //    「识别完成（…）」还挂着，像是有结果。
-    this._setHint("已清空");
-    // ⚠️ **「已清空」写在「清空」按钮右边**（同「配音导出」那行的位置和
-    //    风格）⇒ 用户一眼能找到「刚才清过」。
-    this._trSetClearStatus("已清空");
-    // ⚠️ **完成信息清掉** —— 它讲的是「上一次识别用了多久、识别出几个
-    //    字」⇒ 结果都清了 ⇒ 那一行不该留着（「已清空」由状态位说）。
-    this._trSetInfo("");
+    this._setOutcome("已清空");
+    // ⚠️⚠️ **配音导出的结果也一起清**（2026-11-27 用户要求：「清空」= 清
+    //    **所有**结果 —— 包括「实时翻译」和「配音导出」的结果）⇒
+    //    * 本地：逐句导出结果面板（``_dubClearResult``）
+    //    * 服务端：那个作业（``POST /dub/reset``）—— 不清的话刷新页面
+    //      又会复活（页面进时会拉一次**最新那个作业**）。
+    await this._dubClearAll();
     // ⚠️ **清空 ⇒ 「清空」按钮变灰**（没东西可清了 ⇒ 跟「配音导出」一个
     //    口径）⇒ 用户不会以为还能再点一次。
     this._syncResetBtn();
@@ -6787,14 +6795,12 @@ const Qwen3Asr = {
         // 音频时长 + 耗时都报出来 —— 用户能看出「多长的音频被识别了」
         // （不再有 60 秒截断，所以这个数字可能远大于 60）。
         const audio = msg.audio_sec ? ` · 音频 ${msg.audio_sec.toFixed(1)} s` : "";
-        // ⚠️⚠️ **完成信息写进「实时翻译」块自己那一行**（2026-11-27 用户要求）
-        //    ⇒ 「开始识别 / 停止 / 清空」按钮就在那一块 ⇒ 完成信息挨着按钮，
-        //    不该掉到卡片最底下（「显示模式」上面那一行）。
-        this._trSetInfo(`识别完成（${(msg.elapsed_sec || 0).toFixed(2)} s${audio}）`
+        // ⚠️⚠️ **完成信息统一写在「显示模式」上一行**（2026-11-27 用户要求）
+        //    ⇒ 那是**整张卡唯一**的「刚刚发生了什么」那一行 ⇒ 「识别完成」与
+        //    「配音完成」都写在这儿 ⇒ **哪个后做就覆盖前面的**。
+        //    （两个块里**不再**各写一份。）
+        this._setOutcome(`识别完成（${(msg.elapsed_sec || 0).toFixed(2)} s${audio}）`
           + `· 语种 ${msg.language || "未知"}`);
-        // ⚠️ **全局提示行只留一句短的** —— 它是「识别中…」「已停止」「出错」
-        //    那种**临时提示** ⇒ 跑完了还挂着「识别中……」才是过时信息。
-        this._setHint("识别完成");
         break;
       }
       case "stopped": {
@@ -7036,9 +7042,10 @@ const Qwen3Asr = {
 
   async _dubStart() {
     const $ = (id) => document.getElementById(id);
-    // ⚠️ **新的一轮 ⇒ 上一轮那条完成信息先清掉**（它讲的是上一次导出的
-    //    结果 ⇒ 留着会跟正在跑的这次对不上）。
-    this._dubSetInfo("");
+    // ⚠️ **新一轮导出 ⇒ 提示行让位**（2026-11-27）—— 完成信息现在**统一**
+    //    写在「显示模式」上一行 ⇒ 上一轮的「识别完成（…）」不该留着 ⇒
+    //    这一行先写「正在生成配音版…」（跑完了再被「配音完成（…）」覆盖）。
+    this._setHint("正在生成配音版…");
     let path = this._dubSourcePath();
     if (!path && this._file) {
       // ⚠️ 本机上传的文件**先传到设备端** —— 导出要在设备端跑，产物也
@@ -7102,7 +7109,12 @@ const Qwen3Asr = {
   },
 
   /**
-   * 「配音导出」的**清空**（2026-11-27 用户要求）。
+   * 清掉配音导出的结果（本地 + 服务端）。
+   *
+   * ⚠️⚠️ **现在没有独立的「清空」按钮了**（2026-11-27 用户要求）——
+   *    原来「实时翻译」「配音导出」各有一个 ⇒ 两个按钮各清一半 ⇒ 用户得
+   *    先想「我要清的是哪个」⇒ **统一成一个**，挪到「实时结果」旁边 ⇒
+   *    **一个按钮清所有结果** ⇒ 这段由 ``reset()`` 调用。
    *
    * ⚠️ **清的是「逐句结果」**（原文 + 译文）—— **不删生成的文件**
    *    （产物在源文件同级目录里，用户还要拿去播 / 拿去用）。
@@ -7111,10 +7123,10 @@ const Qwen3Asr = {
    *    **最新那个作业**（``_dubRefreshStatus``）⇒ 只清前端 DOM 的话，
    *    用户**一刷新页面**，上次的逐句结果又回来了。
    *
-   * ⚠️ **导出还在跑 ⇒ 不清**（按钮已禁用，服务端也再挡一道）—— 半路清
-   *    会留下一个「半截」的作业状态（句子清了、作业还在跑）。
+   * ⚠️ **导出还在跑 ⇒ 不清**（服务端会拒）—— 半路清会留下一个「半截」的
+   *    作业状态（句子清了、作业还在跑）。
    */
-  async _dubReset() {
+  async _dubClearAll() {
     // ⚠️ **先作废在途的那一帧** ⇒ 清空之后旧句子不会长回来。
     this._dub.gen = (this._dub.gen || 0) + 1;
     this._dubPollStop();
@@ -7137,9 +7149,6 @@ const Qwen3Asr = {
     this._dub.hasJob = false;
     this._dubClearResult();
     this._dubSetStatus("已清空");
-    // ⚠️ **完成信息也清掉** —— 那一行讲的是「上次导出了什么」⇒ 结果都
-    //    清了 ⇒ 那一行也不该留着（「已清空」由状态位说，不重复）。
-    this._dubSetInfo("");
     this._dubSyncButtons();
   },
 
@@ -7178,9 +7187,10 @@ const Qwen3Asr = {
       this._dubPollStop();
       this._dubClearResult();
       this._dubSetStatus("未开始");
-      // ⚠️ **服务端连作业都没了 ⇒ 完成信息也清掉**（否则留着上一条，
-      //    页面却什么结果都没有 ⇒ 自相矛盾）。
-      this._dubSetInfo("");
+      // ⚠️⚠️ **别动提示行**（2026-11-27）—— 提示行是**全卡共用**的
+      //    （「识别完成（…）」也写在那儿）⇒ 这里清一下 ⇒ 可能把用户刚跑完
+      //    的识别信息抹掉 ⇒ **不动**。配音自己那块的状态位写「未开始」
+      //    就够了（用户看得见「配音导出这边没东西了」）。
       this._dubSyncButtons();
       return;
     }
@@ -7207,23 +7217,25 @@ const Qwen3Asr = {
       this._dub.running = false;
       this._dubPollStop();
       this._dubSetStatus("完成");
-      // ⚠️ **完成信息**（2026-11-27 用户要求）—— 与识别那条「识别完成
-      //    （…）」同一口径：耗时 · 音频时长 · 句数 · 源语言 → 导出语言。
-      this._dubSetInfo(this._dubInfoText(d));
+      // ⚠️⚠️ **完成信息写在「显示模式」上一行**（2026-11-27 用户要求）——
+      //    那是**整张卡唯一**的「刚刚发生了什么」那一行 ⇒ 与「识别完成（…）」
+      //    **共用** ⇒ **哪个后做就覆盖前面的**。
+      this._setOutcome(this._dubInfoText(d));
       await this._dubRefreshFiles();
     } else if (this._dub.state === "error") {
       this._dub.running = false;
       this._dubPollStop();
       this._dubSetStatus("失败：" + (this._dub.error || "未知错误"));
-      // ⚠️ **失败/停止 ⇒ 完成信息清空**（那一行只讲「做成了什么」⇒ 失败
-      //    时留着上一条成功记录就是骗人）。
-      this._dubSetInfo("");
+      // ⚠️ **失败 ⇒ 提示行让位**（那一行只讲「做成了什么」⇒ 失败时留着
+      //    上一条成功记录就是骗人）⇒ 但**别清空**（清空了用户就不知道出
+      //    了什么事）⇒ 写失败原因。
+      this._setOutcome("配音失败：" + (this._dub.error || "未知错误"));
       await this._dubRefreshFiles();
     } else if (this._dub.state === "stopped") {
       this._dub.running = false;
       this._dubPollStop();
       this._dubSetStatus("已停止");
-      this._dubSetInfo("");
+      this._setOutcome("配音已停止");
     }
     this._dubSyncButtons();
   },
@@ -7232,7 +7244,18 @@ const Qwen3Asr = {
     const $ = (id) => document.getElementById(id);
     const start = $("asr-dub-start");
     const stop = $("asr-dub-stop");
-    const reset = $("asr-dub-reset");
+    // ⚠️⚠️ **这里没有「清空」按钮了**（2026-11-27 用户要求）—— 原来
+    //    「实时翻译」「配音导出」**各有一个**「清空」⇒ 两个按钮各清一半 ⇒
+    //    用户得先想「我要清的是哪个」⇒ **统一成一个**，挪到「实时结果」
+    //    旁边（``#asr-reset-btn``）⇒ **一个按钮清所有结果**。
+    //
+    // ⚠️ **但这里仍要刷它** —— 配音那边**有结果时**，那个统一按钮必须
+    //    可点 ⇒ 判据在 ``_hasResults()``（含配音的逐句结果 / 作业）。
+    // ⚠️⚠️ **导出还在跑 ⇒ 统一按钮不许点** —— 半路清掉会留下一个
+    //    「半截」的作业状态（句子清了、作业还在跑）⇒ 服务端也再挡一道。
+    // ⚠️⚠️ **识别在跑 ⇒ 也不许点**（正在跑时「清空」= 停止 + 清空 ⇒ 有用）
+    //    —— 但那条判据在 ``_hasResults()`` 里（``_busy()`` ⇒ 有东西可清）。
+    const hasSrc = !!(this._path || this._file);
     // ⚠️⚠️ **「有源」= 设备端路径 **或** 本机上传的文件**（2026-11-26）。
     //
     // 之前只看 ``_dubSourcePath()``（设备端路径）⇒ **本机上传的文件永远
@@ -7241,7 +7264,6 @@ const Qwen3Asr = {
     //
     // ⇒ 本机上传的文件**也能导** —— ``_dubStart()`` 会先把它传到设备端
     //    （导出必须在设备端跑，产物也落在设备端）。
-    const hasSrc = !!(this._path || this._file);
     // ⚠️⚠️ **识别在跑 ⇒ 「生成配音版」灰着**（2026-11-27 用户要求）——
     //    「实时翻译」和「配音导出」**互斥**：两个都占 **ASR 单例 + 翻译
     //    模型** ⇒ 同时跑会把同一个增量解码器搅坏。
@@ -7255,23 +7277,12 @@ const Qwen3Asr = {
     const asrBusy = this._asrFileBusy() || this._starting;
     if (start) start.disabled = this._dub.running || !hasSrc || asrBusy;
     if (stop) stop.disabled = !this._dub.running;
-    // ⚠️ **「清空」只在**真有东西可清**时才点得动**（2026-11-27 用户要求）——
-    //    没有结果可清的时候，按钮灰着（跟「停止」没作业时灰着一个道理）。
-    //
-    // ⚠️ **判据是「面板有内容」**或**「服务端还有作业」** —— 后者补上一个
-    //    缺口：新识别开始时面板被**本地**收起来了（合并规则），但服务端
-    //    那份作业还在 ⇒ 「清空」仍要能点（点了才能把服务端那份也清掉）。
-    //
-    // ⚠️ **导出还在跑 ⇒ 也不许点** —— 半路清掉会留下一个「半截」的作业
-    //    状态（句子清了、作业还在跑）⇒ 服务端也再挡一道。
-    if (reset) {
-      reset.disabled = this._dub.running ||
-        !(this._dub.hasRows || this._dub.hasJob);
-    }
     // ⚠️⚠️ **反过来也要刷**（2026-11-27 用户要求：两者互斥）——
     //    导出状态一变（「生成配音版」点了 / 跑完了 / 停了），「开始识别」
     //    的可用态也要跟着变 ⇒ 出口只有 ``_syncStartBtn`` 一个。
     this._syncStartBtn();
+    // ⚠️ **统一「清空」按钮的可用态** —— 配音这边有结果时它要能点。
+    this._syncResetBtn();
   },
 
   /**
@@ -7302,40 +7313,22 @@ const Qwen3Asr = {
     } else if (d.state === "done") {
       this._dubSetStatus("完成");
       // ⚠️ **刷新页面后完成信息也要在**（作业还在服务端 ⇒ 状态拉得到 ⇒
-      //    这一行拉得到）⇒ 用户刷新一下还能看到上次导出了什么。
-      this._dubSetInfo(this._dubInfoText(d));
+      //    提示行拉得到）⇒ 用户刷新一下还能看到上次导出了什么。
+      this._setOutcome(this._dubInfoText(d));
       await this._dubRefreshFiles();
     } else if (d.state === "error") {
       this._dubSetStatus("失败：" + (d.error || "未知错误"));
-      this._dubSetInfo("");
+      this._setOutcome("配音失败：" + (d.error || "未知错误"));
       await this._dubRefreshFiles();
     } else if (d.state === "stopped") {
       this._dubSetStatus("已停止");
-      this._dubSetInfo("");
+      this._setOutcome("配音已停止");
     }
     this._dubSyncButtons();
   },
 
   _dubSetStatus(text) {
     const el = document.getElementById("asr-dub-status");
-    if (el) el.textContent = text || "";
-  },
-
-  /**
-   * 写「配音导出」的**完成信息**那一行（``#asr-dub-info``）。
-   *
-   * ⚠️ **位置 = 按钮组下方那一整行**（2026-11-27 用户选定）—— 参照「实时
-   *    翻译」那条「识别完成（2.65 s · 音频 15.1 s）· 语种 English」。
-   *
-   * ⚠️ **别写进全局提示行**（``#asr-hint``）—— 那是**识别**那条的家 ⇒
-   *    配音写进去会把识别的信息**覆盖掉**（同一张卡上两个意思 ⇒ 各给各的
-   *    位置）。
-   *
-   * ⚠️ **按钮组右边那个状态位不写它**（``#asr-dub-status``）—— 那是
-   *    ``nowrap`` 的**短状态**（「完成」/「已清空」）⇒ 长文字放不下。
-   */
-  _dubSetInfo(text) {
-    const el = document.getElementById("asr-dub-info");
     if (el) el.textContent = text || "";
   },
 
