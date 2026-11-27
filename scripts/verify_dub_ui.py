@@ -547,6 +547,81 @@ def main() -> int:
         check("语言提示里标了「源语言」",
               "源语言" in merge["capText"], f"实际 = {merge['capText']!r}")
 
+        section("F4. 配音导出的**完成信息**（2026-11-27 用户要求）")
+        # ⚠️ **为什么要有这一段**（用户要求）—— 参照「实时翻译」那行
+        #   「识别完成（2.65 s · 音频 15.1 s）· 语种 English」⇒ 配音导出
+        #   跑完也该有一条**同样口径**的完成信息（耗时 · 音频时长 · 句数 ·
+        #   源语言 → 导出语言）⇒ 否则用户只看到一个「完成」。
+        #
+        # ⚠️ **位置 = 按钮组下方新起一整行**（用户选定）⇒ 断言它**在按钮组
+        #   下面**、**在配音导出块里**、**可见**。
+        info = page.evaluate(
+            """() => {
+                const el = document.getElementById('asr-dub-info');
+                const grp = document.querySelector('#asr-dub-block .asr-btn-group');
+                const blk = document.getElementById('asr-dub-block');
+                const hint = document.getElementById('asr-hint');
+                const r = (e) => (e ? e.getBoundingClientRect() : null);
+                const box = r(el), gbox = r(grp);
+                const cs = el ? getComputedStyle(el) : null;
+                return {
+                    exists: !!el,
+                    text: el ? (el.textContent || '').trim() : '',
+                    visible: !!el && !!cs && cs.display !== 'none'
+                             && !!box && box.height > 0,
+                    inBlock: !!(blk && el && blk.contains(el)),
+                    belowGroup: !!(box && gbox && box.top >= gbox.bottom - 1),
+                    hintText: hint ? (hint.textContent || '').trim() : '',
+                };
+            }""")
+        check("有完成信息那一行（#asr-dub-info）", info["exists"])
+        check("跑完后那一行**有内容**", bool(info["text"]),
+              f"实际 = {info['text']!r}")
+        check("内容是「配音完成（…）」", info["text"].startswith("配音完成（"),
+              f"实际 = {info['text']!r}")
+        check("内容里带**耗时**", " s" in info["text"], f"实际 = {info['text']!r}")
+        check("内容里带**音频时长**", "音频" in info["text"],
+              f"实际 = {info['text']!r}")
+        check("内容里带**句数**", "句" in info["text"], f"实际 = {info['text']!r}")
+        check("内容里标了**源语言 → 导出语言**",
+              "源语言" in info["text"] and "导出语言" in info["text"],
+              f"实际 = {info['text']!r}")
+        check("那一行在「配音导出」块里", info["inBlock"])
+        check("那一行在**按钮组下方**（用户选定的位置）", info["belowGroup"])
+        check("那一行**可见**", info["visible"])
+        # ⚠️ **别写进全局提示行**（#asr-hint）—— 那是**识别**那条「识别完成
+        #    （…）」的家 ⇒ 配音写进去会把识别的信息覆盖掉。
+        check("**没有**写进全局提示行（#asr-hint）",
+              "配音完成" not in info["hintText"],
+              f"实际 = {info['hintText']!r}")
+        print("    完成信息:", info["text"])
+
+        # ⚠️ **刷新页面后完成信息也要在** —— 作业还在服务端 ⇒ 状态拉得到
+        #    ⇒ 这一行拉得到 ⇒ 用户刷新一下还能看到上次导出了什么。
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(2500)
+        skip = page.locator("text=跳过向导").first
+        if skip.count():
+            skip.click()
+            page.wait_for_timeout(1500)
+        # ⚠️ **刷新后来源会回到默认** ⇒ 配音导出块是藏着的 ⇒ 先切回
+        #    「音频文件」再看那一行。
+        page.click(".asr-source-tab[data-source='file']")
+        page.wait_for_timeout(1200)
+        re_info = page.evaluate(
+            """() => {
+                const el = document.getElementById('asr-dub-info');
+                const blk = document.getElementById('asr-dub-block');
+                const hid = (el) => !!el && el.classList.contains('hidden');
+                return {
+                    text: el ? (el.textContent || '').trim() : '',
+                    blockVisible: !hid(blk),
+                };
+            }""")
+        check("刷新页面后完成信息**还在**（服务端作业还在）",
+              re_info["text"].startswith("配音完成（"),
+              f"实际 = {re_info['text']!r}")
+
         section("G. 「配音导出」的「清空」按钮")
         # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
         #   「配音导出」原来只有「生成配音版 / 停止」⇒ 跑完之后那面板一直
@@ -583,6 +658,8 @@ def main() -> int:
                     liveHidden: hid(live),
                     sentsHidden: hid(sents),
                     resetDisabled: b ? b.disabled : null,
+                    infoText: (document.getElementById('asr-dub-info')
+                               ?.textContent || '').trim(),
                 };
             }""")
         check("结果面板被藏了（清空了）", cleared["panelHidden"])
@@ -592,6 +669,10 @@ def main() -> int:
         check("「清空」按钮又变灰了（没东西可清）",
               cleared["resetDisabled"] is True,
               f"disabled={cleared['resetDisabled']}")
+        # ⚠️ **完成信息也清掉** —— 那一行讲的是「上次导出了什么」⇒ 结果都
+        #    清了 ⇒ 那一行不该留着（「已清空」由状态位说，不重复）。
+        check("清空后完成信息也清掉了",
+              cleared["infoText"] == "", f"实际 = {cleared['infoText']!r}")
 
         # ⚠️ **服务端也要清** —— 页面进时会拉一次**最新那个作业**
         #    ⇒ 只清前端 DOM 的话，用户**一刷新页面**，上次的逐句结果又回来了。
@@ -616,10 +697,17 @@ def main() -> int:
                 const wrap = document.getElementById('asr-dub-out');
                 const rows = document.querySelectorAll('#asr-dub-list .asr-sent');
                 const hid = (el) => !!el && el.classList.contains('hidden');
-                return {panelHidden: hid(wrap), n: rows.length};
+                return {
+                    panelHidden: hid(wrap),
+                    n: rows.length,
+                    infoText: (document.getElementById('asr-dub-info')
+                               ?.textContent || '').trim(),
+                };
             }""")
         check("刷新页面后导出结果没有复活（服务端清生效）",
               again["panelHidden"] and again["n"] == 0, f"实际 = {again!r}")
+        check("刷新页面后完成信息也没有复活",
+              again["infoText"] == "", f"实际 = {again['infoText']!r}")
 
         section("H. 「实时翻译」与「配音导出」**互斥**（2026-11-27 用户要求）")
         # ⚠️ **为什么要有这一段** —— 两个**都可能用到 ASR + 翻译** ⇒ 同时跑会把

@@ -702,6 +702,23 @@
   background: #f4fdf7;
 }
 
+/* 配音导出的**完成信息**（2026-11-27 用户要求）——
+   与「实时翻译」那条「识别完成（…）」**同一个视觉口径**（``.asr-hint``）
+   ⇒ 两处一眼看过去是同一类信息。
+   ⚠️ **平时是空的 ⇒ 不占位**（``:empty``）—— 否则一个空 div 就在按钮组
+   底下留一道白边。 */
+.asr-dub-info {
+  font-size: 0.85rem;
+  color: var(--muted, #6b7280);
+  line-height: 1.5;
+  margin: 0 0 8px;
+  padding-left: 6px;
+}
+
+.asr-dub-info:empty {
+  display: none;
+}
+
 /* 产物播放器 —— 音频与视频**二选一**（下拉选中哪个就显示哪个）。 */
 .asr-dub-block .asr-preview {
   max-width: 100%;

@@ -7009,6 +7009,9 @@ const Qwen3Asr = {
 
   async _dubStart() {
     const $ = (id) => document.getElementById(id);
+    // ⚠️ **新的一轮 ⇒ 上一轮那条完成信息先清掉**（它讲的是上一次导出的
+    //    结果 ⇒ 留着会跟正在跑的这次对不上）。
+    this._dubSetInfo("");
     let path = this._dubSourcePath();
     if (!path && this._file) {
       // ⚠️ 本机上传的文件**先传到设备端** —— 导出要在设备端跑，产物也
@@ -7107,6 +7110,9 @@ const Qwen3Asr = {
     this._dub.hasJob = false;
     this._dubClearResult();
     this._dubSetStatus("已清空");
+    // ⚠️ **完成信息也清掉** —— 那一行讲的是「上次导出了什么」⇒ 结果都
+    //    清了 ⇒ 那一行也不该留着（「已清空」由状态位说，不重复）。
+    this._dubSetInfo("");
     this._dubSyncButtons();
   },
 
@@ -7145,6 +7151,9 @@ const Qwen3Asr = {
       this._dubPollStop();
       this._dubClearResult();
       this._dubSetStatus("未开始");
+      // ⚠️ **服务端连作业都没了 ⇒ 完成信息也清掉**（否则留着上一条，
+      //    页面却什么结果都没有 ⇒ 自相矛盾）。
+      this._dubSetInfo("");
       this._dubSyncButtons();
       return;
     }
@@ -7171,16 +7180,23 @@ const Qwen3Asr = {
       this._dub.running = false;
       this._dubPollStop();
       this._dubSetStatus("完成");
+      // ⚠️ **完成信息**（2026-11-27 用户要求）—— 与识别那条「识别完成
+      //    （…）」同一口径：耗时 · 音频时长 · 句数 · 源语言 → 导出语言。
+      this._dubSetInfo(this._dubInfoText(d));
       await this._dubRefreshFiles();
     } else if (this._dub.state === "error") {
       this._dub.running = false;
       this._dubPollStop();
       this._dubSetStatus("失败：" + (this._dub.error || "未知错误"));
+      // ⚠️ **失败/停止 ⇒ 完成信息清空**（那一行只讲「做成了什么」⇒ 失败
+      //    时留着上一条成功记录就是骗人）。
+      this._dubSetInfo("");
       await this._dubRefreshFiles();
     } else if (this._dub.state === "stopped") {
       this._dub.running = false;
       this._dubPollStop();
       this._dubSetStatus("已停止");
+      this._dubSetInfo("");
     }
     this._dubSyncButtons();
   },
@@ -7258,10 +7274,17 @@ const Qwen3Asr = {
       this._dubPoll();
     } else if (d.state === "done") {
       this._dubSetStatus("完成");
+      // ⚠️ **刷新页面后完成信息也要在**（作业还在服务端 ⇒ 状态拉得到 ⇒
+      //    这一行拉得到）⇒ 用户刷新一下还能看到上次导出了什么。
+      this._dubSetInfo(this._dubInfoText(d));
       await this._dubRefreshFiles();
     } else if (d.state === "error") {
       this._dubSetStatus("失败：" + (d.error || "未知错误"));
+      this._dubSetInfo("");
       await this._dubRefreshFiles();
+    } else if (d.state === "stopped") {
+      this._dubSetStatus("已停止");
+      this._dubSetInfo("");
     }
     this._dubSyncButtons();
   },
@@ -7269,6 +7292,51 @@ const Qwen3Asr = {
   _dubSetStatus(text) {
     const el = document.getElementById("asr-dub-status");
     if (el) el.textContent = text || "";
+  },
+
+  /**
+   * 写「配音导出」的**完成信息**那一行（``#asr-dub-info``）。
+   *
+   * ⚠️ **位置 = 按钮组下方那一整行**（2026-11-27 用户选定）—— 参照「实时
+   *    翻译」那条「识别完成（2.65 s · 音频 15.1 s）· 语种 English」。
+   *
+   * ⚠️ **别写进全局提示行**（``#asr-hint``）—— 那是**识别**那条的家 ⇒
+   *    配音写进去会把识别的信息**覆盖掉**（同一张卡上两个意思 ⇒ 各给各的
+   *    位置）。
+   *
+   * ⚠️ **按钮组右边那个状态位不写它**（``#asr-dub-status``）—— 那是
+   *    ``nowrap`` 的**短状态**（「完成」/「已清空」）⇒ 长文字放不下。
+   */
+  _dubSetInfo(text) {
+    const el = document.getElementById("asr-dub-info");
+    if (el) el.textContent = text || "";
+  },
+
+  /**
+   * 拼配音导出的完成信息 —— 与识别那条「识别完成（…）」**同一口径**：
+   * **耗时 · 源时长 · 句数 · 源语言 → 导出语言**。
+   *
+   * ⚠️ **耗时 = 作业墙钟时间**（``finished_at - started_at``）—— 导出是
+   *    长任务（识别 + 翻译 + 合成 + 存盘）⇒ 这个数包含等语音模型就绪那段。
+   */
+  _dubInfoText(d) {
+    const job = d || {};
+    const started = Number(job.started_at) || 0;
+    const finished = Number(job.finished_at) || 0;
+    const elapsed = finished > started ? finished - started : 0;
+    const dur = Number(job.duration_sec) || 0;
+    const n = Array.isArray(job.sentences) ? job.sentences.length : 0;
+    const bits = [];
+    if (elapsed > 0) bits.push(elapsed.toFixed(2) + " s");
+    if (dur > 0) bits.push("音频 " + dur.toFixed(1) + " s");
+    if (n > 0) bits.push(n + " 句");
+    const head = bits.length ? "配音完成（" + bits.join(" · ") + "）" : "配音完成";
+    const srcLang = this._srcLangLabel(job.source_lang || "");
+    const tgtLang = this._dubTgtLangLabel(job.target_lang || "");
+    const langs = [];
+    if (srcLang) langs.push("源语言 " + srcLang);
+    if (tgtLang) langs.push("导出语言 " + tgtLang);
+    return langs.length ? head + "· " + langs.join(" → ") : head;
   },
 
   /** 收掉「配音导出结果」面板（⇒ 「实时结果」框回来）。 */

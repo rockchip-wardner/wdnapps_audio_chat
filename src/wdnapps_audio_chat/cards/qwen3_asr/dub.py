@@ -150,6 +150,11 @@ class DubJob:
     #: **源语言**（识别出来的那个语种，如 "English"）—— 结果面板要标
     #: 「源语言 → 导出语言」⇒ 没有它就只标得出导出语言那一头。
     source_lang: str = ""
+    #: **源媒体时长**（秒）—— 页面那条完成信息里的「音频 15.1 s」。
+    #:
+    #: ⚠️ **音频 = 文件时长，视频 = 音轨时长**（见 :meth:`_run` 里的
+    #:    ``_dur``）⇒ 与识别那条「音频 15.1 s」是同一个口径。
+    duration_sec: float = 0.0
     sentences: List[DubSentence] = field(default_factory=list)
     audio_path: str = ""
     video_path: str = ""
@@ -178,6 +183,7 @@ class DubJob:
             "message": self.message,
             "error": self.error,
             "source_lang": self.source_lang,
+            "duration_sec": round(float(self.duration_sec or 0.0), 2),
             "sentences": [s.as_dict() for s in self.sentences],
             "audio_path": self.audio_path,
             "video_path": self.video_path,
@@ -717,6 +723,10 @@ class DubEngine:
                 _dur = track_dur
             else:
                 _dur = _media_duration_sec(src)
+            # ⚠️ **源时长记在作业上**（2026-11-27 用户要求）—— 页面跑完要写
+            #    一条完成信息「配音完成（12.34 s · 音频 15.1 s · 12 句）…」
+            #    ⇒ 「音频 15.1 s」这一项就是它（与识别那条同一个口径）。
+            job.duration_sec = float(_dur or 0.0)
             sentences = self._reuse_page_result(job, src, _dur)
             if sentences:
                 self._set_phase(job, "复用识别结果", 0.05)
