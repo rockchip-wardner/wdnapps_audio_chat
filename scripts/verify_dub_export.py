@@ -709,6 +709,37 @@ def part_h() -> None:
           f"warnings={job2.warnings}")
 
 
+def _post_transcribe(base: str, src: str, timeout: float = 60.0):
+    """发一次**识别**请求（multipart）⇒ 返回 ``(状态码, 体)``。
+
+    ⚠️ ``/transcribe`` 是 **multipart**（不是 JSON）⇒ 不能用 ``_api``。
+    """
+    from urllib import request as _rq
+    boundary = "----wdnverify%d" % int(time.time() * 1000)
+    body = b""
+    for k, v in (("path", src), ("translate_mode", "sentence")):
+        body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                 % (boundary, k, v)).encode()
+    body += ("--%s--\r\n" % boundary).encode()
+    req = _rq.Request(base + "/api/qwen3-asr/transcribe", data=body,
+                      headers={"Content-Type":
+                               "multipart/form-data; boundary=" + boundary},
+                      method="POST")
+    try:
+        with _rq.urlopen(req, timeout=timeout, context=_CTX) as r:
+            raw = r.read().decode("utf-8", "replace")
+            try:
+                return r.status, json.loads(raw)
+            except ValueError:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, raw
+
+
 def part_i(base: str) -> None:
     section("I. 「清空」：服务端把**结果**清掉（刷新页面不会复活）")
     # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
@@ -729,6 +760,13 @@ def part_i(base: str) -> None:
     check("清空：作业刚起来是 running",
           (d or {}).get("state") == "running",
           f"得到 {(d or {}).get('state')}")
+
+    # ⚠️ **反向也要挡**（2026-11-27 用户要求：两者**互斥**）——
+    #    导出在跑时，**不允许**再发起识别 ⇒ 两者都占**同一个 ASR 单例**
+    #    （导出那条流也走 ``svc.transcribe_stream``）⇒ 同时跑会搅坏。
+    code, t = _post_transcribe(base, str(src))
+    check("互斥：导出在跑时，识别请求被拒（409）",
+          code == 409 and "配音导出" in str(t), f"得到 {code} {t}")
 
     # ⚠️ **跑着的时候不许清** —— 半路清会留下一个「半截」的作业状态
     #    （句子清了、作业还在跑）。

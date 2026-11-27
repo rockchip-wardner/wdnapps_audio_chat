@@ -2526,6 +2526,39 @@ const Qwen3Asr = {
     return !!(this.snapshot && this.snapshot.busy);
   },
 
+  /**
+   * **文件 / 视频**那条识别自己还在跑吗。
+   *
+   * ⚠️ **别用 ``_busy()``** —— 那个 ``snapshot.busy`` 会被**实时（麦克风）
+   * 会话**盖掉（服务端 ``snapshot()`` 末尾会把 busy 置 true）⇒ 麦克风开着
+   * 的时候，页面上的「配音导出」会被误判成「识别在跑」。
+   * ⇒ 用后端给的 ``file_busy``（只认文件/视频那条）。
+   */
+  _asrFileBusy() {
+    if (this.snapshot && typeof this.snapshot.file_busy === "boolean") {
+      return this.snapshot.file_busy;
+    }
+    // ⚠️ 老服务（没这个字段）⇒ 退回 ``busy``（宁可保守一点）。
+    return this._busy();
+  },
+
+  /**
+   * 「开始识别」的可用态 —— **只有这一处**说了算（2026-11-27）。
+   *
+   * ⚠️ 原来散在**四个地方**各算一遍（`_syncSourceUi` / `_applySnapshot` /
+   *    `start()` 的 finally / WS onopen）⇒ 口径容易漂 ⇒ 收到这里。
+   *
+   * ⚠️⚠️ **配音导出在跑 ⇒ 灰着**（2026-11-27 用户要求）—— 两者**互斥**：
+   *    「实时翻译」和「配音导出」**都可能用到 ASR + 翻译** ⇒ 同时跑会把
+   *    同一个 ASR 单例搅坏（后端也会拒：409「上一条识别还在进行中」）。
+   */
+  _syncStartBtn() {
+    const btn = document.getElementById("asr-start-btn");
+    if (!btn) return;
+    btn.disabled = !this._isFileSource() || !this._hasSource()
+      || this._busy() || this._starting || this._dub.running;
+  },
+
   _hasSource() {
     return !!(this._file || (this._path && this._path.trim()));
   },
@@ -2543,11 +2576,10 @@ const Qwen3Asr = {
     if (fileName && this._path) fileName.textContent = "";
     // 「开始识别」只对**文件 / 视频**来源有意义 —— 实时两种来源各有各
     // 的按钮（板载采集 / 浏览器麦克风）。
-    const startBtn = $("asr-start-btn");
-    if (startBtn) {
-      startBtn.disabled = !this._isFileSource() || !this._hasSource()
-        || this._busy() || this._starting;
-    }
+    //
+    // ⚠️ **判定只有一份**（``_syncStartBtn``）—— 里面还管着「配音导出在跑
+    //    ⇒ 灰着」那条互斥规则 ⇒ 别在这儿另算一遍。
+    this._syncStartBtn();
     // ⚠️ **结果框画什么** —— 三种来源三个框（都在**页面底部**）：
     //   * 音频文件 ⇒ 「句子流」（原文 + 译文成对），见 `#asr-sentences`；
     //   * 含音轨的视频 ⇒ 「字幕同款转写框」（见 `#asr-transcript`）；
@@ -2753,17 +2785,21 @@ const Qwen3Asr = {
     //    ⇒ 语种是**识别出来之后**才有的 ⇒ 得在这里刷一次。
     this._syncResultBoxes();
 
-    const startBtn = document.getElementById("asr-start-btn");
-    if (startBtn) startBtn.disabled = !this._hasSource() || snap.busy || this._starting;
+    // ⚠️ **「开始识别」的判定只有一份**（``_syncStartBtn``）—— 它还管着
+    //    「配音导出在跑 ⇒ 灰着」那条**互斥**规则 ⇒ 别在这儿另算一遍。
+    this._syncStartBtn();
     const stopBtn = document.getElementById("asr-stop-btn");
     if (stopBtn) stopBtn.disabled = !snap.busy;
-
     const empty = document.getElementById("asr-empty");
     if (empty) empty.classList.toggle("hidden", this.rounds.length > 0 || !!snap.last_result);
 
     this._updateHint();
     this._syncSourceUi();
     this._syncLiveUi();
+    // ⚠️⚠️ **识别状态变了 ⇒ 配音导出的按钮也要跟着变**（2026-11-27 用户
+    //    要求：两者**互斥**）—— 识别一开始，「生成配音版」就灰；识别一
+    //    结束，它又亮回来 ⇒ 快照是唯一的触发点（WS 的 state 帧）。
+    this._dubSyncButtons();
     // ⚠️ **行级翻译**：「最后一行的定稿」正常是靠识别结束的 ``done``
     // 帧触发的 —— 刷新页面后那个帧**随旧连接一起没了** ⇒ 最后一行永远
     // 等不到译文 ⇒ 靠「后端已经不忙了」这个信号补上（见
@@ -4655,6 +4691,11 @@ const Qwen3Asr = {
     }
     if (!this._hasSource() || this._starting || this._busy()) return false;
     this._starting = true;
+    // ⚠️⚠️ **识别一开始 ⇒「生成配音版」立刻就灰**（2026-11-27 用户要求：
+    //    两者互斥）—— 别等服务端确认（WS 那一帧要 ~0.3 s）⇒ 这中间用户
+    //    还能点「生成配音版」⇒ 两个一起跑。
+    // ⇒ ``_starting`` 也算「识别在跑」（见 ``_dubSyncButtons``）。
+    this._dubSyncButtons();
     this.rounds = [];
     this._roundGen++;            // 新的一批轮次 → 作废在途的「刷新恢复」
     this._stopInitiated = false;  // 新的一批 → 「谁停的」重新算
@@ -4749,11 +4790,14 @@ const Qwen3Asr = {
       return false;
     } finally {
       this._starting = false;
-      const startBtn = document.getElementById("asr-start-btn");
-      if (startBtn) {
-        startBtn.disabled = !this._isFileSource() || !this._hasSource()
-          || this._busy();
-      }
+      // ⚠️ **判定只有一份**（见 ``_syncStartBtn``）—— 含「配音导出在跑 ⇒
+      //    灰着」那条互斥规则。
+      this._syncStartBtn();
+      // ⚠️⚠️ **配音导出的按钮也要跟着刷**（互斥规则的另一半）——
+      //    ``_starting`` 刚清掉 ⇒ 判据回到服务端的 ``file_busy``。
+      //    ⇒ 正常路径：响应里的快照已经带 ``file_busy=true`` ⇒ 仍然灰着；
+      //    ⇒ 失败路径（比如被配音导出挡了 409）：识别压根没起来 ⇒ 亮回来。
+      this._dubSyncButtons();
     }
   },
 
@@ -5148,8 +5192,7 @@ const Qwen3Asr = {
     }
     this.ws.onopen = () => {
       this.wsRetry = 0;
-      const startBtn = document.getElementById("asr-start-btn");
-      if (startBtn) startBtn.disabled = !this._hasSource() || this._busy();
+      this._syncStartBtn();
     };
     this.ws.onmessage = (ev) => {
       let msg;
@@ -6909,6 +6952,9 @@ const Qwen3Asr = {
       // ⚠️ 记下作业的**原始**源路径 ⇒ 列产物用它（见 ``_dubRefreshFiles``）
       this._dub.sourcePath = d.source_path || path;
       this._dubSetStatus("已提交，正在处理…");
+      // ⚠️⚠️ **马上就把「开始识别」灰掉**（2026-11-27 用户要求：两者互斥）——
+      //    别等下一轮轮询（1.5 s）才变 ⇒ 用户手快点两下就点进去了。
+      this._dubSyncButtons();
       this._dubPoll();
     } catch (e) {
       this._dubSetStatus("提交失败：" + e);
@@ -6922,6 +6968,8 @@ const Qwen3Asr = {
     this._dub.running = false;
     this._dubPollStop();
     this._dubSetStatus("已停止");
+    // ⚠️ **导出停了 ⇒ 「开始识别」该亮了**（互斥规则的解除）。
+    this._dubSyncButtons();
   },
 
   /**
@@ -7052,7 +7100,18 @@ const Qwen3Asr = {
     // ⇒ 本机上传的文件**也能导** —— ``_dubStart()`` 会先把它传到设备端
     //    （导出必须在设备端跑，产物也落在设备端）。
     const hasSrc = !!(this._path || this._file);
-    if (start) start.disabled = this._dub.running || !hasSrc;
+    // ⚠️⚠️ **识别在跑 ⇒ 「生成配音版」灰着**（2026-11-27 用户要求）——
+    //    「实时翻译」和「配音导出」**互斥**：两个都占 **ASR 单例 + 翻译
+    //    模型** ⇒ 同时跑会把同一个增量解码器搅坏。
+    //
+    //    ⚠️ 判据用 ``_asrFileBusy()``（**只认文件/视频那条**）——
+    //    ``_busy()`` 会被**麦克风实时会话**盖掉 ⇒ 麦克风开着的时候不该
+    //    把「生成配音版」误判成灰的（实时会话在**另一个服务**里，不冲突）。
+    //
+    //    ⚠️ **``_starting`` 也算「在跑」** —— 点下「开始识别」到服务端确认
+    //    之间有 ~0.3 s ⇒ 那段时间里也必须灰着（不然两个一起跑）。
+    const asrBusy = this._asrFileBusy() || this._starting;
+    if (start) start.disabled = this._dub.running || !hasSrc || asrBusy;
     if (stop) stop.disabled = !this._dub.running;
     // ⚠️ **「清空」只在**真有东西可清**时才点得动**（2026-11-27 用户要求）——
     //    没有结果可清的时候，按钮灰着（跟「停止」没作业时灰着一个道理）。
@@ -7067,6 +7126,10 @@ const Qwen3Asr = {
       reset.disabled = this._dub.running ||
         !(this._dub.hasRows || this._dub.hasJob);
     }
+    // ⚠️⚠️ **反过来也要刷**（2026-11-27 用户要求：两者互斥）——
+    //    导出状态一变（「生成配音版」点了 / 跑完了 / 停了），「开始识别」
+    //    的可用态也要跟着变 ⇒ 出口只有 ``_syncStartBtn`` 一个。
+    this._syncStartBtn();
   },
 
   /**

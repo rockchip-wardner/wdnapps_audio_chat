@@ -358,6 +358,21 @@ async def post_asr_transcribe(
 
     svc = get_asr_service()
     start_at = max(0.0, float(start_sec or 0.0))
+    # ⚠️⚠️ **与「配音导出」互斥**（2026-11-27 用户要求）——
+    #    两者**都可能用到 ASR + 翻译** ⇒ 不能同时跑。
+    #
+    #    ⇒ 导出那条流也走**同一个** ASR 单例（``svc.transcribe_stream``）
+    #      ⇒ 同时跑会把**同一个增量解码器**搅坏（后端也会拒：
+    #      ValueError「上一条识别还在进行中」⇒ 409）。
+    #    ⇒ 前端已把按钮灰了，这里**再挡一道**（防止直接打接口）。
+    try:
+        from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+    except ImportError:  # pragma: no cover — 导入失败不该挡住识别
+        get_dub_engine = None
+    if get_dub_engine is not None and get_dub_engine().running():
+        raise HTTPException(
+            status_code=409,
+            detail="配音导出还在跑，先等它结束（或点「停止」）")
     # ⚠️ **回看**：拖动进度条后重开识别时，新会话是**零上下文**的 ⇒
     #    模型会**重新判语种**（中文音频被判成 English / Russian）⇒
     #    头几轮的假设文本是外文（实测冒出过「Мыщение」）⇒ 那一段的

@@ -394,6 +394,20 @@ class DubEngine:
         self._thread.start()
         return job.as_dict()
 
+    def running(self) -> bool:
+        """现在有导出作业在跑吗。
+
+        ⚠️ **给「识别」那边的互斥判断用**（2026-11-27 用户要求）——
+        「实时翻译」和「配音导出」**都可能用到 ASR + 翻译** ⇒ 两者互斥：
+        导出在跑时，**不允许**再发起一次识别（否则同一个 ASR 单例被搅坏）。
+
+        ⚠️ **整个作业期间都算「在跑」** —— 包括它**等页面上的识别跑完**
+        那段（那时它还没占 ASR，但也还没结束 ⇒ 不该让识别插进来）。
+        """
+        with self._lock:
+            job = self._job
+        return bool(job is not None and job.state == "running")
+
     def status(self) -> Dict[str, Any]:
         with self._lock:
             job = self._job

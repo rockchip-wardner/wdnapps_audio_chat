@@ -621,6 +621,86 @@ def main() -> int:
         check("刷新页面后导出结果没有复活（服务端清生效）",
               again["panelHidden"] and again["n"] == 0, f"实际 = {again!r}")
 
+        section("H. 「实时翻译」与「配音导出」**互斥**（2026-11-27 用户要求）")
+        # ⚠️ **为什么要有这一段** —— 两个**都可能用到 ASR + 翻译** ⇒ 同时跑会把
+        #   **同一个 ASR 单例**搅坏（后端会 409「上一条识别还在进行中」）
+        #   ⇒ 用户要求：识别在跑时「生成配音版」灰；导出在跑时「开始识别」灰。
+        #
+        # ⇒ ① 先跑一次**识别** ⇒ 期间「生成配音版」必须是灰的。
+        page.click(".asr-source-tab[data-source='file']")
+        page.wait_for_timeout(1000)
+        page.fill("#asr-source", args.source)
+        page.wait_for_timeout(800)
+        start_dis = page.evaluate(
+            "() => document.getElementById('asr-start-btn')?.disabled")
+        check("填了路径 ⇒「开始识别」可点", start_dis is False,
+              f"disabled={start_dis}")
+        if start_dis is False:
+            page.click("#asr-start-btn")
+        # ⚠️ **徽标与按钮状态必须**一次**读出来** —— 分两次读的话，中间
+        #    识别可能就结束了（asr_en.wav 只要 2~3 s）⇒ 读到「徽标=识别中」
+        #    但按钮已经恢复 ⇒ **假失败**（踩到过一次）。
+        ATOMIC = """() => ({
+            badge: (document.getElementById('asr-state-badge')
+                    ?.textContent || '').trim(),
+            dub: document.getElementById('asr-dub-start')?.disabled,
+        })"""
+        # ⇒ ① 点下「开始识别」的**瞬间**就灰了（不等服务端确认）
+        page.wait_for_timeout(50)
+        early = page.evaluate(ATOMIC)
+        check("点「开始识别」⇒「生成配音版」**立刻**就灰了",
+              early["dub"] is True, f"disabled={early['dub']}")
+        # ⇒ ② 「识别中」那一刻也必须是灰的
+        saw_busy = False
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            snap = page.evaluate(ATOMIC)
+            if "识别中" in snap["badge"]:
+                saw_busy = True
+                check("识别在跑 ⇒「生成配音版」是灰的", snap["dub"] is True,
+                      f"disabled={snap['dub']}")
+                break
+            if snap["badge"] in ("完成", "出错", "已停止"):
+                break          # 识别太快，没抓到那一刻 —— 不算失败（上面已钉住）
+            page.wait_for_timeout(50)
+        if not saw_busy:
+            print("    （识别太快，没抓到「识别中」那一刻；上面那条已钉住互斥）")
+        # ⇒ 等它跑完 ⇒ 「生成配音版」要亮回来
+        deadline = time.time() + 240
+        back = None
+        while time.time() < deadline:
+            back = page.evaluate(
+                "() => document.getElementById('asr-dub-start')?.disabled")
+            if back is False:
+                break
+            page.wait_for_timeout(500)
+        check("识别跑完 ⇒「生成配音版」又亮了", back is False, f"disabled={back}")
+
+        # ⇒ ② 再跑一次**导出** ⇒ 期间「开始识别」必须是灰的。
+        dub_dis = page.evaluate(
+            "() => document.getElementById('asr-dub-start')?.disabled")
+        check("识别跑完了 ⇒「生成配音版」可点", dub_dis is False,
+              f"disabled={dub_dis}")
+        if dub_dis is False:
+            page.click("#asr-dub-start")
+        page.wait_for_timeout(2500)
+        start_grey = page.evaluate(
+            "() => document.getElementById('asr-start-btn')?.disabled")
+        check("导出在跑 ⇒「开始识别」是灰的", start_grey is True,
+              f"disabled={start_grey}")
+        deadline = time.time() + 300
+        state = ""
+        while time.time() < deadline:
+            state = page.evaluate(
+                "() => document.getElementById('asr-dub-status')?.textContent || ''")
+            if "完成" in state or "失败" in state:
+                break
+            page.wait_for_timeout(2000)
+        page.wait_for_timeout(2000)
+        back2 = page.evaluate(
+            "() => document.getElementById('asr-start-btn')?.disabled")
+        check("导出跑完 ⇒「开始识别」又亮了", back2 is False, f"disabled={back2}")
+
         check("页面没有 JS 报错", not errors, "; ".join(errors[:3]))
         if bad_responses:
             print("\n  \033[33m非 2xx 响应:\033[0m")

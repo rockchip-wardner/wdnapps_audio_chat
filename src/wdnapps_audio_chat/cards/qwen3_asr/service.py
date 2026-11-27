@@ -1520,6 +1520,13 @@ class _AsrManager:
             snap = {
                 "state": self._state,
                 "busy": self._state == self.STATE_RUNNING,
+                # ⚠️ **只认「文件 / 视频」那条识别**（2026-11-27 用户要求）——
+                #    ``busy`` 会被**实时（麦克风）会话**盖掉（见本方法末尾）
+                #    ⇒ 拿 ``busy`` 判「配音导出能不能点」的话，用户只要开着
+                #    麦克风，「生成配音版」就永远是灰的（可它俩其实不冲突 ——
+                #    实时会话在**另一个服务**里）。
+                # ⇒ 这里给一个**精确**的口径：文件/视频的识别自己还在跑吗。
+                "file_busy": self._state == self.STATE_RUNNING,
                 "error": self._error,
                 "language": self._language,
                 "model_id": self._model_id or self._resolve_model_id(),
