@@ -149,6 +149,39 @@ def main() -> int:
         check("切回音频文件：配音导出块又显示了",
               not _hidden(page, "#asr-dub-block"))
 
+        section("B3. 三个语言下拉的标签必须**区分开**（防「同名 ⇒ 以为联动」）")
+        # ⚠️ **为什么要有这条**（2026-11-27）—— 用户实测报过「配音导出选择英文，
+        #    生成的文件播放是中文」⇒ 根因之一就是两个下拉**都叫「目标语言」**
+        #    ⇒ 用户以为它们联动、以为改一个另一个跟着变（实际不跟）。
+        # ⇒ 现在三个下拉各有各的**不重名**标签，作用域也写在提示里。
+        labels = page.evaluate(
+            """() => {
+                const pick = (id) => {
+                    const el = document.querySelector('label[for="' + id + '"]');
+                    return el ? (el.textContent || "").trim() : "";
+                };
+                const root = document.getElementById("page-qwen3-asr");
+                const olds = root
+                  ? Array.from(root.querySelectorAll("label"))
+                      .map((l) => (l.textContent || "").trim())
+                      .filter((t) => t === "目标语言")
+                  : [];
+                return {
+                    tr: pick("asr-tr-target"),
+                    interp: pick("asr-interp-target"),
+                    dub: pick("asr-dub-target"),
+                    olds: olds,
+                };
+            }""")
+        check("实时翻译的下拉叫「显示语言」", labels["tr"] == "显示语言",
+              f"实际 {labels['tr']!r}")
+        check("同传的下拉叫「朗读语言」", labels["interp"] == "朗读语言",
+              f"实际 {labels['interp']!r}")
+        check("配音导出的下拉叫「导出语言」", labels["dub"] == "导出语言",
+              f"实际 {labels['dub']!r}")
+        check("这张卡里**再没有**叫「目标语言」的标签", not labels["olds"],
+              f"实际 {labels['olds']!r}")
+
         section("C. 填**设备端路径** ⇒ 「生成配音版」必须可点")
         page.fill("#asr-source", args.source)
         page.wait_for_timeout(800)

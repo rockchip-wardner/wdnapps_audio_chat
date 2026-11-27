@@ -834,9 +834,13 @@ const Qwen3Asr = {
       this._trSet({ enabled: on });
     });
     $("asr-tr-target")?.addEventListener("change", (e) => {
-      // ⚠️ **换目标语言 ⇒ 旧译文作废** —— 那些译文是**上一种语言**的
+      // ⚠️ **换显示语言 ⇒ 旧译文作废** —— 那些译文是**上一种语言**的
       // （「中文→英语」的译文挂在字幕上，用户刚换成「日语」⇒ 字幕上还是
       // 英文）⇒ 清掉译文与记账 ⇒ 重新按新语言翻一遍。
+      //
+      // ⚠️ **这里只管「显示语言」** —— **不碰**「配音导出」的「导出语言」
+      // （那是**产物**的语言 ⇒ 由用户**显式**决定 ⇒ 2026-11-27 起两者
+      // 在 UI 上就分开了，不再同名也不再联动）。
       this._tr.items = [];
       this._trLineTr.clear();
       this._trLineReq.clear();
@@ -6587,7 +6591,16 @@ const Qwen3Asr = {
           o.textContent = it.name || it.id;
           langSel.appendChild(o);
         });
-        // ⚠️ 默认跟随「实时翻译」的目标语言（没开就退回第一条）。
+        // ⚠️ **默认跟随「实时翻译」的显示语言**（没开就退回第一条）。
+        //
+        // ⚠️⚠️ **只跟这一次** —— 本函数首行就是 ``if (this._dub.loaded) return;``
+        // ⇒ 用户之后改「显示语言」，**这里不会再变**。
+        //
+        // ⇒ 这是**故意的**（2026-11-27）：导出语言是**产物**的语言 ⇒ 必须由
+        //    用户**显式**决定 ⇒ 绝不能被「显示语言」的改动悄悄带偏。
+        //    （用户实测报过「导出选英文、出来的文件却是中文」⇒ 根因就是
+        //      两个下拉**同名** + 默认联动 ⇒ 现在 UI 上叫「导出语言」，
+        //      且明写了与「显示语言」互不影响。）
         const want = this._tr.targetLang;
         const hit = items.find((it) => it.id === want);
         langSel.value = hit ? hit.id : (items[0] ? items[0].id : "");
@@ -7039,7 +7052,8 @@ window.ImApp_qwen3_asr.applyWizardSnapshot = async function (opts) {
     const sel = document.getElementById("asr-dub-voice");
     if (sel) sel.value = dubVoice;
   }
-  // 目标语言：跟随「翻译目标语言」（配音版就是「翻成什么语言就念什么语言」）
+  // 导出语言：向导选的那个语言**同时**作为「显示语言」和「导出语言」的初始值
+  // （卡片页里两者可以再分别改 —— 2026-11-27 起两个下拉**不再同名**）。
   if (trOn) {
     Qwen3Asr._dub.targetLang = trTarget;
     const dsel = document.getElementById("asr-dub-target");

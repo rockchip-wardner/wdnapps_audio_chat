@@ -224,7 +224,7 @@
             <div class="asr-block asr-tr-block" id="asr-tr-block">
               <div class="asr-tr-title">实时翻译</div>
               <div class="asr-tr-head">
-                <label class="asr-file-label" for="asr-tr-target">目标语言</label>
+                <label class="asr-file-label" for="asr-tr-target">显示语言</label>
                 <select id="asr-tr-target" class="tts-select"></select>
                 <label class="asr-tr-switch" for="asr-tr-enabled">
                   <input type="checkbox" id="asr-tr-enabled" />
@@ -245,6 +245,8 @@
               -->
               <div class="asr-tr-note">
                 译文显示在下方「实时结果」框里，与原文一句一句对应。
+                <br />
+                「显示语言」只管页面上显示成什么语言，不影响生成的文件。
               </div>
             </div>
 
@@ -282,7 +284,7 @@
                   <option value="now">不等播放</option>
                   <option value="follow">跟播放</option>
                 </select>
-                <label class="asr-file-label" for="asr-interp-target">目标语言</label>
+                <label class="asr-file-label" for="asr-interp-target">朗读语言</label>
                 <select id="asr-interp-target" class="tts-select"></select>
                 <label class="asr-file-label" for="asr-interp-speaker">音色</label>
                 <select id="asr-interp-speaker" class="tts-select"></select>
@@ -299,6 +301,8 @@
               </div>
               <div class="asr-tr-note" id="asr-interp-hint">
                 同传把识别结果翻译后从板载扬声器播报。一句话都不会丢（逐句结果见页面底部）。
+                <br />
+                「朗读语言」是同传从扬声器念出来的语言；想让听到的和看到的一致，就跟上面的「显示语言」选成一样。
               </div>
             </div>
 
@@ -309,22 +313,35 @@
               来源用上面的「同声传译」）。
 
               做什么：
-                * 音频文件     ⇒ 生成**目标语言的音频文件**
+                * 音频文件     ⇒ 生成**导出语言的音频文件**
                                    （ASR → 翻译 → TTS）；
-                * 含音轨的视频 ⇒ ① 目标语言的音频文件
+                * 含音轨的视频 ⇒ ① 导出语言的音频文件
                                    ② **双字幕**（原文 + 译文）烧进画面
                                    ③ ①② 重新封装成一个音视频文件。
 
-              文件名 = **源文件名 + 目标语言 + 音色**，存在**源文件同级目录**
+              文件名 = **源文件名 + 导出语言 + 音色**，存在**源文件同级目录**
               ⇒ 生成完可以在下面**挑一个文件播放**。
 
               ⚠️ 这一块与「实时翻译」「字幕实时显示」**并行**：翻译照旧实时
               显示在页面底部，配音版是**另外**跑一遍导出的产物。
+
+              ⚠️⚠️ **「导出语言」与「实时翻译」的「显示语言」是两个独立的
+              东西**（2026-11-27）—— 用户实测报过「导出选英文、出来的文件
+              却是中文」⇒ 根因就是两个下拉**同名**（都叫「目标语言」）⇒
+              用户以为它们联动。
+
+              ⇒ **名字必须区分开**：
+                * 「显示语言」= 页面上显示成什么语言（实时翻译 / 字幕）；
+                * 「朗读语言」= 同传从扬声器念什么语言；
+                * 「导出语言」= 生成的文件里是什么语言（音轨 + 烧录字幕）。
+              ⇒ **绝不要**把它们合回一个下拉，也**绝不要**让「显示语言」
+                的改动去改「导出语言」（后端已用 ``strict_target`` 把导出
+                那一批的目标语言钉死 ⇒ 前端改显示语言**带不偏**导出）。
             -->
             <div class="asr-block asr-tr-block asr-dub-block hidden" id="asr-dub-block">
               <div class="asr-tr-title">配音导出</div>
               <div class="asr-tr-head">
-                <label class="asr-file-label" for="asr-dub-target">目标语言</label>
+                <label class="asr-file-label" for="asr-dub-target">导出语言</label>
                 <select id="asr-dub-target" class="tts-select"></select>
                 <label class="asr-file-label" for="asr-dub-voice">音色</label>
                 <select id="asr-dub-voice" class="tts-select"></select>
@@ -341,7 +358,9 @@
                        preload="metadata" playsinline></video>
               </div>
               <div class="asr-tr-note" id="asr-dub-hint">
-                生成的文件保存在**源文件同级目录**，文件名 = 源文件名 + 目标语言 + 音色。
+                生成的文件保存在源文件同级目录，文件名 = 源文件名 + 导出语言 + 音色。
+                <br />
+                「导出语言」决定生成的文件里的语言（音轨和烧进画面的字幕）。它与上面的「显示语言」互不影响 —— 改了显示语言，生成的文件仍然是导出语言。
               </div>
             </div>
 
