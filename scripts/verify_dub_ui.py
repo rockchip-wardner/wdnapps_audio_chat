@@ -182,6 +182,44 @@ def main() -> int:
         check("这张卡里**再没有**叫「目标语言」的标签", not labels["olds"],
               f"实际 {labels['olds']!r}")
 
+        # ⚠️ **说明必须紧贴自己解释的那一行**（2026-11-27 用户要求）——
+        #    放在块底部离得太远 ⇒ 用户得自己猜是哪一项的说明。
+        hints = page.evaluate(
+            """() => {
+                const hintAfter = (selId) => {
+                    const el = document.getElementById(selId);
+                    const row = el && el.closest
+                        ? el.closest('.asr-tr-head') : null;
+                    const nxt = row ? row.nextElementSibling : null;
+                    if (!nxt || !nxt.classList.contains('asr-tr-hint')) {
+                        return null;
+                    }
+                    return (nxt.textContent || '').trim();
+                };
+                return {
+                    tr: hintAfter('asr-tr-target'),
+                    interp: hintAfter('asr-interp-target'),
+                    dub: hintAfter('asr-dub-target'),
+                };
+            }""")
+        check("「显示语言」的说明**紧贴**它那一行下面",
+              bool(hints["tr"]) and "显示语言" in hints["tr"],
+              f"实际 = {hints['tr']!r}")
+        check("「朗读语言」的说明**紧贴**它那一行下面",
+              bool(hints["interp"]) and "朗读语言" in hints["interp"],
+              f"实际 = {hints['interp']!r}")
+        check("「导出语言」的说明**紧贴**它那一行下面",
+              bool(hints["dub"]) and "导出语言" in hints["dub"],
+              f"实际 = {hints['dub']!r}")
+        # ⚠️ **动态状态行不能被静态说明占掉** —— ``#asr-interp-hint``
+        #    是 JS 每次都重写的状态行 ⇒ 静态说明必须另起元素。
+        check("「朗读语言」的说明**没有**占用动态状态行 #asr-interp-hint",
+              page.evaluate("""() => {
+                  const el = document.getElementById('asr-interp-hint');
+                  if (!el) return true;
+                  return !el.classList.contains('asr-tr-hint');
+              }"""))
+
         section("B4. 三个语言下拉的**选项排法**必须一致（中文名 + 本族名）")
         # ⚠️ **为什么要有这条**（2026-11-27）—— 「导出语言」的下拉原先直接用
         #    `it.name` ⇒ 选项是**纯英文名**（"English" / "Chinese"）⇒ 跟

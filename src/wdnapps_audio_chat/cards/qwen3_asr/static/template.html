@@ -234,6 +234,13 @@
                 <span class="asr-live-status" id="asr-tr-status">翻译未启用</span>
               </div>
               <!--
+                ⚠️ **说明必须紧贴自己解释的那一行**（2026-11-27 用户要求）——
+                放在块底部离「显示语言」太远 ⇒ 用户得自己猜是哪一项的说明。
+              -->
+              <div class="asr-tr-hint">
+                「显示语言」只管页面上显示成什么语言，不影响生成的文件。
+              </div>
+              <!--
                 ⚠️ **这里只有控制条，没有译文列表**。
 
                 原来这一块下面有一栏译文（原文 + 译文成对）⇒ 它把原文又抄了
@@ -245,8 +252,6 @@
               -->
               <div class="asr-tr-note">
                 译文显示在下方「实时结果」框里，与原文一句一句对应。
-                <br />
-                「显示语言」只管页面上显示成什么语言，不影响生成的文件。
               </div>
             </div>
 
@@ -294,6 +299,14 @@
                      想听清楚自己往上拉。与 `app.js` 的 `volume: 0.05` 一致。 -->
                 <input type="range" id="asr-interp-volume" min="0" max="100" value="5" />
               </div>
+              <!--
+                ⚠️ **紧贴「朗读语言」那一行**（2026-11-27 用户要求）——
+                下面的 ``#asr-interp-hint`` 是**动态**的（JS 每次都重写它
+                ⇒ 静态说明塞进去会被覆盖）⇒ 静态说明单独起一个元素。
+              -->
+              <div class="asr-tr-hint">
+                「朗读语言」是同传从扬声器念出来的语言；想让听到的和看到的一致，就跟上面的「显示语言」选成一样。
+              </div>
               <div class="asr-tr-head">
                 <button type="button" class="vd-btn vd-btn-primary" id="asr-interp-start">开始同传</button>
                 <button type="button" class="vd-btn" id="asr-interp-stop" disabled>停止同传</button>
@@ -301,8 +314,6 @@
               </div>
               <div class="asr-tr-note" id="asr-interp-hint">
                 同传把识别结果翻译后从板载扬声器播报。一句话都不会丢（逐句结果见页面底部）。
-                <br />
-                「朗读语言」是同传从扬声器念出来的语言；想让听到的和看到的一致，就跟上面的「显示语言」选成一样。
               </div>
             </div>
 
@@ -349,6 +360,14 @@
                 <button type="button" class="vd-btn" id="asr-dub-stop" disabled>停止</button>
                 <span class="asr-live-status" id="asr-dub-status">未开始</span>
               </div>
+              <!--
+                ⚠️ **紧贴「导出语言」那一行**（2026-11-27 用户要求）——
+                这块下面还有「生成的文件」那一行 ⇒ 说明放在块底部会离
+                「导出语言」很远 ⇒ 用户得自己猜是哪一项的说明。
+              -->
+              <div class="asr-tr-hint">
+                「导出语言」决定生成的文件里的语言（音轨和烧进画面的字幕）。它与上面的「显示语言」互不影响 —— 改了显示语言，生成的文件仍然是导出语言。
+              </div>
               <div class="asr-tr-head">
                 <label class="asr-file-label" for="asr-dub-files">生成的文件</label>
                 <select id="asr-dub-files" class="tts-select"></select>
@@ -359,8 +378,6 @@
               </div>
               <div class="asr-tr-note" id="asr-dub-hint">
                 生成的文件保存在源文件同级目录，文件名 = 源文件名 + 导出语言 + 音色。
-                <br />
-                「导出语言」决定生成的文件里的语言（音轨和烧进画面的字幕）。它与上面的「显示语言」互不影响 —— 改了显示语言，生成的文件仍然是导出语言。
               </div>
             </div>
 
