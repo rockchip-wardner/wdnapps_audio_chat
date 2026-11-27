@@ -205,9 +205,13 @@ def main() -> int:
         check("产物下拉里有文件", len(opts) > 0, f"status={state!r}")
         if opts:
             print("    产物:", opts[:3])
-            src = page.evaluate(
-                "() => document.getElementById('asr-dub-player')?.src || ''")
-            check("播放器拿到了产物 URL", "/api/qwen3-asr/media" in src, src)
+            # ⚠️ **音频产物 ⇒ 音频播放器；视频产物 ⇒ 视频播放器**
+            # （``_dubSyncPlayer`` 会把另一个元素的 src 清掉）⇒ 两个都看。
+            srcs = page.evaluate(
+                "() => [document.getElementById('asr-dub-player')?.src || '',"
+                " document.getElementById('asr-dub-video')?.src || '']")
+            check("播放器拿到了产物 URL",
+                  any("/api/qwen3-asr/media" in s for s in srcs), str(srcs))
 
         check("页面没有 JS 报错", not errors, "; ".join(errors[:3]))
         if bad_responses:
