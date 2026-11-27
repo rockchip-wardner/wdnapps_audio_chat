@@ -835,6 +835,16 @@
   white-space: nowrap;
 }
 
+/* 「实时结果」框顶上那一行提示（源语言 → 显示语言）——
+   与「配音导出结果」面板的标题**同一个排法**。 */
+.asr-live-cap {
+  font-size: 0.85rem;
+  color: var(--muted, #6b7280);
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px dashed var(--border, #e5e7eb);
+}
+
 /* ------------------------------------------------------------------ *
  * 同传结果（页面底部，2026-11-25）
  *

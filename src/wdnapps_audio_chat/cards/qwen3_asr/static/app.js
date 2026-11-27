@@ -628,6 +628,8 @@ const Qwen3Asr = {
     audioPath: "",        // 生成的目标语言音频文件
     videoPath: "",        // 生成的双字幕视频文件（视频来源才有）
     sourcePath: "",       // 作业的**原始**源路径（列产物用它，别用 _path）
+    sourceLang: "",      // 识别出来的语种（如 "English"）—— 结果面板要标「源语言」
+    hasRows: false,       // 导出结果面板**有内容**吗 ⇒ 藏掉重复的「实时结果」
     files: [],            // 源文件同级目录里已生成的产物 [{name, path, kind, url}]
     timer: null,          // 轮询定时器
     loaded: false,        // 语言 / 音色下拉拉过了
@@ -2719,6 +2721,9 @@ const Qwen3Asr = {
     }
     const lang = document.getElementById("asr-language");
     if (lang) lang.textContent = snap.language ? `语种：${snap.language}` : "";
+    // ⚠️ **「实时结果」顶上那行提示跟着语种走**（源语言 → 显示语言）
+    //    ⇒ 语种是**识别出来之后**才有的 ⇒ 得在这里刷一次。
+    this._syncResultBoxes();
 
     const startBtn = document.getElementById("asr-start-btn");
     if (startBtn) startBtn.disabled = !this._hasSource() || snap.busy || this._starting;
@@ -2873,16 +2878,16 @@ const Qwen3Asr = {
   },
 
   /* ------------------------------------------------------------------ *
-   * 配音导出结果面板用的两个语言标签
+   * 语言标签的两个来源
    *
    * ⚠️ **源语言**是 ASR 报出来的**英文名**（"English"）⇒ 先映射回语言码
    *    ⇒ 再走 ``_trLangLabel`` ⇒ 跟三个语言下拉**同一套排法**
    *    （「英语 English」）⇒ 映射不到就原样显示（不显示成空白）。
    *
-   * ⚠️ **导出语言**直接取「导出语言」下拉里那一项的文案 ⇒ 保证跟用户
+   * ⚠️ **目标语言**直接取那个语言下拉里那一项的文案 ⇒ 保证跟用户
    *    在下拉里看到的**一模一样**（不用再维护第二份标签表）。
    * ------------------------------------------------------------------ */
-  _dubSrcLangLabel(raw) {
+  _srcLangLabel(raw) {
     const name = String(raw || "").trim();
     if (!name) return "";
     const code = TR_LANG_BY_EN[name.toLowerCase()];
@@ -2890,17 +2895,18 @@ const Qwen3Asr = {
     return name;
   },
 
-  _dubTgtLangLabel(code) {
+  /** 某个语言下拉里那一项的文案（选不中就退回标签表）。 */
+  _selLangLabel(selId, code) {
     const c = String(code || "").trim();
     if (!c) return "";
-    const sel = document.getElementById("asr-dub-target");
+    const sel = document.getElementById(selId);
     if (sel) {
       const opt = Array.from(sel.options || [])
         .find((o) => o.value === c);
       if (opt) return (opt.textContent || "").trim();
     }
-    // ⚠️ **下拉可能还没填好** —— ``_dubLoadOptions`` 是**异步**的（要拉
-    //    接口）⇒ 进页面第一次渲染时它可能还是空的 ⇒ 退回**标签表**
+    // ⚠️ **下拉可能还没填好** —— ``_dubLoadOptions`` 之类是**异步**的（要
+    //    拉接口）⇒ 进页面第一次渲染时它可能还是空的 ⇒ 退回**标签表**
     //    （同一份 ``TR_LANG_LABELS`` ⇒ 排法与下拉一致，不会漂）。
     const lab = TR_LANG_LABELS[c];
     if (lab) {
@@ -2908,6 +2914,51 @@ const Qwen3Asr = {
       return lab.zh + " " + native;
     }
     return c;
+  },
+
+  _dubTgtLangLabel(code) {
+    return this._selLangLabel("asr-dub-target", code);
+  },
+
+  /**
+   * 「实时结果」框顶上那一行提示（源语言 → 显示语言）。
+   *
+   * ⚠️ **为什么要它**（2026-11-27 用户要求）—— 这个框原来**只有句子、
+   *    没有标题** ⇒ 用户得自己猜哪行是原文、哪行是译文、译文是哪种语言；
+   *    跟「配音导出结果」那个带标题的面板并排时更乱 ⇒ 现在两处**同一个
+   *    口径**。
+   *
+   * ⚠️ **实时翻译关着** ⇒ 只标源语言（那一行就是原文，没有译文）。
+   * ⚠️ **视频来源不标** —— 那个框里显示的是**字幕转写框**（它自己有标题
+   *    「字幕文本 · 与画面字幕同步，可上拉回看」）⇒ 两个标题挨着会重复。
+   */
+  _syncLiveCap() {
+    const cap = document.getElementById("asr-live-cap");
+    if (!cap) return;
+    // ⚠️ **句子流被藏起来 ⇒ 提示行也要藏** —— 「配音导出有内容」或「同传有
+    //    内容」时，句子流是隐藏的（合并规则）⇒ 只剩一个「有标题、没内容」
+    //    的框 ⇒ 一起藏。
+    const sents = document.getElementById("asr-sentences");
+    const rtSents = document.getElementById("asr-rt-sentences");
+    const shown = (sents && !sents.classList.contains("hidden")) ||
+                  (rtSents && !rtSents.classList.contains("hidden"));
+    const isVideo = this._source === "video";
+    const src = this._srcLangLabel(
+      (this.snapshot && this.snapshot.language) || "");
+    const trOn = !!this._tr.enabled;
+    const tgt = trOn
+      ? this._selLangLabel("asr-tr-target", this._tr.targetLang) : "";
+    let text = "";
+    if (!isVideo) {
+      if (trOn) {
+        text = "实时翻译结果 · 一句一句（源语言：" + (src || "未知") +
+          " → 显示语言：" + (tgt || "未知") + "）";
+      } else if (src) {
+        text = "识别结果 · 一句一句（源语言：" + src + "）";
+      }
+    }
+    if (cap.textContent !== text) cap.textContent = text;
+    cap.classList.toggle("hidden", !text || !shown);
   },
 
   /**
@@ -4591,6 +4642,13 @@ const Qwen3Asr = {
     // ⚠️ **新的一批 ⇒ 句子流也清空** —— 句子序号从头数 ⇒ 上一批的句子
     // 不清的话会**接着**这一批往下画（两批混在一个框里）。
     this._sentClear(["asr-sentences"]);
+    // ⚠️⚠️ **新的一批 ⇒ 配音导出的结果面板也收起来**（2026-11-27）——
+    //    「配音导出有内容 ⇒ 藏掉实时结果」那条合并规则是**粘的**
+    //    （``_dub.hasRows`` 一直是 true）⇒ 不收的话，用户点「开始识别」
+    //    想看**新的**识别结果，实时结果框却**回不来**（一直被藏着）⇒
+    //    看着像「点了没反应」。
+    // ⇒ 收掉导出结果 ⇒ 实时结果框回来 ⇒ 两边也不再重复。
+    this._dubClearResult();
     // ⚠️ **翻译的单位** —— 视频 ⇒ 逐行；音频文件 ⇒ 逐句。
     //
     // ⚠️ 视频必须是「逐行」：字幕的显示单位是「行」，译文必须**逐行**跟着
@@ -5907,15 +5965,26 @@ const Qwen3Asr = {
    */
   _syncResultBoxes() {
     const interpHas = this._interp.segs.size > 0;
+    // ⚠️ **配音导出有内容 ⇒ 藏掉「实时结果」**（2026-11-27 用户要求）——
+    //    配音导出结果面板是**更完整**的版本（原文 + 译文 + **两种语言都
+    //    标出来了**）⇒ 两个都显示 ⇒ 同一批句子**显示两遍**。
+    // ⇒ 跟「同传有内容 ⇒ 藏掉实时结果」是**同一条合并规则**。
+    //
+    // ⚠️ **只藏「句子流」那一份**（文件来源）—— 视频来源的
+    //    ``#asr-transcript`` 是**跟播放头绑定**的字幕转写框（能上拉回看），
+    //    配音导出面板**替代不了**它 ⇒ 留着。
+    const dubHas = !!(this._dub && this._dub.hasRows);
     // 音频文件 · 句子流
     const sents = document.getElementById("asr-sentences");
     if (sents) {
-      sents.classList.toggle("hidden", this._source !== "file" || interpHas);
+      sents.classList.toggle("hidden",
+        this._source !== "file" || interpHas || dubHas);
     }
     // 麦克风 · 句子流
     const rtSents = document.getElementById("asr-rt-sentences");
     if (rtSents) {
-      rtSents.classList.toggle("hidden", this._isFileSource() || interpHas);
+      rtSents.classList.toggle("hidden",
+        this._isFileSource() || interpHas || dubHas);
     }
     // 视频 · 字幕文本（**它自己的规则**在 ``_renderTranscript`` 里）
     const tr = document.getElementById("asr-transcript");
@@ -5923,6 +5992,8 @@ const Qwen3Asr = {
       const isVideo = this._source === "video" && this._roundsSource === "video";
       tr.classList.toggle("hidden", !isVideo || interpHas);
     }
+    // ⚠️ 顶上那一行提示也跟着走（源语言 → 显示语言）。
+    this._syncLiveCap();
   },
 
   /**
@@ -6937,6 +7008,19 @@ const Qwen3Asr = {
     if (el) el.textContent = text || "";
   },
 
+  /** 收掉「配音导出结果」面板（⇒ 「实时结果」框回来）。 */
+  _dubClearResult() {
+    const box = document.getElementById("asr-dub-list");
+    const wrap = document.getElementById("asr-dub-out");
+    this._dub.hasRows = false;
+    if (wrap) wrap.classList.add("hidden");
+    if (box) {
+      if (box._rows) box._rows.clear();
+      while (box.firstChild) box.removeChild(box.firstChild);
+    }
+    this._syncResultBoxes();
+  },
+
   /**
    * 渲染「配音导出结果」—— 逐句**原文 / 译文**，并标清两种语言。
    *
@@ -6956,6 +7040,9 @@ const Qwen3Asr = {
     const wrap = document.getElementById("asr-dub-out");
     if (!box || !wrap) return;
     const list = sentences || [];
+    // ⚠️ **「有没有内容」要记在状态里** —— 结果框的显隐（合并规则：
+    //    「配音导出有内容 ⇒ 藏掉实时结果」）靠它。
+    this._dub.hasRows = list.length > 0;
     if (!list.length) {
       wrap.classList.add("hidden");
       // ⚠️ **DOM 也要清** —— 只清 ``box._rows``（那个 Map）的话，上一个
@@ -6963,11 +7050,12 @@ const Qwen3Asr = {
       //    **上一次的旧结果**（实测踩到）。
       if (box._rows) box._rows.clear();
       while (box.firstChild) box.removeChild(box.firstChild);
+      this._syncResultBoxes();
       return;
     }
     wrap.classList.remove("hidden");
 
-    const srcLang = this._dubSrcLangLabel(this._dub.sourceLang);
+    const srcLang = this._srcLangLabel(this._dub.sourceLang);
     const tgtLang = this._dubTgtLangLabel(this._dub.targetLang);
     const cap = document.getElementById("asr-dub-out-cap");
     if (cap) {
@@ -7006,6 +7094,8 @@ const Qwen3Asr = {
       box._rows.delete(i);
       if (row.parentNode) row.parentNode.removeChild(row);
     }
+    // ⚠️ **结果框的显隐跟着走** —— 「配音导出有内容 ⇒ 藏掉重复的实时结果」。
+    this._syncResultBoxes();
   },
 
   /** 一行的内容 = 「语言标签 + 文字」。 */

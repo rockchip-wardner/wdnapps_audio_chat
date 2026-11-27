@@ -457,6 +457,17 @@
               ``#asr-live-committed`` 读最终文本），由 CSS 隐藏。
             -->
             <div class="asr-live" id="asr-live">
+              <!--
+                这一行提示（2026-11-27 用户要求）—— 与「配音导出结果」面板
+                **同一个排法**：标清「源语言 → 显示语言」。
+
+                ⚠️ 原来这个框**只有句子、没有标题** ⇒ 用户得自己猜哪一行是
+                原文、哪一行是译文、译文是哪种语言 ⇒ 跟「配音导出结果」
+                那个带标题的面板放在一起时就更乱了 ⇒ 现在两处**同一个口径**。
+
+                ⚠️ **实时翻译关着** ⇒ 只标源语言（那一行就是原文，没有译文）。
+              -->
+              <div class="asr-live-cap hidden" id="asr-live-cap"></div>
               <span class="asr-live-committed" id="asr-live-committed"></span><span
                     class="asr-live-unfixed" id="asr-live-unfixed"></span>
               <!--

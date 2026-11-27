@@ -324,6 +324,23 @@ def main() -> int:
               btns["dubInRow"], "防回退")
         check("底部的「显示模式」下拉还在结果区那边", btns["ctrlHasMode"])
 
+        section("B6. 「实时结果」框顶上要有一行**语言提示**")
+        # ⚠️ **为什么要有这条**（2026-11-27 用户要求）——
+        #   「实时翻译」的结果框原来**只有句子、没有标题** ⇒ 用户得自己猜
+        #   哪行是原文、哪行是译文、译文是哪种语言 ⇒ 跟「配音导出结果」那个
+        #   带标题的面板并排时更乱 ⇒ 现在两处**同一个口径**（都标语言）。
+        cap_exist = page.evaluate(
+            """() => {
+                const c = document.getElementById('asr-live-cap');
+                const live = document.getElementById('asr-live');
+                return {
+                    exists: !!c,
+                    inLive: !!(c && live && live.contains(c)),
+                };
+            }""")
+        check("「实时结果」框顶上有一行语言提示的元素", cap_exist["exists"])
+        check("语言提示在「实时结果」框**里面**", cap_exist["inLive"])
+
         section("C. 填**设备端路径** ⇒ 「生成配音版」必须可点")
         page.fill("#asr-source", args.source)
         page.wait_for_timeout(800)
@@ -431,21 +448,48 @@ def main() -> int:
                   f"实际 = {r0['srcTag']!r}")
             check("译文那行标了**导出语言**", bool(r0["dstTag"]),
                   f"实际 = {r0['dstTag']!r}")
-            # ⚠️ **不能断言「两种语言一定不同」** —— 导出语言**可以**选成跟
-            #    源语一样（那是**透传**，译文本来就等于原文）⇒ 两个标签相同
-            #    是对的。⇒ 改成断言「译文那行的标签 = 「导出语言」下拉当前
-            #    选中项的文案」（下拉与面板必须说同一件事）。
-            sel_text = page.evaluate(
-                """() => {
-                    const s = document.getElementById('asr-dub-target');
-                    if (!s || !s.selectedOptions || !s.selectedOptions[0]) {
-                        return '';
-                    }
-                    return (s.selectedOptions[0].textContent || '').trim();
-                }""")
-            check("译文那行的标签 = 「导出语言」下拉当前选中的文案",
-                  bool(sel_text) and r0["dstTag"] == sel_text,
-                  f"标签={r0['dstTag']!r} 下拉={sel_text!r}")
+            # ⚠️ **不能拿「导出语言」下拉的当前选中项来比** —— 下拉是**下次**
+            #    作业的默认值（默认跟随「显示语言」⇒ 全局目标语言一变它就变），
+            #    而面板说的是**刚跑完那个作业**的语言 ⇒ 两者可以合法地不同。
+            # ⇒ 改成断言面板**内部自洽**：标题里的「导出语言」 == 每行译文
+            #    那个标签。
+            cap_tgt = ""
+            if "→ 导出语言：" in panel["cap"]:
+                cap_tgt = panel["cap"].split("→ 导出语言：", 1)[1]
+                cap_tgt = cap_tgt.rstrip("）").strip()
+            check("标题里的「导出语言」 = 译文那行的语言标签（面板内部自洽）",
+                  bool(cap_tgt) and cap_tgt == r0["dstTag"],
+                  f"标题={cap_tgt!r} 标签={r0['dstTag']!r}")
+
+        section("F3. 配音导出有内容 ⇒ 「实时结果」**不重复显示两遍**")
+        # ⚠️ **合并规则**（2026-11-27 用户要求）—— 有了「配音导出结果」面板，
+        #   它是**更完整**的版本（原文 + 译文 + **两种语言都标出来**）⇒
+        #   两个都显示 ⇒ 同一批句子在屏幕上**出现两遍** ⇒ 藏掉「实时结果」。
+        # ⇒ 跟「同传有内容 ⇒ 藏掉实时结果」是**同一条规则**。
+        merge = page.evaluate(
+            """() => {
+                const c = document.getElementById('asr-live-cap');
+                const s = document.getElementById('asr-sentences');
+                const d = document.getElementById('asr-dub-out');
+                const hid = (el) => !!el && el.classList.contains('hidden');
+                return {
+                    sentsHidden: hid(s),
+                    capHidden: hid(c),
+                    capText: c ? (c.textContent || '').trim() : '',
+                    dubVisible: !hid(d),
+                };
+            }""")
+        check("配音导出结果面板是显示的", merge["dubVisible"])
+        check("「实时结果」句子流被藏了（同一批句子不显示两遍）",
+              merge["sentsHidden"], f"隐藏={merge['sentsHidden']}")
+        # ⚠️ **提示行不能留「有标题、没内容」** ⇒ 它的显隐必须跟句子流一致。
+        check("语言提示的显隐跟句子流一致（不留有标题没内容的框）",
+              merge["capHidden"] == merge["sentsHidden"],
+              f"提示隐藏={merge['capHidden']} 句子流隐藏={merge['sentsHidden']}")
+        # ⚠️ 提示**内容**里要有语言 ⇒ 但实时翻译关着时只有「源语言」
+        #    （那一行就是原文，没有译文）⇒ 只钉「源语言」。
+        check("语言提示里标了「源语言」",
+              "源语言" in merge["capText"], f"实际 = {merge['capText']!r}")
 
         check("页面没有 JS 报错", not errors, "; ".join(errors[:3]))
         if bad_responses:
