@@ -85,13 +85,14 @@ class _Item:
     """队列里的一项：一句待译的话。"""
 
     __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at",
-                 "gen", "start_sec", "end_sec", "seq")
+                 "gen", "start_sec", "end_sec", "seq", "batch_id")
 
     def __init__(self, index: int, text: str, lang: str, stream_id: str,
                  loop: Any, enqueued_at: float, gen: int = 0,
                  start_sec: Optional[float] = None,
                  end_sec: Optional[float] = None,
-                 seq: Optional[int] = None):
+                 seq: Optional[int] = None,
+                 batch_id: str = ""):
         self.index = index
         self.text = text
         self.lang = lang
@@ -110,6 +111,10 @@ class _Item:
         #: **行级**翻译时前端给这一行编的序号（原样带回，前端据此对回
         #: 是哪一行）。句子级翻译没有这个（``None``）。
         self.seq = seq
+        #: **批次号**（= 识别请求号 rid）—— 用来把这一批的句子归到
+        #: 一起（见 :meth:`TranslationService.batch_results`）。
+        #: 实时（麦克风）路径没有这个（``""``）。
+        self.batch_id = batch_id
 
 
 class TranslationService:
@@ -146,6 +151,62 @@ class TranslationService:
         #: ⇒ 句级翻译的载荷正好三项都有（``source`` / ``text`` /
         #: ``start_sec`` / ``end_sec``）⇒ 直接旁听它最省事。
         self._result_listener: Optional[Any] = None
+        #: **批次缓存**（2026-11-27，配音导出复用识别结果用）。
+        #:
+        #: ``{批次号: [句结果, …]}`` —— 批次号 = 识别请求号（rid）。
+        #:
+        #: ⚠️ **为什么要有它**：配音导出（``dub.py``）需要「原文 + 译文 +
+        #: 时间」三项齐全的**整份**句子表。页面上那次识别**已经**把这三样
+        #: 都算出来了 ⇒ 再识别一遍就是**白烧一遍 NPU**。
+        #:
+        #: ⇒ 识别跑完时由 ASR 服务取走这一份（见
+        #: ``AsrManager._remember_file_result``）⇒ 导出直接复用。
+        self._batch_results: Dict[str, List[Dict[str, Any]]] = {}
+        #: 批次号 → 落地顺序（只留最近几批 ⇒ 内存有界）。
+        self._batch_order: List[str] = []
+
+    #: 批次缓存最多留几批。
+    _BATCH_CACHE_MAX = 4
+
+    # ------------------------------------------------------------------ #
+    # 批次缓存（配音导出复用识别结果）
+    # ------------------------------------------------------------------ #
+    def _remember(self, item: "_Item", status: str, text: str) -> None:
+        """把一句译文记进**批次缓存**。
+
+        ⚠️ **只有成功的句子才记** —— 失败/跳过的没有译文，导出会拿到空句。
+        """
+        if status != "done":
+            return
+        batch = str(item.batch_id or "")
+        if not batch:
+            return
+        with self._lock:
+            rows = self._batch_results.setdefault(batch, [])
+            rows.append({
+                "orig": item.text,
+                "trans": text,
+                "start_sec": item.start_sec,
+                "end_sec": item.end_sec,
+            })
+            if batch not in self._batch_order:
+                self._batch_order.append(batch)
+            while len(self._batch_order) > self._BATCH_CACHE_MAX:
+                old = self._batch_order.pop(0)
+                self._batch_results.pop(old, None)
+
+    def batch_results(self, batch_id: str) -> List[Dict[str, Any]]:
+        """取某个批次的全部句子结果（原文 / 译文 / 起止时间）。"""
+        with self._lock:
+            return [dict(r) for r in self._batch_results.get(str(batch_id or ""), [])]
+
+    def drop_batch(self, batch_id: str) -> None:
+        """丢掉一个批次的缓存。"""
+        with self._lock:
+            bid = str(batch_id or "")
+            self._batch_results.pop(bid, None)
+            if bid in self._batch_order:
+                self._batch_order.remove(bid)
 
     # ------------------------------------------------------------------ #
     # 结果观察者（配音导出）
@@ -230,7 +291,8 @@ class TranslationService:
     def submit(self, *, index: int, text: str, lang: str, stream_id: str,
                loop: Any, start_sec: Optional[float] = None,
                end_sec: Optional[float] = None,
-               seq: Optional[int] = None) -> None:
+               seq: Optional[int] = None,
+               batch_id: str = "") -> None:
         """送来一句待译的话。
 
         ``start_sec`` / ``end_sec`` —— 这句话的**音频时间范围**（可选）。
@@ -239,6 +301,10 @@ class TranslationService:
 
         ``seq`` —— **行级**翻译时前端给这一行编的序号（原样带回）。
         句子级翻译不传（``None``）。
+
+        ``batch_id`` —— **批次号**（= 识别请求号 rid）。文件 / 视频路径
+        传 ⇒ 这一批的句子会被**归到一起** ⇒ 识别跑完后可以整份取走
+        （配音导出**复用**这次识别，不重复识别一遍）。
 
         ⚠️ **绝不抛异常** —— 翻译出问题不许影响识别。
         """
@@ -249,7 +315,7 @@ class TranslationService:
             self._submitted += 1
             gen = self._gen
         item = _Item(index, text, lang, stream_id, loop, time.monotonic(),
-                     gen, start_sec, end_sec, seq)
+                     gen, start_sec, end_sec, seq, str(batch_id or ""))
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -400,6 +466,11 @@ class TranslationService:
                 self._failed += 1
 
         self._broadcast(item, status, text, reason, latency_ms)
+        # ⚠️ **批次缓存**（配音导出复用）—— 一句译文落地就记一笔，
+        # 带着**批次号**（= 识别请求号 rid）⇒ 识别跑完后 ASR 服务能把
+        # 「这一遍识别的全部句子（含译文 + 时间）」整份取走 ⇒ 配音导出
+        # **不用再识别一遍**。
+        self._remember(item, status, text)
         # ⚠️ **结果观察者**（配音导出）—— **在广播之后**调：观察者挂了
         # 也不该影响页面的实时译文。
         with self._lock:

@@ -2037,7 +2037,10 @@ TTS 比字幕慢」**根本没被修掉**。
    长度前缀恰好就是 `00 00 01 xx`** ⇒ 它把**没转换**的数据原样返回 ⇒ NAL
    边界错位 ⇒ MPP 只解出前几帧。
    实测：本卡 `preview.mp4` 用 SDK 的函数只解 **5/73 帧**，自带严格解析得
-   **71/73 帧** ⇒ `video_burn.py` **自带**严格转换（不改 SDK）。
+   **73/73 帧** ⇒ `video_burn.py` **自带**严格转换。
+   ✅ **2026-11-27：SDK 侧已修**（wdnav 仓 `e3050a0`，判据改成「严格解析
+   能不能吃干净」）⇒ 本卡片**仍保留自带的一份** —— 插件要兼容**已发布的
+   旧版 wdnav wheel** ⇒ 不能只依赖 SDK。
 
 2. **MPP 解码器一次只能持有一帧** —— 必须 `recv → numpy(fmt="bgr") →
    release` 立刻归还；输入缓冲满（`-1012`）时**先取帧再重试**。
@@ -2096,3 +2099,55 @@ cd /userdata/wdnwebui
 
 ⚠️ 真机端到端**必须打运行中的服务** —— 另起 Python 进程**够不到**进程内
 的算力注册表（`ComputeRegistry` 是进程内的）。
+
+## ⚠️ 配音导出**复用**页面那次识别（2026-11-27）
+
+### 问题
+
+「实时翻译」（页面那次识别）与「配音导出」**各跑一遍 ASR** ⇒ 同一份媒体
+被识别两次 ⇒ **白烧一遍 NPU**，导出还要再等一遍。
+
+### 做法：批次缓存 + 完成记录
+
+| 组件 | 职责 |
+|---|---|
+| `translation.py::TranslationService` | **批次缓存**：`_remember()` 把每条译文（原文 / 译文 / 起止时间）按**批次号**（= 识别请求号 rid）记下来；`batch_results(rid)` 取整批 |
+| `service.py::AsrManager` | **完成记录**：`transcribe_stream` 跑完（`STATE_DONE`）时记下「源路径 + rid」（`_remember_file_result`） |
+| `service.py::AsrManager.completed_file_result(path)` | 给导出查「这个源跑完了吗 / 是哪一批」 |
+| `api.py::post_translate_line` | **行级**翻译（视频来源，前端逐行来要）也带上**批次号**（= 当前 rid） |
+| `dub.py::DubEngine._reuse_page_result` | 导出时先查缓存 ⇒ 命中就**不识别** |
+
+⚠️ **只记「跑完了」，不记句子** —— 译文可能**比识别晚落地**（翻译队列是
+串行的；行级翻译更是**前端字幕推进时才送来**）⇒ 句子要**用的时候再去取**。
+
+⚠️ **批次号从哪来**：
+* 句子级（音频文件）⇒ 后端自己送翻译 ⇒ `batch_id = ctx["rid"]`；
+* 行级（视频）⇒ **前端**逐行来要 ⇒ `batch_id = 当前 rid`
+  （`AsrManager.current_request_id()`）。
+
+### ⚠️ 覆盖度检查（**关键**）
+
+复用**不一定覆盖整段**：
+
+* 行级翻译是**前端字幕推进到哪一行才送来哪一行** ⇒ 用户拖过进度条 /
+  只看了一半 ⇒ **中间缺一截**；
+* 句子级由后端整段送 ⇒ 覆盖是全的。
+
+⇒ 判据：**最后一句的结束时间 ≥ 源时长 × 0.9** ⇒ 不满足 ⇒ **退回自己
+识别一遍**（宁可慢，也不能让配音**缺内容**）。
+
+⚠️ 视频比的是**音轨时长**（句子的时间轴是音轨相对时间），音频比的是
+**文件时长**（`_media_duration_sec`，只读容器头不解码）。
+
+### ⚠️ 「没有译文 ⇒ 立刻放弃复用」
+
+行级模式下如果前端一行都没送来（用户没播过），翻译队列是空的 ⇒
+**再等也是白等** ⇒ 立刻退回自己识别（别让用户干等 60 秒）。
+
+### 回归
+
+```bash
+cd /userdata/wdnwebui
+.venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_export.py --no-npu   # 含 G1（批次缓存）
+.venv/bin/python .venv/src/wdnapps-audio-chat/scripts/verify_dub_export.py --http     # 含 G2（真机复用）
+```

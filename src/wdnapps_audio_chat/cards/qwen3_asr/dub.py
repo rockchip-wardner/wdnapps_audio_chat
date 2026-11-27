@@ -239,6 +239,31 @@ def split_audio_track(video: Path, out_wav: Path) -> Tuple[float, float]:
             pass
 
 
+def _media_duration_sec(path: Path) -> float:
+    """媒体的**时长**（秒）—— 只读容器头，不解码。
+
+    ⚠️ 用它做「复用的结果覆盖了整段吗」的判据（见
+    :meth:`DubEngine._reuse_page_result`）。
+    """
+    try:
+        import av
+        c = av.open(str(path), timeout=(5.0, 10.0))
+        try:
+            dur = float(c.duration or 0.0) / 1_000_000.0
+            if dur > 0:
+                return dur
+            # 有些容器没有 duration ⇒ 用最长那条流
+            best = 0.0
+            for st in c.streams:
+                if st.duration and st.time_base:
+                    best = max(best, float(st.duration) * float(st.time_base))
+            return best
+        finally:
+            c.close()
+    except Exception:  # noqa: BLE001 — 读不到时长就当没有（不拦复用）
+        return 0.0
+
+
 def _trim_silence(arr, rate: int, thresh_db: float = -45.0,
                   margin_ms: int = 25):
     """裁掉一段 TTS 音频**首尾**的静音。
@@ -461,15 +486,30 @@ class DubEngine:
             # ---------- ① 视频：先拆音轨 -------------------------------- #
             asr_source = src
             origin_sec = 0.0
+            track_dur = 0.0
             if job.kind == "video":
                 self._set_phase(job, "拆音轨", 0.02)
                 audio_wav = tmp_dir / "track.wav"
-                origin_sec, _dur = split_audio_track(src, audio_wav)
+                origin_sec, track_dur = split_audio_track(src, audio_wav)
                 asr_source = audio_wav
 
             # ---------- ② ASR + 翻译 ------------------------------------ #
-            self._set_phase(job, "识别中", 0.05)
-            sentences = self._run_asr(job, asr_source)
+            # ⚠️ **优先复用页面上已经跑过的那次识别** —— 同一个源文件、
+            # 从头跑到尾、还带译文 ⇒ 直接拿它的句子 ⇒ **不用再识别一遍**
+            # （省一遍 NPU + 一遍等待）。
+            #
+            # ⚠️ **视频用「音轨时长」**（句子的时间轴是音轨相对时间），
+            # **音频用「文件时长」**。
+            if job.kind == "video":
+                _dur = track_dur
+            else:
+                _dur = _media_duration_sec(src)
+            sentences = self._reuse_page_result(job, src, _dur)
+            if sentences:
+                self._set_phase(job, "复用识别结果", 0.05)
+            else:
+                self._set_phase(job, "识别中", 0.05)
+                sentences = self._run_asr(job, asr_source)
             if not sentences:
                 raise RuntimeError(
                     "没有识别出任何能翻译的句子（翻译模型没起来？源文件有声音吗？）")
@@ -637,6 +677,112 @@ class DubEngine:
             if s.end_sec <= s.start_sec:
                 s.end_sec = s.start_sec + _MIN_CUE_SEC
             out.append(s)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # 复用页面上已经跑过的那次识别
+    # ------------------------------------------------------------------ #
+    def _reuse_page_result(self, job: DubJob, src: Path,
+                           duration_sec: float = 0.0) -> List[DubSentence]:
+        """复用页面上**已经跑完**的那次识别 ⇒ **不用再识别一遍**。
+
+        ⚠️ **什么时候能复用**：
+
+        * ASR 服务记下了「这个源文件从头跑到尾了」（``completed_file_result``）
+          —— 拖过进度条的那一遍**不算**（只覆盖了一部分）；
+        * 这一批的**译文已经落地**（翻译队列排空）。
+
+        ⚠️ **复用不了就返回空** ⇒ 调用方退回「自己再识别一遍」。
+
+        ⚠️ **句子的时间轴是「音轨相对」** —— 与自己识别一遍得到的**完全
+        同口径**（页面那次识别的输入也是同一条音轨）⇒ 字幕/配音的落位
+        不用改。
+        """
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.service import (
+                get_asr_service,
+            )
+            from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+                get_translation_service,
+            )
+            svc = get_asr_service()
+            rec = svc.completed_file_result(str(src))
+            if not rec:
+                return []
+            rid = str(rec.get("request_id") or "")
+            tr = get_translation_service()
+
+            # ⚠️ **等译文落地** —— 页面那次识别的译文可能**还在飞**
+            # （翻译队列是串行的，识别跑完时译文未必全到；行级翻译更是
+            # **前端字幕推进时才送来**）。
+            #
+            # ⚠️ **队列是空的 ⇒ 不会有译文了**（行级模式下前端根本没送来
+            # 行译文）⇒ **立刻放弃复用** ⇒ 退回自己识别（别让用户干等）。
+            rows: List[Dict[str, Any]] = tr.batch_results(rid)
+            if not rows and tr.queue_depth() == 0:
+                LOG.info("dub: 这次识别没有可用的译文 ⇒ 自己再识别一遍")
+                return []
+            deadline = time.time() + 60.0
+            quiet_since = 0.0
+            while time.time() < deadline:
+                rows = tr.batch_results(rid)
+                if rows and tr.queue_depth() == 0:
+                    if not quiet_since:
+                        quiet_since = time.time()
+                    elif (time.time() - quiet_since) > 1.5:
+                        break
+                else:
+                    quiet_since = 0.0
+                if self._cancelled():
+                    raise RuntimeError("用户取消了")
+                time.sleep(0.25)
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — 复用是 best-effort
+            LOG.debug("dub: 复用识别结果失败（退回自己识别）: %s", exc)
+            return []
+
+        out: List[DubSentence] = []
+        for r in rows:
+            orig = str(r.get("orig") or "").strip()
+            trans = str(r.get("trans") or "").strip()
+            if not orig or not trans:
+                continue
+            try:
+                st = float(r.get("start_sec"))
+                en = float(r.get("end_sec"))
+            except (TypeError, ValueError):
+                continue
+            if st < 0:
+                continue
+            if en <= st:
+                en = st + _MIN_CUE_SEC
+            out.append(DubSentence(orig=orig, trans=trans,
+                                   start_sec=st, end_sec=en))
+        if not out:
+            return []
+        # ⚠️⚠️ **覆盖度检查** —— 页面那次识别的句子**不一定覆盖整段**：
+        #
+        # * **行级翻译**（视频来源）是**前端字幕推进到哪一行才送来哪一行**
+        #   ⇒ 用户拖过进度条 / 只看了一半 ⇒ **中间缺一截** ⇒ 复用会让
+        #   导出的配音**缺内容**、字幕**缺行**。
+        # * 句子级（音频文件）由**后端**整段送 ⇒ 覆盖是全的。
+        #
+        # ⇒ 判据：**最后一句的结束时间**要接近源时长（留 10% 余量）。
+        # ⇒ 不满足 ⇒ **退回自己识别一遍**（宁可慢，也不能缺内容）。
+        if duration_sec and duration_sec > 0:
+            covered = max(s.end_sec for s in out)
+            if covered < duration_sec * 0.9:
+                LOG.info(
+                    "dub: 复用结果只覆盖了 %.1fs / %.1fs ⇒ 自己再识别一遍",
+                    covered, duration_sec)
+                return []
+        # ⚠️ **按时间排一遍** —— 行级翻译（视频来源）是前端**按字幕推进**
+        # 逐行送来的，顺序理论上有保证，但排一次更稳。
+        out.sort(key=lambda s: s.start_sec)
+        job.warnings.append(
+            "复用了页面上那次识别的结果（{} 句，没有重新识别）".format(len(out)))
+        LOG.info("dub: 复用识别结果 %d 句（源 %s）", len(out), src.name)
         return out
 
     # ------------------------------------------------------------------ #

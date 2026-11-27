@@ -162,8 +162,13 @@ def part_b() -> None:
     check("样本造得对（前缀 = 00 00 01 63）", sample[:4] == b"\x00\x00\x01\x63")
     check("样本长度自洽", len(sample) == 4 + nal_len)
     sdk_out = sdk_avcc_to_annexb(sample)
-    check("SDK 的函数会误判（原样返回 AVCC）", sdk_out == sample,
-          "SDK 行为变了 ⇒ 本模块的说明要跟着改")
+    # ⚠️ **2026-11-27：SDK 的这个 bug 已修**（wdnav 仓）—— 旧实现用
+    # 「开头像不像起始码」当判据 ⇒ MP4 的 AVCC 长度前缀恰好是
+    # ``00 00 01 xx`` ⇒ 误判成 Annex-B ⇒ 只解出 5/73 帧。
+    # 现在是「严格解析能不能吃干净」⇒ 与本模块的实现一致。
+    check("SDK 的函数能正确转换（wdnav 已修：严格 AVCC 解析）",
+          sdk_out == b"\x00\x00\x00\x01" + payload,
+          f"SDK 行为变了 ⇒ 本模块的说明要跟着改：{sdk_out[:12].hex()}")
     ours = avcc_to_annexb(sample)
     check("本模块的函数正确转成 Annex-B",
           ours == b"\x00\x00\x00\x01" + payload, f"得到 {ours[:12].hex()}")
@@ -178,6 +183,8 @@ def part_b() -> None:
     check("to_annexb：认不出的返回空串",
           to_annexb(b"\xff\xff\xff\xffxx") == b"")
     check("Annex-B 判定：认得起始码", _is_annexb(annexb_in))
+    check("本模块与 SDK 的转换结果一致（同一份严格实现）",
+          to_annexb(sample) == sdk_avcc_to_annexb(sample))
     check("Annex-B 判定：AVCC 的 00 00 01 前缀也会被误判（所以不能当判据）",
           _is_annexb(sample))
 
@@ -302,6 +309,106 @@ def part_f() -> None:
     check("mux：丢掉时间戳倒序的帧",
           "pts90 <= result.last_pts90" in src)
     check("mux：送 EOS 冲尾帧（否则片尾丢帧）", "eos=True" in src)
+
+
+
+# --------------------------------------------------------------------------- #
+# G. 复用：配音导出**不再识别一遍**（纯逻辑 + 真机）
+# --------------------------------------------------------------------------- #
+def part_g_logic() -> None:
+    section("G1. 复用：批次缓存（原文 + 译文 + 时间）")
+    from wdnapps_audio_chat.cards.qwen3_asr.translation import (
+        TranslationService, _Item,
+    )
+
+    svc = TranslationService()
+    item = _Item(index=1, text="Hello there.", lang="en", stream_id="file-1",
+                 loop=None, enqueued_at=0.0, start_sec=1.0, end_sec=2.5,
+                 batch_id="42")
+    svc._remember(item, "done", "你好啊")
+    rows = svc.batch_results("42")
+    check("批次缓存：记下了这一句", len(rows) == 1, f"得到 {rows}")
+    if rows:
+        check("批次缓存：原文/译文/时间都在",
+              rows[0].get("orig") == "Hello there."
+              and rows[0].get("trans") == "你好啊"
+              and rows[0].get("start_sec") == 1.0
+              and rows[0].get("end_sec") == 2.5, f"得到 {rows[0]}")
+    # 失败的句子**不记**（没译文，导出会拿到空句）
+    svc._remember(item, "failed", "")
+    check("批次缓存：失败的句子不记", len(svc.batch_results("42")) == 1)
+    # 没有批次号的（实时麦克风路径）不记
+    item2 = _Item(index=2, text="x", lang="en", stream_id="live-1", loop=None,
+                  enqueued_at=0.0, batch_id="")
+    svc._remember(item2, "done", "y")
+    check("批次缓存：没有批次号的不记", svc.batch_results("") == [])
+    svc.drop_batch("42")
+    check("批次缓存：可以丢掉一批", svc.batch_results("42") == [])
+
+
+def part_g_http(base: str) -> None:
+    section("G2. 复用：真机 —— 先识别、再导出 ⇒ 导出**不重新识别**")
+    src = "/userdata/assets/uploads/asr_en.wav"
+    if not Path(src).is_file():
+        check("源音频存在（%s）" % src, False, "找不到测试素材")
+        return
+
+    _api("POST", "/api/qwen3-asr/translate/settings",
+         {"enabled": True, "target_lang": "zh-CN"})
+
+    # ① 页面式识别（句级翻译 ⇒ 后端整段送译文）
+    code, d = _api("POST", "/api/qwen3-asr/transcribe", base=base,
+                   timeout=60) if False else (0, None)
+    # 上面的接口是 multipart ⇒ 单独走 urllib
+    try:
+        from urllib import request as _rq
+        boundary = "----wdnverify%d" % int(time.time())
+        body = b""
+        for k, v in (("path", src), ("translate_mode", "sentence")):
+            body += ("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                     % (boundary, k, v)).encode()
+        body += ("--%s--\r\n" % boundary).encode()
+        req = _rq.Request(base + "/api/qwen3-asr/transcribe", data=body,
+                          headers={"Content-Type":
+                                   "multipart/form-data; boundary=" + boundary},
+                          method="POST")
+        with _rq.urlopen(req, timeout=60, context=_CTX) as r:
+            code, d = r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        check("发起识别", False, str(exc))
+        return
+    check("识别已发起", code == 200 and isinstance(d, dict), f"得到 {code}")
+
+    # ② 等识别跑完
+    deadline = time.time() + 600
+    st = {}
+    while time.time() < deadline:
+        st = _api("GET", "/api/qwen3-asr/", base=base)[1] or {}
+        if isinstance(st, dict) and st.get("state") == "done":
+            break
+        time.sleep(3)
+    check("识别跑完了", st.get("state") == "done", f"state={st.get('state')}")
+    rounds = st.get("round_count") or 0
+    check("识别出了轮次", rounds > 0, f"round_count={rounds}")
+
+    # ③ 导出 ⇒ **应当复用**
+    code, d = _api("POST", "/api/qwen3-asr/dub/start",
+                   {"kind": "audio", "path": src, "target_lang": "zh-CN",
+                    "ref_speaker": "news_female"}, base=base, timeout=60)
+    check("导出作业已受理", code == 200 and isinstance(d, dict), f"得到 {code}")
+    job = _wait_job(base, limit=1800)
+    check("导出作业成功", job.get("state") == "done",
+          f"state={job.get('state')} err={job.get('error')}")
+    warns = " | ".join(job.get("warnings") or [])
+    check("导出**复用了**页面上那次识别（没有重新识别）",
+          "复用" in warns, f"warnings={warns!r}")
+    sents = job.get("sentences") or []
+    check("复用到的句子带原文 + 译文 + 时间",
+          bool(sents) and all(s.get("orig") and s.get("trans")
+                              for s in sents), f"得到 {len(sents)} 句")
+    audio = job.get("audio_path") or ""
+    check("产物落在源文件同级目录",
+          bool(audio) and Path(audio).parent == Path(src).parent, audio)
 
 
 # --------------------------------------------------------------------------- #
@@ -464,9 +571,11 @@ def main() -> int:
     part_b()
     part_e()
     part_f()
+    part_g_logic()
     if args.http:
         part_c(args.base)
         part_d(args.base)
+        part_g_http(args.base)
     else:
         print("\n（真机端到端没跑：加 --http）")
     print("\n\033[1m结果\033[0m: 通过 %d，失败 %d" % (_OK, len(_FAIL)))

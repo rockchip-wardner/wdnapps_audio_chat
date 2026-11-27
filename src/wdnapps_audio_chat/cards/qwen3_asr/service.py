@@ -1299,6 +1299,18 @@ class _AsrManager:
         #: 轮次是哪一路来的，靠当前页签猜就会把「音频文件」的轮次画到视频
         #: 画面上（U15 那个「切来源串台」的坑）。后端是唯一知道真相的地方。
         self._rounds_source: Dict[str, Any] = {}
+        #: **最近一次「完整跑完」的文件识别**（配音导出复用）。
+        #:
+        #: ``{"path": 源路径, "request_id": rid, "completed_at": 时间戳}``
+        #:
+        #: ⚠️ 这里只记「**谁**跑完了、跑的哪个源」；**句子本身**去翻译
+        #: 服务按 ``request_id`` 取（见 ``TranslationService.batch_results``）
+        #: —— 因为译文可能**比识别晚落地**（翻译队列）⇒ 在识别收尾那一刻
+        #: 拍快照会**拍不全**。
+        #:
+        #: ⚠️ **只在「从头跑到尾」时写**（见 :meth:`_remember_file_result`）
+        #: ⇒ 拖过进度条的那一遍不会被当成完整结果。
+        self._last_file_result: Dict[str, Any] = {}
         #: 上一次停止的**发起方**（``user`` / ``internal``）—— 见
         #: :meth:`stop`。前端据此决定「画面要不要跟着停」。
         self._stop_reason: str = ""
@@ -1561,6 +1573,60 @@ class _AsrManager:
         """
         with self._lock:
             return [dict(s) for s in self._sent_log]
+
+    # ------------------------------------------------------------------ #
+    # 文件识别的结果缓存（配音导出复用）
+    # ------------------------------------------------------------------ #
+    def current_request_id(self) -> int:
+        """当前识别请求号（rid）—— 行级翻译归批次用。
+
+        ⚠️ **没有请求时是 0**（不是 None）⇒ 调用方不用判空。
+        """
+        with self._lock:
+            return int(self._current_request_id or 0)
+
+    def completed_file_result(self, path: str) -> Dict[str, Any]:
+        """「某个源文件最近一次**完整**识别」的完成记录。
+
+        ⚠️ **只有源路径完全一致才给** —— 否则导出会拿别的文件的句子。
+
+        返回 ``{"path":…, "request_id": rid, "completed_at":…}``；
+        句子本身用 ``TranslationService.batch_results(rid)`` 取。
+        """
+        want = str(path or "")
+        with self._lock:
+            rec = dict(self._last_file_result)
+        if not want or str(rec.get("path") or "") != want:
+            return {}
+        return rec
+
+    def _remember_file_result(self, rid: int, path: str,
+                              start_sec: float) -> None:
+        """记下「这次识别跑完了、跑的是哪个源」。
+
+        ⇒ 配音导出（``dub.py``）用它去翻译服务取这批句子 ⇒ **不用再
+        识别一遍**（省一遍 NPU，也省一遍等待）。
+
+        ⚠️ **只在「从头跑到尾」的会话上记**：
+
+        * ``start_sec > 0`` ⇒ 用户**拖过进度条** ⇒ 这一遍只覆盖了源的
+          一部分 ⇒ 复用会让导出的字幕**缺一截** ⇒ 不记。
+
+        ⚠️ **这里只记「跑完了」，不记句子** —— 译文可能**比识别晚落地**
+        （翻译队列是串行的；行级翻译更是**前端字幕推进时才送来**）⇒
+        句子要**用的时候再去取**（``TranslationService.batch_results``）。
+        """
+        want = str(path or "")
+        if not want or float(start_sec or 0.0) > 0.0:
+            return
+        with self._lock:
+            self._last_file_result = {
+                "path": want,
+                "request_id": int(rid),
+                "completed_at": time.time(),
+            }
+        _LOG.info("asr: 记住这次识别（源 %s，rid=%s，配音导出可复用）",
+                  want, rid)
 
     def _set_state(self, state: str, *, error: str = "") -> None:
         with self._lock:
@@ -2033,6 +2099,9 @@ class _AsrManager:
                 lang=self._media_language(text),
                 stream_id=str(ctx["stream_id"]),
                 loop=ctx.get("loop"),
+                # ⚠️ **批次号 = rid** —— 这一批的句子会被归到一起 ⇒
+                # 识别跑完时整份取走 ⇒ 配音导出**复用**这次识别。
+                batch_id=str(ctx.get("rid") or ""),
                 # ⚠️ **时间**是给「画面字幕显示双语」用的：前端要靠它把
                 # 译文挂到对应的字幕行上（按时间重叠匹配）。
                 start_sec=start_sec,
@@ -2455,6 +2524,14 @@ class _AsrManager:
                 "epoch_errors": result.get("epoch_errors", 0),
             }
             self._set_state(self.STATE_DONE)
+        # ⚠️ **记住这次识别的句级结果**（配音导出**复用**，不重识别一遍）——
+        # 只在「跑完了」的路径上记（拖过进度条的那一遍不记）。
+        try:
+            with self._lock:
+                _src_path = str((self._rounds_source or {}).get("path") or "")
+            self._remember_file_result(rid, _src_path, float(start_sec or 0.0))
+        except Exception as exc:  # noqa: BLE001 — 缓存是 best-effort
+            _LOG.debug("记住文件识别结果失败（best-effort）: %s", exc)
         # 收尾时切出来的**最后一句**（没有下一帧可以搭便车了）—— 跟着
         # ``done`` 帧发给前端，否则那句话永远不出现。
         #

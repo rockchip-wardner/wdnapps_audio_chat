@@ -808,12 +808,21 @@ async def post_translate_line(payload: TranslateLinePayload) -> dict:
             "skipped": "翻译没开",
             "enabled": False,
         }
+    # ⚠️ **批次号 = 当前识别请求号** —— 行级翻译（视频来源）也是
+    # 「这次识别的一部分」⇒ 配音导出**复用**它 ⇒ 不用再识别一遍。
+    _rid = 0
+    try:
+        from wdnapps_audio_chat.cards.qwen3_asr.service import get_asr_service
+        _rid = int(get_asr_service().current_request_id() or 0)
+    except Exception:  # noqa: BLE001 — 取不到就当没有批次
+        _rid = 0
     svc.submit(
         index=_TR_LINE_INDEX_BASE + seq,
         text=payload.text,
         lang=lang,
         stream_id="line",
         loop=asyncio.get_running_loop(),
+        batch_id=str(_rid or ""),
         start_sec=payload.start_sec,
         end_sec=payload.end_sec,
         seq=seq,
