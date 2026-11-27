@@ -86,7 +86,7 @@ class _Item:
 
     __slots__ = ("index", "text", "lang", "stream_id", "loop", "enqueued_at",
                  "gen", "start_sec", "end_sec", "seq", "batch_id", "target_lang",
-                 "strict_target")
+                 "strict_target", "force")
 
     def __init__(self, index: int, text: str, lang: str, stream_id: str,
                  loop: Any, enqueued_at: float, gen: int = 0,
@@ -95,7 +95,8 @@ class _Item:
                  seq: Optional[int] = None,
                  batch_id: str = "",
                  target_lang: str = "",
-                 strict_target: bool = False):
+                 strict_target: bool = False,
+                 force: bool = False):
         self.index = index
         self.text = text
         self.lang = lang
@@ -130,6 +131,10 @@ class _Item:
         #: **必须**用它，不能被「页面改了全局目标语言」带偏；
         #: 没指定（页面那条路）⇒ 维持老行为（用处理时的全局值）。
         self.strict_target = bool(strict_target)
+        #: **不受全局「实时翻译」开关管** —— 这是**另一个功能**（配音导出）
+        #: 在用它 ⇒ 它自己带目标语言、自己要翻 ⇒ 不该把页面上那个开关顶开
+        #: （用户实测：点「生成配音版」⇒「实时翻译」自己开了）。
+        self.force = bool(force)
 
 
 class TranslationService:
@@ -320,7 +325,8 @@ class TranslationService:
                end_sec: Optional[float] = None,
                seq: Optional[int] = None,
                batch_id: str = "",
-               target_lang: str = "") -> None:
+               target_lang: str = "",
+               force: bool = False) -> None:
         """送来一句待译的话。
 
         ``start_sec`` / ``end_sec`` —— 这句话的**音频时间范围**（可选）。
@@ -339,11 +345,21 @@ class TranslationService:
         是**单例**、目标语言是**全局**的 ⇒ 页面改了下拉就会把正在跑的
         导出带偏（「导出选英文、出来的却是中文」）。
 
+        ``force`` —— **不受全局「实时翻译」开关管**。
+        ⚠️ 配音导出那一批传它 ⇒ 导出**自己**翻 ⇒ **不用**去动页面上的
+        那个开关（用户实测：点「生成配音版」⇒「实时翻译」自己开了 ⇒
+        页面上的译文和导出要的又不是一回事）。
+        ⚠️ **别拿它当「无视一切」的万能参数** —— 只给「自带目标语言的
+        那一批」用（配音导出）。
+
         ⚠️ **绝不抛异常** —— 翻译出问题不许影响识别。
         """
         text = (text or "").strip()
         with self._lock:
-            if not self._enabled or not text:
+            # ⚠️ **force（配音导出那一批）不受全局开关管** —— 它是**另一个
+            #    功能**在用 ⇒ 页面上那个「实时翻译」开关该不该开，是**用户**
+            #    的事 ⇒ 导出不能替他开。
+            if not (self._enabled or force) or not text:
                 return
             self._submitted += 1
             gen = self._gen
@@ -353,7 +369,7 @@ class TranslationService:
             tgt_lang = _want or str(self._target_lang or "")
         item = _Item(index, text, lang, stream_id, loop, time.monotonic(),
                      gen, start_sec, end_sec, seq, str(batch_id or ""),
-                     tgt_lang, bool(_want))
+                     tgt_lang, bool(_want), bool(force))
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -593,13 +609,27 @@ class TranslationService:
     # 清理
     # ------------------------------------------------------------------ #
     def _drain(self) -> None:
-        """丢掉队列里排着的句子。"""
+        """丢掉队列里排着的句子。
+
+        ⚠️ **配音导出那一批（``force``）不丢** —— 它是**另一个功能**在用
+        （用户点「生成配音版」⇒ 导出要拿到自己的译文）⇒ 页面用户关掉
+        自己的「实时翻译」/ 离开页面把队列清了，都**不该**把导出搞死。
+        """
+        keep: List[Any] = []
         while True:
             try:
-                self._queue.get_nowait()
+                item = self._queue.get_nowait()
                 self._queue.task_done()
+                if getattr(item, "force", False):
+                    keep.append(item)
             except queue.Empty:
-                return
+                break
+        for item in keep:
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                with self._lock:
+                    self._dropped += 1
 
     def drain(self) -> None:
         """丢掉队列里排着的句子（**公开**接口）。

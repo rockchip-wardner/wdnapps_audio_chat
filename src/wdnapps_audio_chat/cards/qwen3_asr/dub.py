@@ -75,6 +75,12 @@ DUB_KINDS = ("audio", "video")
 #: 一条字幕最短显示时长（秒）—— 太短会一闪而过。
 _MIN_CUE_SEC = 0.6
 
+#: **等页面上正在跑的识别**最多等多久（秒）。
+#: ⚠️ 以前是**直接掐断**它 ⇒ 页面上的「实时结果」停在半截（用户实测）⇒
+#:    现在改成等它跑完 ⇒ 页面上的结果是**完整的**。
+#: ⇒ 超时了只能停掉（不然导出永远进不去）⇒ 那时在 ``warnings`` 里说清楚。
+_DUB_WAIT_PAGE_ASR_SEC = 1800.0
+
 #: 文件名里不安全的字符（换掉，别让用户拿到一个建不出来的路径）。
 _UNSAFE_NAME = re.compile(r"[^\w一-鿿.\-]+")
 
@@ -351,18 +357,17 @@ class DubEngine:
             )
             self._job = job
 
-        # ① 停掉正在跑的识别（ASR 是单例）
-        try:
-            from wdnapps_audio_chat.cards.qwen3_asr.service import (
-                get_asr_service,
-            )
-            svc = get_asr_service()
-            if svc.snapshot().get("busy"):
-                svc.stop(reason="dub")
-        except Exception as exc:  # noqa: BLE001
-            LOG.debug("dub: 停旧识别失败（best-effort）: %s", exc)
+        # ① **不要停掉页面上正在跑的识别** —— 见 :meth:`_wait_for_page_asr`。
+        #    （以前这里是 ``svc.stop(reason="dub")`` ⇒ 用户自己的识别被**掐断**
+        #    ⇒ 页面上的「实时结果」停在**半截** ⇒ 用户报「实时结果只显示了
+        #    一部分」⇒ 现在改成**等**它跑完。）
+        #
+        # ⚠️ ASR 是**单例** ⇒ 导出自己那条流必须等它让出来 —— 等待放在
+        #    作业线程里（`_wait_for_page_asr`），**不挡**这里（页面能立刻
+        #    拿到作业号、看到「等页面上的识别跑完」这个阶段）。
 
-        # ② 起翻译模型 + 设目标语言
+        # ② 起翻译模型（**不动页面的开关和目标语言** ——
+        #    见 :meth:`_ensure_translation`）
         try:
             self._ensure_translation(job)
         except Exception as exc:  # noqa: BLE001
@@ -439,10 +444,18 @@ class DubEngine:
         return self._cancel.is_set()
 
     def _ensure_translation(self, job: DubJob) -> None:
-        """把翻译模型拉起来 + 把目标语言设好 + 打开翻译开关。
+        """把翻译模型拉起来（**不动页面的开关和目标语言**）。
 
         ⚠️ ``ensure()`` 是**慢操作**（要等模型加载完，~30 s）⇒ 起作业前
         就做掉，别让作业跑起来才发现没翻译。
+
+        ⚠️⚠️ **绝不能** ``configure(enabled=True, target_lang=...)`` ——
+        翻译服务是**单例**，「开关」和「目标语言」都是**全局**的 ⇒ 那样会
+        把页面上「实时翻译」的开关**顶开**、把「显示语言」改成导出要的那个
+        （用户实测：点「生成配音版」⇒「实时翻译」自己开了、显示语言也变了）。
+
+        ⇒ 导出那一批**自带目标语言**（``strict_target``）⇒ 它自己会翻
+        ⇒ **不需要**动全局。
         """
         from app.core.translate.npu_manager import get_npu_translate_instances
 
@@ -450,11 +463,53 @@ class DubEngine:
         status = mgr.status()
         if not status.get("running"):
             mgr.ensure()
-        from wdnapps_audio_chat.cards.qwen3_asr.translation import (
-            get_translation_service,
-        )
-        get_translation_service().configure(enabled=True,
-                                           target_lang=job.target_lang)
+
+    def _wait_for_page_asr(self, job: DubJob) -> None:
+        """等**页面上正在跑的识别**跑完（**不打断它**）。
+
+        ⚠️ **为什么不能直接停掉它**（2026-11-27 用户实测）：点「生成配音版」
+        会把用户自己的识别**掐断** ⇒ 页面上「实时结果」就停在**半截**
+        （用户报：「『实时结果』只显示了一部分」）⇒ 用户要的明明是**完整
+        的全部结果**。
+
+        ⚠️ ASR 是**单例** ⇒ 导出自己那条流**必须**等它让出来。
+
+        ⇒ 这里**等**（有超时）⇒ 用户的识别跑完 ⇒ 导出**复用**它的结果
+        ⇒ 页面上的结果完整、导出的文件也完整。
+
+        ⚠️ **只等「文件路径」的识别**（``file_busy()``）—— 麦克风那种
+        **实时**会话在**另一个服务**里（``get_live_asr_service``）⇒ 不占
+        这个单例 ⇒ 不用等。
+        """
+        try:
+            from wdnapps_audio_chat.cards.qwen3_asr.service import (
+                get_asr_service,
+            )
+            svc = get_asr_service()
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("dub: 取 ASR 服务失败（best-effort）: %s", exc)
+            return
+        if not svc.file_busy():
+            return
+        self._set_phase(job, "等页面上的识别跑完", 0.02)
+        LOG.info("dub: 页面上的识别还在跑 ⇒ 等它跑完（不打断它）")
+        deadline = time.time() + _DUB_WAIT_PAGE_ASR_SEC
+        while time.time() < deadline:
+            if self._cancelled():
+                raise RuntimeError("用户取消了")
+            if not svc.file_busy():
+                return
+            time.sleep(0.5)
+        # ⚠️ 超时 ⇒ 只能停掉它（否则导出永远进不去）⇒ 说清楚。
+        LOG.warning("dub: 等页面上的识别超时（%.0f s）⇒ 停掉它",
+                    _DUB_WAIT_PAGE_ASR_SEC)
+        job.warnings.append(
+            "页面上的识别等了 {:.0f} 秒还没跑完 ⇒ 已停掉它，"
+            "导出自己重新识别了一遍".format(_DUB_WAIT_PAGE_ASR_SEC))
+        try:
+            svc.stop(reason="dub-timeout")
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("dub: 停旧识别失败（best-effort）: %s", exc)
 
     def _ensure_tts(self) -> None:
         """确保本机有一个跑着的 TTS 实例（**后台**，不挡）。
@@ -480,6 +535,10 @@ class DubEngine:
     def _run(self, job: DubJob) -> None:
         tmp_dir = None
         try:
+            # ---------- ⓪ 等页面上正在跑的识别跑完 ----------------------- #
+            # ⚠️ **不能掐断它**（用户实测：「实时结果只显示了一部分」）。
+            self._wait_for_page_asr(job)
+
             tmp_dir = Path(tempfile.mkdtemp(prefix="qwen3-dub-"))
             src = Path(job.source_path)
 

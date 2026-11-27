@@ -2089,9 +2089,16 @@ class _AsrManager:
                 get_translation_service,
             )
             svc = get_translation_service()
+            # ⚠️ **自带目标语言的那一批 = 配音导出那一批** ⇒ 它**自己**翻
+            # ⇒ 不受页面上的「实时翻译」开关管（用户实测：点「生成配音版」
+            # ⇒「实时翻译」自己开了 ⇒ 页面上的译文和导出要的又不是一回事）。
+            #
+            # ⇒ **只有**这一批绕过开关；页面那条路（没有 target_lang）仍然
+            #    老老实实看开关。
+            _forced = bool(str(ctx.get("target_lang") or "").strip())
             # ⚠️ **开关没开 ⇒ 根本不会进队列**（``translation.py`` 的
             # ``submit`` 直接返回）⇒ 别让前端以为「正在翻译」。
-            if not svc.settings().get("enabled"):
+            if not _forced and not svc.settings().get("enabled"):
                 return False
             svc.submit(
                 index=int(ctx["base"]) + int(seq),
@@ -2105,6 +2112,8 @@ class _AsrManager:
                 # ⚠️ **这一批要翻成的语言**（配音导出显式指定 ⇒ 不受
                 # 「页面改了全局目标语言」影响）。
                 target_lang=str(ctx.get("target_lang") or ""),
+                # ⚠️ **不受全局开关管**（见上）。
+                force=_forced,
                 # ⚠️ **时间**是给「画面字幕显示双语」用的：前端要靠它把
                 # 译文挂到对应的字幕行上（按时间重叠匹配）。
                 start_sec=start_sec,
