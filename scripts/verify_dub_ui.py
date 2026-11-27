@@ -471,10 +471,12 @@ def main() -> int:
                 const c = document.getElementById('asr-live-cap');
                 const s = document.getElementById('asr-sentences');
                 const d = document.getElementById('asr-dub-out');
+                const live = document.getElementById('asr-live');
                 const hid = (el) => !!el && el.classList.contains('hidden');
                 return {
                     sentsHidden: hid(s),
                     capHidden: hid(c),
+                    liveHidden: hid(live),
                     capText: c ? (c.textContent || '').trim() : '',
                     dubVisible: !hid(d),
                 };
@@ -482,6 +484,10 @@ def main() -> int:
         check("配音导出结果面板是显示的", merge["dubVisible"])
         check("「实时结果」句子流被藏了（同一批句子不显示两遍）",
               merge["sentsHidden"], f"隐藏={merge['sentsHidden']}")
+        # ⚠️ **框里没内容 ⇒ 框本身也要藏** —— 否则屏幕上留一个**空白大框**
+        #    （看着像页面坏了）。
+        check("「实时结果」框本身也藏了（不留空白大框）",
+              merge["liveHidden"], f"隐藏={merge['liveHidden']}")
         # ⚠️ **提示行不能留「有标题、没内容」** ⇒ 它的显隐必须跟句子流一致。
         check("语言提示的显隐跟句子流一致（不留有标题没内容的框）",
               merge["capHidden"] == merge["sentsHidden"],

@@ -2652,14 +2652,39 @@ const Qwen3Asr = {
    */
   _applyMode() {
     const mode = document.getElementById("asr-mode")?.value || "single";
-    const live = document.getElementById("asr-live");
     const rounds = document.getElementById("asr-rounds");
-    if (live) live.classList.toggle("hidden", mode !== "single");
+    // ⚠️ 「实时结果」框本身要不要藏 ⇒ 走 ``_syncLiveBox``（那里还有
+    //    「框里有没有内容」这条）。
+    this._syncLiveBox();
     if (rounds) rounds.classList.toggle("hidden", mode !== "rounds");
     // 面板刚露出来 → 把这段时间攒下的轮次补上（隐藏时是**不重建**的）
     if (mode === "rounds") this._renderRounds();
     // 视频来源下「文字显示框」= 字幕同款转写框 → 切模式时要重画。
     this._renderTranscript();
+  },
+
+  /**
+   * 「实时结果」框（``#asr-live``）**本身**要不要藏。
+   *
+   * ⚠️ **两个条件**：
+   *   ① 显示模式不是「实时结果」（那就是「识别过程」⇒ 归 ``#asr-rounds``）；
+   *   ② 框里**没有内容**了 —— 配音导出 / 同传有内容 ⇒ 里面的句子流被藏 ⇒
+   *      整个框空着 ⇒ **一起藏**，否则屏幕上留一个**空白大框**
+   *      （看着像页面坏了）。
+   *
+   * ⚠️ ``_applyMode`` 与 ``_syncResultBoxes`` **都要调它** —— 两处都改这个
+   *    框的显隐 ⇒ 口径必须**只有一份** ⇒ 否则一边藏一边露。
+   */
+  _syncLiveBox() {
+    const live = document.getElementById("asr-live");
+    if (!live) return;
+    const mode = document.getElementById("asr-mode")?.value || "single";
+    const shown = ["asr-sentences", "asr-rt-sentences", "asr-transcript"]
+      .some((id) => {
+        const el = document.getElementById(id);
+        return !!(el && !el.classList.contains("hidden"));
+      });
+    live.classList.toggle("hidden", mode !== "single" || !shown);
   },
 
   /**
@@ -5994,6 +6019,8 @@ const Qwen3Asr = {
     }
     // ⚠️ 顶上那一行提示也跟着走（源语言 → 显示语言）。
     this._syncLiveCap();
+    // ⚠️ **框里没内容了 ⇒ 框本身也藏**（不留空白大框）。
+    this._syncLiveBox();
   },
 
   /**
