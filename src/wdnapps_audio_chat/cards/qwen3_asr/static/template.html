@@ -263,6 +263,20 @@
                   <button class="vd-btn" id="asr-stop-btn" disabled>停止</button>
                   <button class="vd-btn" id="asr-reset-btn">清空</button>
                 </span>
+                <!--
+                  ⚠️ **「已清空」放在「清空」按钮右边**（2026-11-27 用户要求）——
+                  参照「配音导出」那一行：它的状态（``#asr-dub-status``）就在
+                  **按钮组右边**、样式 ``.asr-live-status`` ⇒ 同一张卡上两处
+                  **位置和风格完全一致** ⇒ 用户一眼能找到「刚才清过」。
+
+                  ⇒ 元素 ``#asr-tr-clear-status``：**平时是空的**（没清过就
+                  不占位）⇒ 清空后写成「已清空」⇒ 再点「开始识别」⇒ 清掉。
+
+                  ⚠️ **别复用 ``#asr-tr-status``** —— 那个是**翻译模型**的状态
+                  （翻译未启用 / 翻译模型就绪 · 实时翻译已开启 · 已译 N 句）⇒
+                  塞「已清空」进去会把模型状态顶掉（用户就看不到模型在不在了）。
+                -->
+                <span class="asr-live-status" id="asr-tr-clear-status"></span>
               </div>
               <!--
                 ⚠️ **说明必须紧贴自己解释的那一行**（2026-11-27 用户要求）——

@@ -642,7 +642,6 @@ const Qwen3Asr = {
 
   /* ---------------- 实时翻译状态（流式同传） ---------------- */
   _tr: {
-    cleared: false,      // **结果被清空过**（用户点了「清空」）⇒ 状态显示「已清空」
     enabled: false,      // 「实时翻译」开关
     targetLang: "en",    // 目标语言（provider 的语言 key）
     modelReady: false,   // 翻译模型在不在跑
@@ -2804,6 +2803,8 @@ const Qwen3Asr = {
     //    要求：两者**互斥**）—— 识别一开始，「生成配音版」就灰；识别一
     //    结束，它又亮回来 ⇒ 快照是唯一的触发点（WS 的 state 帧）。
     this._dubSyncButtons();
+    // ⚠️ **「清空」按钮的可用态**（有结果才可点）—— 快照一变就刷。
+    this._syncResetBtn();
     // ⚠️ **行级翻译**：「最后一行的定稿」正常是靠识别结束的 ``done``
     // 帧触发的 —— 刷新页面后那个帧**随旧连接一起没了** ⇒ 最后一行永远
     // 等不到译文 ⇒ 靠「后端已经不忙了」这个信号补上（见
@@ -3615,14 +3616,48 @@ const Qwen3Asr = {
     if (el) el.textContent = this._trStatusText();
   },
 
+  /**
+   * 写「清空」按钮**右边**那个状态位（``#asr-tr-clear-status``）。
+   *
+   * ⚠️ **位置和风格跟「配音导出」那一行一致**（2026-11-27 用户要求）——
+   *    它的 ``#asr-dub-status`` 就在按钮组右边、样式 ``.asr-live-status``
+   *    ⇒ 同一张卡上两处**一模一样** ⇒ 用户一眼能找到「刚才清过」。
+   */
+  _trSetClearStatus(text) {
+    const el = document.getElementById("asr-tr-clear-status");
+    if (el) el.textContent = text || "";
+  },
+
+  /**
+   * 页面上**还有结果**吗 ⇒ 「清空」该不该可点。
+   *
+   * ⚠️ **「没东西可清就灰着」**（2026-11-27 用户要求）—— 与「配音导出」的
+   *    「清空」同一个口径 ⇒ 用户点完清空，按钮**变灰**（不是还能再点）。
+   *
+   * ⚠️ **正在跑的时候不许灰** —— 那时「清空」= 停止 + 清空 ⇒ 有用。
+   */
+  _hasResults() {
+    if (this._busy() || this._starting) return true;
+    if (this.rounds && this.rounds.length) return true;
+    if (this._tr && this._tr.items && this._tr.items.length) return true;
+    if (this._interp && this._interp.segs && this._interp.segs.size) return true;
+    if (this.snapshot && this.snapshot.last_result) return true;
+    return false;
+  },
+
+  /** 「清空」按钮的可用态（**只有这一处**说了算）。 */
+  _syncResetBtn() {
+    const btn = document.getElementById("asr-reset-btn");
+    if (!btn) return;
+    btn.disabled = !this._hasResults();
+  },
+
   _trStatusText() {
-    // ⚠️ **清空过 ⇒ 显示「已清空」**（2026-11-27 用户要求）——
-    //    参照「配音导出」那块的「清空」按钮（它清完就把状态写成
-    //    「已清空」）。
-    //
-    //    ⇒ 不这么做的坏处：清空之后这里还写着「翻译模型就绪 · 实时翻译
-    //    已开启」⇒ 用户以为**还在译**（其实结果已经没了）。
-    if (this._tr.cleared) return "已清空";
+    // ⚠️ **这里只管「翻译模型」的状态**（翻译未启用 / 就绪 · 已开启 · 已译
+    //    N 句）⇒ **不塞「已清空」**（2026-11-27 用户要求）——「已清空」在
+    //    **「清空」按钮右边**那个专属状态位里（``#asr-tr-clear-status``，
+    //    与「配音导出」的 ``#asr-dub-status`` 同位置同风格）⇒ 塞这里会把
+    //    模型状态顶掉（用户就看不到模型在不在了）。
     const bits = [this._tr.modelStatus || "翻译未启用"];
     if (this._tr.enabled) {
       bits.push("实时翻译已开启");
@@ -4736,13 +4771,13 @@ const Qwen3Asr = {
     }
     if (!this._hasSource() || this._starting || this._busy()) return false;
     this._starting = true;
-    // ⚠️ **新一轮识别 ⇒ 「已清空」归零**（2026-11-27）—— 又开始识别了，
-    //    结果马上就会重新长出来 ⇒ 状态不该还停在「已清空」。
-    //
-    // ⚠️ **改完要立刻重画状态行** —— 否则那一行还挂着上一轮的「已清空」
+    // ⚠️ **改完要立刻重画状态行** —— 否则那一行还挂着上一轮的状态
     //    （要等下一帧译文才刷新 ⇒ 中间那几秒是错的）。
-    this._tr.cleared = false;
     this._trSyncUi();
+    // ⚠️ **新一轮识别 ⇒ 「已清空」状态位清掉**（结果马上会长出来 ⇒ 不该
+    //    还挂着「已清空」）+ 刷「清空」按钮（识别中 ⇒ 它可点）。
+    this._trSetClearStatus("");
+    this._syncResetBtn();
     // ⚠️⚠️ **识别一开始 ⇒「生成配音版」立刻就灰**（2026-11-27 用户要求：
     //    两者互斥）—— 别等服务端确认（WS 那一帧要 ~0.3 s）⇒ 这中间用户
     //    还能点「生成配音版」⇒ 两个一起跑。
@@ -4909,10 +4944,6 @@ const Qwen3Asr = {
     this._renderLive("", "");
     // 译文也一起清（服务端 /reset 也会清统计）
     this._tr.items = [];
-    // ⚠️ **「实时翻译」的状态改成「已清空」**（2026-11-27 用户要求）——
-    //    参照「配音导出」的清空（它清完就把状态写成「已清空」）。
-    //    ⇒ 不然这里还写着「实时翻译已开启」⇒ 用户以为还在译。
-    this._tr.cleared = true;
     this._trLineTr.clear();   // 行级译文（视频来源）也一起清
     this._trLineReq.clear();
     this._trLineSlot.clear();
@@ -4961,6 +4992,12 @@ const Qwen3Asr = {
     // ⚠️ **提示行也写「已清空」**（2026-11-27 用户要求）—— 免得上面那行
     //    「识别完成（…）」还挂着，像是有结果。
     this._setHint("已清空");
+    // ⚠️ **「已清空」写在「清空」按钮右边**（同「配音导出」那行的位置和
+    //    风格）⇒ 用户一眼能找到「刚才清过」。
+    this._trSetClearStatus("已清空");
+    // ⚠️ **清空 ⇒ 「清空」按钮变灰**（没东西可清了 ⇒ 跟「配音导出」一个
+    //    口径）⇒ 用户不会以为还能再点一次。
+    this._syncResetBtn();
   },
 
   _showError(detail) {
@@ -6629,6 +6666,12 @@ const Qwen3Asr = {
       case "translation": {
         // 一句译文（流式同传）—— 与识别帧**同一条 WS**。
         if (!msg.stream_id) break;
+        // ⚠️⚠️ **清空之后，迟到的译文帧也要丢掉**（2026-11-27）——
+        //    轮次帧有 ``_ignoreRounds`` 这道闸，**译文帧原来没有** ⇒
+        //    清空前广播出去的那几帧照样会到 ⇒ ``_tr.items`` 又长出句子 ⇒
+        //    状态行还写着「已译 N 句」（跟旁边的「已清空」自相矛盾）。
+        //    ⇒ 同一个开关（``_ignoreRounds``：清空 ⇒ true，新一轮 ⇒ false）。
+        if (this._ignoreRounds) break;
         const it = {
           index: Number(msg.index) || 0,
           source: msg.source || "",
