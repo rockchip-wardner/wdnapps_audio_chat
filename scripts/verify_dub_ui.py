@@ -678,6 +678,9 @@ def main() -> int:
                 const sents = document.getElementById('asr-sentences');
                 const b = document.getElementById('asr-reset-btn');
                 const hid = (el) => !!el && el.classList.contains('hidden');
+                // ⚠️ **顺带把判据也读出来** —— 「实时结果框没回来」时能一眼
+                //    看出是哪一条判据把它藏住的（source / interp / dub）。
+                const A = window.Qwen3Asr || {};
                 return {
                     panelHidden: hid(wrap),
                     n: rows.length,
@@ -686,12 +689,20 @@ def main() -> int:
                     resetDisabled: b ? b.disabled : null,
                     hintText: (document.getElementById('asr-hint')
                                ?.textContent || '').trim(),
+                    why: {
+                        source: A._source,
+                        mode: document.getElementById('asr-mode')?.value,
+                        interpSegs: A._interp ? A._interp.segs.size : -1,
+                        dubRows: A._dub ? A._dub.hasRows : null,
+                        dubJob: A._dub ? A._dub.hasJob : null,
+                    },
                 };
             }""")
         check("结果面板被藏了（清空了）", cleared["panelHidden"])
         check("面板里没有残留的行", cleared["n"] == 0, f"行数 = {cleared['n']}")
         check("「实时结果」框回来了（导出没内容 ⇒ 合并规则解除）",
-              not cleared["liveHidden"])
+              not cleared["liveHidden"],
+              f"实际 = {cleared['liveHidden']!r} 判据 = {cleared['why']!r}")
         check("「清空」按钮又变灰了（没东西可清）",
               cleared["resetDisabled"] is True,
               f"disabled={cleared['resetDisabled']}")
