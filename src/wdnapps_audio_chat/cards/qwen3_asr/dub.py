@@ -75,11 +75,10 @@ DUB_KINDS = ("audio", "video")
 #: 一条字幕最短显示时长（秒）—— 太短会一闪而过。
 _MIN_CUE_SEC = 0.6
 
-#: **等页面上正在跑的识别**最多等多久（秒）。
-#: ⚠️ 以前是**直接掐断**它 ⇒ 页面上的「实时结果」停在半截（用户实测）⇒
-#:    现在改成等它跑完 ⇒ 页面上的结果是**完整的**。
-#: ⇒ 超时了只能停掉（不然导出永远进不去）⇒ 那时在 ``warnings`` 里说清楚。
-_DUB_WAIT_PAGE_ASR_SEC = 1800.0
+#: ⚠️ **不再等页面上正在跑的识别**（2026-11-27 用户要求：严格互斥）——
+#:    上一版是「等它跑完（上限 1800 s），超时才停掉它」⇒ 用户明确说
+#:    **不要等** ⇒ 现在识别在跑时**直接 409**（见 :meth:`DubEngine.start`）。
+#:    ⇒ 那个「等待上限」常量已删除。
 
 #: **等本机的 TTS 实例就绪**最多等多久（秒）。
 #: ⚠️ TTS 加载实测 ~22 s ⇒ 180 s 足够从零起一个。
@@ -95,6 +94,21 @@ def sanitize_name(part: str, fallback: str = "x") -> str:
     """把一段文字变成能安全进文件名的片段。"""
     s = _UNSAFE_NAME.sub("_", (part or "").strip()).strip("._")
     return s or fallback
+
+
+class DubBusyError(Exception):
+    """配音导出**起不来**：页面上**有识别在跑**（严格互斥）。
+
+    ⚠️ **单独一个异常类型**（2026-11-27）—— 不要继承 ``ValueError`` /
+    ``RuntimeError``：API 层要把它单独映射成 **409**（跟「参数错了」
+    的 400、「模型没起来」的 502 分开）。
+
+    ⚠️⚠️ **别把这个类插在 ``@dataclass`` 和 ``class DubSentence`` 之间**
+    （踩到过一次）—— 装饰器会**贴到上一个类**上 ⇒ ``DubBusyError`` 变成
+    dataclass（``__init__() takes 1 positional argument``）⇒ 409 变成 500；
+    而 ``DubSentence`` **没了装饰器** ⇒ ``DubSentence() takes no arguments``
+    ⇒ 导出作业全挂。
+    """
 
 
 @dataclass
@@ -329,14 +343,36 @@ class DubEngine:
               speaker: str = "", ref_speaker: str = "") -> Dict[str, Any]:
         """起一次配音导出。
 
-        ⚠️ **先停掉正在跑的识别** —— ASR 是单例，两个流会搅坏同一个增量
-        解码器（``service.py`` 顶部写得很清楚）。
+        ⚠️⚠️ **严格互斥**（2026-11-27 用户要求）—— 页面上**有识别在跑**时，
+        **直接拒**（抛 :class:`DubBusyError` ⇒ HTTP **409**）⇒
+        **不打断它、也不等它跑完**。
+
+        ⇒ 上一版是「等它跑完（最多 1800 s）」⇒ 用户明确说**不要等**：
+        按了「生成配音版」却卡在「等页面上的识别跑完」，看着像没反应。
+        ⇒ 现在改成「**要么识别先停，要么导出先来**」。
+
+        ⚠️ **以前这里是**直接掐断**它**（``svc.stop(reason="dub")``）⇒
+        用户自己的识别被**掐断** ⇒ 页面上的「实时结果」停在**半截**
+        ⇒ 用户报「实时结果只显示了一部分」⇒ **掐断**和**等待**都不对，
+        正确做法是**互斥**（两边都不动）。
         """
         if kind not in DUB_KINDS:
             raise ValueError("配音导出只支持音频文件 / 含音轨的视频")
         src = Path(source_path)
         if not src.is_file():
             raise ValueError("源文件不存在: {}".format(source_path))
+
+        # ⚠️⚠️ **互斥检查**（**必须在建作业之前**）——
+        #    识别在跑 ⇒ 直接拒（409）⇒ **不打断、不等待**。
+        #
+        #    ⚠️ 判据用 ``file_busy()`` —— 只认**文件/视频**那条识别；麦克风的
+        #    **实时**会话在**另一个服务**里（``get_live_asr_service``）⇒ 不占
+        #    ASR 单例 ⇒ **不该拦**。
+        #
+        #    ⚠️ **要在建作业之前查** —— 否则这次调用会把**上一个**作业顶掉
+        #    （``start()`` 里会 ``self._cancel.set()`` + 新建作业）⇒ 明明
+        #    这次没起成，却把上一个搞没了。
+        self._assert_page_asr_idle()
 
         # ⚠️ **主事件循环** —— API 层是 async ⇒ 这里能抓到。译文广播要靠它
         # 回到主循环（``asyncio.Queue`` 不是线程安全的）。
@@ -367,14 +403,10 @@ class DubEngine:
             )
             self._job = job
 
-        # ① **不要停掉页面上正在跑的识别** —— 见 :meth:`_wait_for_page_asr`。
-        #    （以前这里是 ``svc.stop(reason="dub")`` ⇒ 用户自己的识别被**掐断**
-        #    ⇒ 页面上的「实时结果」停在**半截** ⇒ 用户报「实时结果只显示了
-        #    一部分」⇒ 现在改成**等**它跑完。）
-        #
-        # ⚠️ ASR 是**单例** ⇒ 导出自己那条流必须等它让出来 —— 等待放在
-        #    作业线程里（`_wait_for_page_asr`），**不挡**这里（页面能立刻
-        #    拿到作业号、看到「等页面上的识别跑完」这个阶段）。
+        # ① **页面上有识别在跑 ⇒ 已经在上面拒了**（严格互斥，见
+        #    :meth:`_assert_page_asr_idle`）⇒ 这里没有「等它跑完」那套了。
+        #    （作业线程里还有**第二道**检查：``_check_page_asr`` —— 那是防
+        #    「起作业之后、真正用 ASR 之前」用户又起了识别。）
 
         # ② 起翻译模型（**不动页面的开关和目标语言** ——
         #    见 :meth:`_ensure_translation`）
@@ -521,22 +553,18 @@ class DubEngine:
         if not status.get("running"):
             mgr.ensure()
 
-    def _wait_for_page_asr(self, job: DubJob) -> None:
-        """等**页面上正在跑的识别**跑完（**不打断它**）。
+    def _assert_page_asr_idle(self) -> None:
+        """页面上**有识别在跑**吗 ⇒ 有就**拒**（抛 :class:`DubBusyError`）。
 
-        ⚠️ **为什么不能直接停掉它**（2026-11-27 用户实测）：点「生成配音版」
-        会把用户自己的识别**掐断** ⇒ 页面上「实时结果」就停在**半截**
-        （用户报：「『实时结果』只显示了一部分」）⇒ 用户要的明明是**完整
-        的全部结果**。
+        ⚠️ **严格互斥**（2026-11-27 用户要求）—— 上一版是「等它跑完」
+        （最多 1800 s，超时才停掉它）⇒ 用户明确说**不要等**。
 
-        ⚠️ ASR 是**单例** ⇒ 导出自己那条流**必须**等它让出来。
+        ⇒ 「生成配音版」要么**先**开始（识别没在跑），要么用户**先停掉**
+        识别 ⇒ 不再出现「按了没反应、卡在『等页面上的识别跑完』」。
 
-        ⇒ 这里**等**（有超时）⇒ 用户的识别跑完 ⇒ 导出**复用**它的结果
-        ⇒ 页面上的结果完整、导出的文件也完整。
-
-        ⚠️ **只等「文件路径」的识别**（``file_busy()``）—— 麦克风那种
+        ⚠️ **只认「文件路径」的识别**（``file_busy()``）—— 麦克风那种
         **实时**会话在**另一个服务**里（``get_live_asr_service``）⇒ 不占
-        这个单例 ⇒ 不用等。
+        ASR 单例 ⇒ **不拦**。
         """
         try:
             from wdnapps_audio_chat.cards.qwen3_asr.service import (
@@ -546,27 +574,44 @@ class DubEngine:
         except Exception as exc:  # noqa: BLE001
             LOG.debug("dub: 取 ASR 服务失败（best-effort）: %s", exc)
             return
-        if not svc.file_busy():
-            return
-        self._set_phase(job, "等页面上的识别跑完", 0.02)
-        LOG.info("dub: 页面上的识别还在跑 ⇒ 等它跑完（不打断它）")
-        deadline = time.time() + _DUB_WAIT_PAGE_ASR_SEC
-        while time.time() < deadline:
-            if self._cancelled():
-                raise RuntimeError("用户取消了")
-            if not svc.file_busy():
-                return
-            time.sleep(0.5)
-        # ⚠️ 超时 ⇒ 只能停掉它（否则导出永远进不去）⇒ 说清楚。
-        LOG.warning("dub: 等页面上的识别超时（%.0f s）⇒ 停掉它",
-                    _DUB_WAIT_PAGE_ASR_SEC)
-        job.warnings.append(
-            "页面上的识别等了 {:.0f} 秒还没跑完 ⇒ 已停掉它，"
-            "导出自己重新识别了一遍".format(_DUB_WAIT_PAGE_ASR_SEC))
+        if svc.file_busy():
+            LOG.info("dub: 页面上的识别还在跑 ⇒ 配音导出起不来（互斥）")
+            raise DubBusyError(
+                "识别还在跑 ⇒ 配音导出起不来（互斥）：先点「停止」停掉识别，"
+                "或等它跑完再来导出")
+
+    def _check_page_asr(self, job: DubJob) -> None:
+        """页面上**还有识别在跑**吗 ⇒ 有就**拒**（**不打断、也不等**）。
+
+        ⚠️ **2026-11-27 用户要求：严格互斥** —— 上一版这里是「**等**它跑完
+        （上限 1800 s，超时才停掉它）」⇒ 用户明确说**不要等** ⇒ 改成
+        **直接失败**。
+
+        ⇒ 「生成配音版」要么**先**开始（识别没在跑），要么**先停掉识别**
+        ⇒ 不再出现「按了没反应、卡在『等页面上的识别跑完』」。
+
+        ⚠️ **为什么还要留这一层**（``start()`` 里已经拒过一次了）——
+        ``start()`` 的拒是**给调用方**看的（HTTP 409）；这里是**给作业本身**
+        看的（作业失败 + 人话）⇒ 因为 ``start()`` 之后、作业线程真正去用
+        ASR 之间还有**时间窗** ⇒ 那时候用户可能又起了识别 ⇒ 这一刻必须
+        再挡一次（否则两个流会搅坏同一个增量解码器）。
+
+        ⚠️ **只认「文件路径」的识别**（``file_busy()``）—— 麦克风那种
+        **实时**会话在**另一个服务**里（``get_live_asr_service``）⇒ 不占
+        这个单例 ⇒ **不拦**。
+        """
         try:
-            svc.stop(reason="dub-timeout")
+            from wdnapps_audio_chat.cards.qwen3_asr.service import (
+                get_asr_service,
+            )
+            svc = get_asr_service()
         except Exception as exc:  # noqa: BLE001
-            LOG.debug("dub: 停旧识别失败（best-effort）: %s", exc)
+            LOG.debug("dub: 取 ASR 服务失败（best-effort）: %s", exc)
+            return
+        if svc.file_busy():
+            LOG.info("dub: 页面上的识别还在跑 ⇒ 配音导出起不来（互斥）")
+            raise RuntimeError(
+                "识别还在跑 ⇒ 配音导出起不来（互斥）：先停掉识别，或等它跑完")
 
     def _ensure_tts(self) -> None:
         """确保本机有一个跑着的 TTS 实例（**后台**，不挡）。
@@ -644,9 +689,9 @@ class DubEngine:
     def _run(self, job: DubJob) -> None:
         tmp_dir = None
         try:
-            # ---------- ⓪ 等页面上正在跑的识别跑完 ----------------------- #
-            # ⚠️ **不能掐断它**（用户实测：「实时结果只显示了一部分」）。
-            self._wait_for_page_asr(job)
+            # ---------- ⓪ 页面上的识别在跑？⇒ 拒（互斥） ------------------ #
+            # ⚠️ **不掐断它，也不等它**（2026-11-27 用户要求：严格互斥）。
+            self._check_page_asr(job)
 
             tmp_dir = Path(tempfile.mkdtemp(prefix="qwen3-dub-"))
             src = Path(job.source_path)

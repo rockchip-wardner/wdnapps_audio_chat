@@ -1144,8 +1144,14 @@ async def post_dub_start(payload: Optional[DubStartPayload] = Body(None)) -> dic
 
     ⚠️ **慢操作**（ASR + 翻译 + TTS + 烧字幕）⇒ **立即返回**，进度用
     ``GET /dub/status`` 轮询。
+
+    ⚠️⚠️ **严格互斥**（2026-11-27 用户要求）—— 页面上**有识别在跑**时 ⇒
+    **409**「识别还在跑 ⇒ 配音导出起不来」⇒ **不打断它、也不等它跑完**。
     """
-    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import (
+        DubBusyError,
+        get_dub_engine,
+    )
 
     data = payload or DubStartPayload()
     raw = (data.path or "").strip()
@@ -1173,6 +1179,10 @@ async def post_dub_start(payload: Optional[DubStartPayload] = Body(None)) -> dic
             speaker=(data.speaker or ""),
             ref_speaker=(data.ref_speaker or ""),
         )
+    except DubBusyError as exc:
+        # ⚠️⚠️ **严格互斥**（2026-11-27 用户要求）—— 页面上的识别在跑 ⇒
+        #    **直接拒**（409），**不打断它、也不等它跑完**。
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

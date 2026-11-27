@@ -740,6 +740,52 @@ def _post_transcribe(base: str, src: str, timeout: float = 60.0):
             return e.code, raw
 
 
+def part_k(base: str) -> None:
+    section("K. 严格互斥：识别在跑时发起导出 ⇒ **409**（不打断、不等待）")
+    # ⚠️ **2026-11-27 用户要求** —— 上一版是「**等**页面上的识别跑完
+    #    （上限 1800 s）」⇒ 用户明确说**不要等** ⇒ 后端改成**直接拒**。
+    uploads = Path("/userdata/assets/uploads")
+    # ⇒ 用**视频**当识别源（~70 s ⇒ 窗口宽裕，不用跟识别抢时间）
+    src = uploads / "asr_zh_seek_test.mp4"
+    if not src.is_file():
+        src = uploads / "asr_en.wav"
+    if not src.is_file():
+        check("识别源存在（%s）" % src, False, "找不到测试素材")
+        return
+
+    before = _api("GET", "/api/qwen3-asr/dub/status", base=base)[1] or {}
+    before_id = str(before.get("id") or "")
+
+    # ⇒ 先起一次识别
+    code, t = _post_transcribe(base, str(src))
+    check("互斥：能起一次识别（用来验「识别在跑时导出被拒」）",
+          code == 200, f"得到 {code} {t}")
+    # ⇒ 立刻发起导出 ⇒ 必须被拒
+    code, r = _api("POST", "/api/qwen3-asr/dub/start", {
+        "kind": "audio", "path": str(uploads / "asr_en.wav"),
+        "target_lang": "zh-CN", "ref_speaker": "news_female"},
+        base=base, timeout=60)
+    check("互斥：识别在跑时发起导出 ⇒ **409**（不等、不排队）",
+          code == 409 and "识别" in str(r), f"得到 {code} {r}")
+
+    after = _api("GET", "/api/qwen3-asr/dub/status", base=base)[1] or {}
+    check("互斥：被拒之后**作业没被顶掉**（没起成就不该动上一个）",
+          str(after.get("id") or "") == before_id,
+          f"拒之前 {before_id!r} / 拒之后 {after.get('id')!r}")
+
+    # ⇒ 把那次识别停掉（后面的用例还要用 ASR）
+    _api("POST", "/api/qwen3-asr/stop", {}, base=base)
+    deadline = time.time() + 60
+    s2 = {}
+    while time.time() < deadline:
+        s2 = _api("GET", "/api/qwen3-asr/", base=base)[1] or {}
+        if not s2.get("file_busy"):
+            break
+        time.sleep(1.0)
+    check("互斥：识别已停（后面的用例还要用 ASR）",
+          not s2.get("file_busy"), f"file_busy={s2.get('file_busy')}")
+
+
 def part_i(base: str) -> None:
     section("I. 「清空」：服务端把**结果**清掉（刷新页面不会复活）")
     # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
@@ -837,6 +883,29 @@ def part_j() -> None:
     check("清空：作业记录被扔掉了（刷新页面不复活）",
           st.get("state") == "idle" and not st.get("id"), f"得到 {st}")
 
+    # ⚠️⚠️ **别把新类插在 ``@dataclass`` 和下一个类之间**（2026-11-27 踩到）——
+    #    装饰器会**贴到上一个类**上 ⇒ 新类变成 dataclass ⇒ 409 变成 500；
+    #    而下一个类**没了装饰器** ⇒ 导出作业全挂（``DubSentence() takes no
+    #    arguments``）。⇒ 钉住两个类各自的「身份」。
+    import dataclasses
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import DubBusyError, DubSentence
+
+    check("DubBusyError 是**正常的异常类**（没被 ``@dataclass`` 贴上）",
+          issubclass(DubBusyError, Exception)
+          and not dataclasses.is_dataclass(DubBusyError),
+          f"is_dataclass={dataclasses.is_dataclass(DubBusyError)}")
+    check("DubBusyError **不是** ValueError / RuntimeError（API 要单独映射 409）",
+          not issubclass(DubBusyError, ValueError)
+          and not issubclass(DubBusyError, RuntimeError))
+    check("DubBusyError 能带一句人话",
+          bool(DubBusyError("识别还在跑").args),
+          str(DubBusyError("识别还在跑")))
+    check("DubSentence 仍然是 dataclass（装饰器没被抢走）",
+          dataclasses.is_dataclass(DubSentence))
+    check("DubSentence 还能按关键字造出来",
+          DubSentence(orig="a", trans="b", start_sec=0.0,
+                      end_sec=1.0).as_dict().get("orig") == "a")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -859,6 +928,7 @@ def main() -> int:
         part_c(args.base)
         part_d(args.base)
         part_g_http(args.base)
+        part_k(args.base)
         part_i(args.base)
     else:
         print("\n（真机端到端没跑：加 --http）")
