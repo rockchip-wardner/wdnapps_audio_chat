@@ -2192,7 +2192,21 @@ class _AsrManager:
         with self._lock:
             self._cancel = True
             self._drop_frames = True   # 之后迟到的轮次帧一律丢掉
-            session = self._session
+            # ⚠️⚠️ **只有在跑的时候才去停 worker**（2026-11-28 加）——
+            #    ``session.stop()`` 在 wdndds 那边是「往 side topic **重发 5
+            #    次** stop 信号，每次间隔 0.25 s」⇒ **1.25 s 的阻塞**。
+            #    而「空闲」时那个 stop 本来就是**空转**（worker 那边没有在跑
+            #    的轮次 ⇒ 空 target 的 stop 会被丢弃）⇒ 白付 1.25 s。
+            #:
+            #    ⇒ 空闲时**根本不用停** ⇒ 早退。
+            #    对照 ``stop()``：它本来就有 ``if self._state != RUNNING:
+            #    return`` 这一道 ⇒ 「停止」按钮从来没中过这个招。
+            #:
+            #    ⚠️ **真在跑时那 1.25 s 省不掉**（要真把 worker 停掉 ⇒ 否则
+            #    轮次又长回来）⇒ 但那时**不该占着事件循环** ⇒ 端点已改成
+            #    **同步**（见 ``api.py::post_asr_reset``）⇒ 板子不会被冻。
+            running = (self._state == self.STATE_RUNNING)
+            session = self._session if running else None
             self._rounds = []
             self._rounds_source = {}
             self._sent_log = []      # 句子流也要清（否则刷新后又冒出来）

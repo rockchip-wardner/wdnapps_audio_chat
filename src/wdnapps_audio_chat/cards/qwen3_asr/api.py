@@ -435,7 +435,7 @@ async def post_asr_transcribe(
 
 
 @router.post("/stop")
-async def post_asr_stop(
+def post_asr_stop(
     reason: str = Query("user", description=(
         "谁喊的停：``user`` = 用户点了「停止」（画面也要停，字幕别再滚）；"
         "``internal`` = 前端为了「拖动进度条 → 重开识别」而停"
@@ -446,6 +446,17 @@ async def post_asr_stop(
     ``reason`` —— 「谁喊的停」。后端看这两种动作**一模一样**（都是停掉
     正在跑的识别），但对前端的含义相反：用户喊停 ⇒ 画面停；内部为了
     重开识别而停 ⇒ 画面继续（字幕还要跟着播放头走）。⇒ 由调用方说。
+
+    ⚠️⚠️ **这个端点是「同步」的（不是 ``async def``）**（2026-11-28 改）——
+    ``svc.stop()`` → ``session.stop()`` 会在 **wdndds** 那边「重发 5 次 stop
+    信号，每次间隔 0.25 s」⇒ **1.25 s 的阻塞**。写成 ``async def`` 的话，
+    这 1.25 s 就跑在 **FastAPI 的事件循环线程**上 ⇒ **整个 Web 服务被冻住**
+    （实测：并发的 GET 从 14 ms 变成 1.1 s ⇒ WS 帧不推、别的接口全排队）。
+
+    ⇒ 改成**同步端点** ⇒ FastAPI 把它丢进**线程池**⇒ ``time.sleep`` 把
+    GIL 让出去 ⇒ 事件循环照样跑 ⇒ **板子不再被冻**。
+    （stop 的**时机**没变：还是同步停完才返回 ⇒ stream_id 照样是对的那一轮
+    ⇒ 不会「误伤下一轮」。）
     """
     svc = get_asr_service()
     svc.stop(reason=reason)
@@ -453,8 +464,16 @@ async def post_asr_stop(
 
 
 @router.post("/reset")
-async def post_asr_reset() -> dict:
-    """清空本轮结果。"""
+def post_asr_reset() -> dict:
+    """清空本轮结果。
+
+    ⚠️⚠️ **同步端点**（2026-11-28 改）—— 理由同 ``post_asr_stop``：
+    「识别**正在跑**的时候点清空」⇒ 服务端要真去停 worker ⇒ 那 1.25 s 的
+    阻塞**不能**占着事件循环（否则整个 Web 服务被冻 1.3 s）。
+
+    ⚠️ **空闲时这里已经很快了**（2026-11-28）—— ``svc.reset()`` 只在**真有
+    识别在跑**时才去 ``session.stop()`` ⇒ 空闲时端点 ~20 ms。
+    """
     svc = get_asr_service()
     svc.reset()
     return {"ok": True, "snapshot": svc.snapshot()}

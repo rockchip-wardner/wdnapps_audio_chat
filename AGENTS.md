@@ -2869,6 +2869,9 @@ worker 的 session 没加载 ⇒ 报上面那句。
 * ⚠️ **`_dubReset()` 改名 `_dubClearAll()`**（它不再是「那个按钮」的处理函数，
   而是被 `reset()` 调用的**清配音那一半**）⇒ `reset()` = 清识别 + 清翻译 +
   清同传 + **清配音**（本地面板 + 服务端 `POST /dub/reset`）。
+  ⚠️ **2026-11-28 又拆成两个**：`_dubClearLocal()`（**同步**，本地那份）+
+  `_dubResetServer()`（异步，服务端那份）—— 原因见文末「『清空』要**立刻**
+  清干净」那一节。
 * ⚠️ **可用态判据要算上配音**（`_hasResults()` 加上 `_dub.hasRows ||
   _dub.hasJob`）—— 否则配音有结果时那个统一按钮还是灰的 ⇒ 点不了。
 * ⚠️ **配音导出在跑 ⇒ 统一按钮灰着**（`_syncResetBtn()` 里挡）—— 服务端会拒
@@ -2955,3 +2958,71 @@ overflow-y: auto;
 回归（宿主 `verify_asr_file_translate_ui.py`）：钉住**紧挨下拉右边**
 （`rightOfSelect` + `sameRow` + 间距 ≤ 40px）**且在状态组左边**
 （`beforeStatus`）⇒ 防回退到「行尾」那版。
+
+## ⚠️「清空」要**立刻**清干净（2026-11-28 用户问「为什么过了一段时间才清空」）
+
+用户原话：「点『清空』之后，为什么过了一段时间才把结果清空？为什么不是立马就清空」。
+
+### 改前实测（Playwright 打真服务，采样 20 ms）
+
+| 时刻 | 屏幕上发生什么 |
+|---|---|
+| t = 0 | 点「清空」 |
+| t ≈ **+50 ms** | **本地**同步清了（句子流 / 译文 / 同传 / 字幕）—— 但「实时结果」框**被配音面板遮住** ⇒ **看不见** |
+| t = **+1333 ms** | `POST /api/qwen3-asr/reset` 回来 ⇒ 提示行才变「已清空」、徽标才变「空闲」 |
+| t = **+1503 ms** | `POST /api/qwen3-asr/dub/reset` 回来 ⇒ 配音面板才清空、「实时结果」框才回来、按钮才变灰 |
+
+⇒ **看得见的「清空」= 1.5 s**。
+
+### 根因（三条，缺一不可）
+
+1. **服务端那 1.3 s 是「硬睡」出来的** —— `svc.reset()` → `session.stop()`
+   → wdndds `ai_session.py` 的 `stop()`：**往 side topic 重发 5 次 stop 信号，
+   每次 `time.sleep(0.25)`** ⇒ **1.25 s**。
+   ⚠️ **空闲时也照睡** —— `svc.reset()` 少了 `svc.stop()` 那句
+   `if self._state != STATE_RUNNING: return` 早退 ⇒ 明明没有在跑的轮次，
+   stop 信号也是空转（worker 那边 `stop:` 空 target 本来就会被丢弃）。
+2. **那 1.25 s 跑在**FastAPI 的**事件循环线程**上（`post_asr_reset` 是
+   `async def` 且直接同步调 `svc.reset()`）⇒ **整个 Web 服务被冻 1.3 s**
+   （实测：并发的 `GET /api/qwen3-asr/` 从 **14 ms 变成 1104 ms** ⇒ WS 帧不推、
+   别的接口全排队）。
+3. **前端两个请求是串行的**，而且**配音面板的本地清空排在最后** ⇒
+   「实时结果」框被配音面板遮着的那 1.4 s 里，**本地那点清空在屏幕上完全
+   看不见** ⇒ 用户看着就是「点了没反应」。
+
+### 改法（三处，缺一不可）
+
+| 位置 | 改法 |
+|---|---|
+| **wdndds** `ai_session.py` | `LLMRPCSession` 加 `_inflight`（在飞轮数，`_dispatch` 里 +1/-1）⇒ `stop()` 在**没有在跑**时**只发一次、不 sleep**（保住「顺手杀掉上一轮超时残留」的能力，「误伤下一轮」的窗口从 1.25 s 缩到 ~1 ms） |
+| **插件后端** `service.py::reset()` | **只有在跑的时候**才 `session.stop()`（照抄 `stop()` 的 `STATE_RUNNING` 早退）⇒ 空闲时端点 **~20 ms** |
+| **插件后端** `api.py` | `post_asr_reset` / `post_asr_stop` 改成**同步端点**（`def`）⇒ FastAPI 丢线程池 ⇒ `time.sleep` 让出 GIL ⇒ **事件循环不再被冻**（识别在跑时 `/reset` 仍要 1.3 s 去真停 worker，但并发 GET 从 1.10 s 回到 **22 ms**） |
+| **插件前端** `app.js` | ① 配音的**本地**清空提到**第一个 await 之前**（`_dubClearLocal()`）② 提示行**立刻**写「已清空」③ 两个服务端请求**并行**发（`Promise.all`）④ `_dubClearAll()` 拆成 `_dubClearLocal()`（同步）+ `_dubResetServer()`（异步） |
+
+### 改后实测
+
+| 场景 | 看得见的「清空」 | 服务端 `/reset` | 并发 GET（冻不冻） |
+|---|---|---|---|
+| **空闲** | **40 ms** | 16~20 ms | 24 ms |
+| **识别在跑** | **122 ms** | 1.3 s（**必要**：要真停 worker） | **22 ms**（不冻了） |
+
+⚠️ **「识别在跑」时服务端那 1.3 s 不能省** —— 省了 worker 就停不掉 ⇒ 轮次
+还会长回来（实测「清空 4 s 后 rounds 0 → 0」才叫真停）。
+
+⚠️ **别把「本地清空」又排到 await 后面** —— 合并规则是「配音导出有内容 ⇒
+**藏掉**『实时结果』框」⇒ 配音面板还在 ⇒ 识别的本地清空**看不见**。
+`reset()` 里所有本地清理必须**一起**在第一个 await 之前做完。
+
+⚠️ **提示行「已清空」写两次是有意的** —— 第一次（await 之前）给用户**即时
+反馈**；第二次（await 之后）压掉服务端快照可能写进来的别的东西（麦克风实时
+会话在跑 ⇒ 「识别中……」）。失败时**不写**第二次（提示行里是错误信息）。
+
+⚠️ **`_inflight` 不能用 `_active` 代替** —— `_active` 只在**流式**轮次
+（传了 `on_delta`）里有值 ⇒ **非流式**那轮在跑时它是 `None` ⇒ 拿它判「空闲」
+会漏掉正在跑的推理。
+
+回归：宿主 `verify_asr_file_translate_ui.py`（39）+ 插件 `verify_dub_ui.py`
+（90）+ `verify_dub_export.py --no-npu`（64）+ `verify_two_input_modes.py`（64）
+全绿；wdndds `tests/test_ai_session.py`（25）全绿（`tests/test_import.py` 那
+11 个失败**改动前就有**，与本次无关）。
+

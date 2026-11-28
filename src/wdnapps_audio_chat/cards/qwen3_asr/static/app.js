@@ -4997,13 +4997,30 @@ const Qwen3Asr = {
     const empty = document.getElementById("asr-empty");
     if (empty) empty.classList.remove("hidden");
 
-    try {
-      const r = await fetch(API_PREFIX + "/qwen3-asr/reset", { method: "POST" });
-      const data = await r.json().catch(() => ({}));
-      if (data.snapshot) this._applySnapshot(data.snapshot);
-    } catch (e) {
-      this._showError("清空失败: " + e);
-    }
+    // ⚠️⚠️ **配音导出的结果也一起清**（2026-11-27 用户要求：「清空」= 清
+    //    **所有**结果 —— 包括「实时翻译」和「配音导出」的结果）⇒
+    //    * 本地：逐句导出结果面板（``_dubClearLocal``）—— **同步**做！
+    //    * 服务端：那个作业（``POST /dub/reset``）—— 不清的话刷新页面
+    //      又会复活（页面进时会拉一次**最新那个作业**）。
+    //
+    // ⚠️⚠️ **本地这份必须提前**（2026-11-28）—— 合并规则是「配音导出有
+    //    内容 ⇒ **藏掉**『实时结果』框」⇒ 配音面板还在的这段时间里，
+    //    **识别的本地清空在屏幕上根本看不见** ⇒ 用户看着就是「点了没
+    //    响应」（原来这份排在**两个 HTTP 往返之后** ⇒ ~1.4 s）。
+    this._dubClearLocal();
+    // ⚠️ **提示行立刻写「已清空」**（2026-11-27 用户要求）—— 免得上面那行
+    //    「识别完成（…）」还挂着，像是有结果。
+    //    ⚠️ **原来这段排在 ASR reset 往返之后**（2026-11-28 提前）⇒ 服务端
+    //    那 1.3 s 里提示行还挂着「识别完成（…）」⇒ 看着像「没清掉」。
+    this._setOutcome("已清空");
+
+    // ⚠️ **两个服务端请求并行发**（2026-11-28）—— 原来串行（等 ASR 回来
+    //    才发 dub）⇒ 1.3 s + 0.08 s；并行 ⇒ max(两者)。
+    const [asrOk] = await Promise.all([
+      this._asrResetServer(),
+      this._dubResetServer(),
+    ]);
+
     // ⚠️ **再清一次译文** —— 「本地先清」与「服务端 /reset 回来」之间
     // 可能刚好到了一条译文帧（那一句已经在推理）⇒ 不再清一次，页面上
     // 就留下一行「刚清空却还在」的译文。
@@ -5022,18 +5039,31 @@ const Qwen3Asr = {
     // 就留下一句「刚清空却还在」的原文。
     this._sentClear();
     this._trSyncUi();
-    // ⚠️ **提示行也写「已清空」**（2026-11-27 用户要求）—— 免得上面那行
-    //    「识别完成（…）」还挂着，像是有结果。
-    this._setOutcome("已清空");
-    // ⚠️⚠️ **配音导出的结果也一起清**（2026-11-27 用户要求：「清空」= 清
-    //    **所有**结果 —— 包括「实时翻译」和「配音导出」的结果）⇒
-    //    * 本地：逐句导出结果面板（``_dubClearResult``）
-    //    * 服务端：那个作业（``POST /dub/reset``）—— 不清的话刷新页面
-    //      又会复活（页面进时会拉一次**最新那个作业**）。
-    await this._dubClearAll();
+    // ⚠️ **再写一遍「已清空」** —— 服务端快照回来时可能又写了别的（麦克风
+    //    实时会话在跑 ⇒ 「识别中……」）⇒ **结果消息优先**（失败时提示行
+    //    里是错误信息 ⇒ 别盖）。
+    if (asrOk) this._setOutcome("已清空");
     // ⚠️ **清空 ⇒ 「清空」按钮变灰**（没东西可清了 ⇒ 跟「配音导出」一个
     //    口径）⇒ 用户不会以为还能再点一次。
     this._syncResetBtn();
+  },
+
+  /**
+   * 「清空」的**服务端**那一半（识别 / 翻译 / 同传）。
+   *
+   * ⚠️ **返回值 = 有没有成功** —— 调用方靠它决定要不要把提示行的「已清空」
+   *    **再写一遍**（失败时提示行里是错误信息，不能盖）。
+   */
+  async _asrResetServer() {
+    try {
+      const r = await fetch(API_PREFIX + "/qwen3-asr/reset", { method: "POST" });
+      const data = await r.json().catch(() => ({}));
+      if (data.snapshot) this._applySnapshot(data.snapshot);
+      return true;
+    } catch (e) {
+      this._showError("清空失败: " + e);
+      return false;
+    }
   },
 
   _showError(detail) {
@@ -7116,27 +7146,47 @@ const Qwen3Asr = {
   },
 
   /**
-   * 清掉配音导出的结果（本地 + 服务端）。
+   * 清掉配音导出的结果 —— **本地那一份**（**同步**，不等服务端）。
    *
    * ⚠️⚠️ **现在没有独立的「清空」按钮了**（2026-11-27 用户要求）——
    *    原来「实时翻译」「配音导出」各有一个 ⇒ 两个按钮各清一半 ⇒ 用户得
-   *    先想「我要清的是哪个」⇒ **统一成一个**，挪到「实时结果」旁边 ⇒
+   *    先想「我要清的是哪个」⇒ **统一成一个**，挪到「显示模式」旁边 ⇒
    *    **一个按钮清所有结果** ⇒ 这段由 ``reset()`` 调用。
    *
    * ⚠️ **清的是「逐句结果」**（原文 + 译文）—— **不删生成的文件**
    *    （产物在源文件同级目录里，用户还要拿去播 / 拿去用）。
    *
-   * ⚠️ **服务端也要清**（``POST /dub/reset``）—— 页面进时会拉一次
-   *    **最新那个作业**（``_dubRefreshStatus``）⇒ 只清前端 DOM 的话，
-   *    用户**一刷新页面**，上次的逐句结果又回来了。
-   *
-   * ⚠️ **导出还在跑 ⇒ 不清**（服务端会拒）—— 半路清会留下一个「半截」的
-   *    作业状态（句子清了、作业还在跑）。
+   * ⚠️⚠️ **本地这份必须同步清**（2026-11-28）—— 合并规则是「配音导出有
+   *    内容 ⇒ **藏掉**『实时结果』框」⇒ 配音面板还在的这段时间里，**识别
+   *    的本地清空在屏幕上根本看不见** ⇒ 用户看着就是「点了没反应」。
+   *    ⇒ 跟识别那份**一起**在第一个 await 之前清掉。
    */
-  async _dubClearAll() {
+  _dubClearLocal() {
     // ⚠️ **先作废在途的那一帧** ⇒ 清空之后旧句子不会长回来。
     this._dub.gen = (this._dub.gen || 0) + 1;
     this._dubPollStop();
+    // ⚠️ **本地也清** —— 面板 + DOM + 「实时结果」框的合并规则
+    //    （导出没内容了 ⇒ 「实时结果」框回来）。
+    this._dub.hasJob = false;
+    this._dubClearResult();
+    this._dubSetStatus("已清空");
+    this._dubSyncButtons();
+  },
+
+  /**
+   * 清掉配音导出的结果 —— **服务端那一份**（``POST /dub/reset``）。
+   *
+   * ⚠️ **服务端也要清** —— 页面进时会拉一次**最新那个作业**
+   *    （``_dubRefreshStatus``）⇒ 只清前端 DOM 的话，用户**一刷新页面**，
+   *    上次的逐句结果又回来了。
+   *
+   * ⚠️ **导出还在跑 ⇒ 不清**（服务端会拒）—— 半路清会留下一个「半截」的
+   *    作业状态（句子清了、作业还在跑）⇒ 把状态拉回来，别装作清空了。
+   *
+   * ⚠️ **返回值 = 有没有成功** —— 调用方靠它决定要不要把提示行的「已清空」
+   *    **再写一遍**（被拒时提示行里是「清不了：…」，不能盖）。
+   */
+  async _dubResetServer() {
     try {
       const r = await fetch("/api/qwen3-asr/dub/reset", { method: "POST" });
       const d = await r.json().catch(() => ({}));
@@ -7144,19 +7194,17 @@ const Qwen3Asr = {
         // ⚠️ 服务端拒了（多半是导出还在跑）⇒ 把状态拉回来，别装作清空了。
         this._dubSetStatus("清不了：" + ((d && d.reason) || "导出还在跑"));
         await this._dubRefreshStatus();
-        return;
+        return false;
       }
     } catch (e) {
       this._dubSetStatus("清空失败：" + e);
       await this._dubRefreshStatus();
-      return;
+      return false;
     }
-    // ⚠️ **本地也清** —— 面板 + DOM + 「实时结果」框的合并规则
-    //    （导出没内容了 ⇒ 「实时结果」框回来）。
     this._dub.hasJob = false;
-    this._dubClearResult();
     this._dubSetStatus("已清空");
     this._dubSyncButtons();
+    return true;
   },
 
   _dubPollStop() {
