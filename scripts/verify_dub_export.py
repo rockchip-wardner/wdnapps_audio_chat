@@ -8,8 +8,9 @@
 2. 「音频文件」「含音轨的视频」⇒ **保留**实时翻译 + 字幕实时显示，
    **去掉**同声传译；
 3. 「音频文件」⇒ 生成**目标语言的音频文件**（ASR + 翻译 + TTS），
-   文件名 = **源文件名 + 目标语言 + 音色**，存在**源文件同级目录**，
-   生成完**可选目标文件播放**；
+   文件名 = **源文件名 + 目标语言 + 音色**，存在**工程目录的产物目录**
+   （``app/uploads/qwen3_asr/dub/``，2026-11-28 起**不再**落源文件同级
+   目录），生成完**可选目标文件播放**；
 4. 「含音轨的视频」⇒ 拆音轨 → ASR + 翻译 + TTS → 目标语言音频文件；
    视频按 ASR + 翻译的结果加**双字幕**（原文 + 译文，节奏跟原声对齐）；
    语音文件与加完字幕的视频**重新合成** ⇒ 音视频文件。
@@ -129,8 +130,15 @@ def part_a() -> None:
     out = eng._output_path(j, ".wav")
     check("音频：文件名 = 源名_目标语言_音色.wav",
           out.name == "会议_zh-CN_news_female.wav", f"得到 {out.name}")
-    check("音频：落在源文件同级目录",
-          out.parent == Path("/uploads"), f"得到 {out.parent}")
+    # ⚠️ **2026-11-28**：产物**不再落源文件同级目录** ⇒ 落在本卡专属的
+    #    **产物目录**（工程目录内）⇒ 源目录只读也能导出、产物集中一处
+    #    可管可删。
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import dub_output_root
+    check("音频：落在**产物目录**（工程目录内），不是源文件旁边",
+          out.parent == dub_output_root(),
+          f"得到 {out.parent}（期望 {dub_output_root()}）")
+    check("音频：产物目录在**工程目录**里（app/uploads/…）",
+          "app/uploads/" in str(out.parent), f"得到 {out.parent}")
 
     j2 = DubJob(id="t", kind="video", source_path="/uploads/movie.mp4",
                 source_name="movie.mp4", target_lang="en", speaker="serena")
@@ -138,7 +146,7 @@ def part_a() -> None:
     check("视频：文件名 = 源名_目标语言_音色.mp4",
           out2.name == "movie_en_serena.mp4", f"得到 {out2.name}")
     check("视频：与音频同目录",
-          out2.parent == Path("/uploads"), f"得到 {out2.parent}")
+          out2.parent == dub_output_root(), f"得到 {out2.parent}")
 
 
 # --------------------------------------------------------------------------- #
@@ -432,8 +440,9 @@ def part_g_http(base: str) -> None:
           bool(sents) and all(s.get("orig") and s.get("trans")
                               for s in sents), f"得到 {len(sents)} 句")
     audio = job.get("audio_path") or ""
-    check("产物落在源文件同级目录",
-          bool(audio) and Path(audio).parent == Path(src).parent, audio)
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import dub_output_root
+    check("产物落在**产物目录**（不是源文件同级目录）",
+          bool(audio) and Path(audio).parent == dub_output_root(), audio)
 
     # ④ ⚠️ **目标语言不同** ⇒ **绝不能复用** ——
     #    用户实测：「配音导出选择英文，生成的文件播放是中文」。
@@ -522,8 +531,10 @@ def part_c(base: str) -> None:
     _check_sentences(st.get("sentences") or [], "音频导出")
 
     out_path = st.get("audio_path") or ""
-    check("音频导出：产物路径是源文件同级目录",
-          out_path and Path(out_path).parent == uploads, f"得到 {out_path}")
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import dub_output_root
+    check("音频导出：产物路径在**产物目录**里",
+          out_path and Path(out_path).parent == dub_output_root(),
+          f"得到 {out_path}")
     check("音频导出：文件名符合规则",
           out_path and Path(out_path).name ==
           "asr_en_zh-CN_news_female.wav",
@@ -538,19 +549,22 @@ def part_c(base: str) -> None:
         check("音频导出：产物文件存在", False, f"得到 {out_path}")
 
     # 「可选目标文件进行播放」—— 列表接口要把产物列出来
-    code, d = _api("GET", "/api/qwen3-asr/dub/files?path=" +
-                   urllib.parse.quote(str(src)), base=base)
+    # ⚠️ **2026-11-28**：列表是**全局**的（产物统一落在一个目录里）⇒
+    #    **不再按源文件筛** ⇒ 也不需要 ``path`` 参数。
+    code, d = _api("GET", "/api/qwen3-asr/dub/files", base=base)
     items = (d or {}).get("items") or []
     check("音频导出：产物能被列出来（供页面下拉）",
           any(f["name"].endswith(".wav") for f in items),
           f"得到 {[f.get('name') for f in items]}")
     check("音频导出：列表项带播放用的 url",
           all(f.get("url") for f in items), f"得到 {items[:2]}")
-    # 播放用的 url 要真的能取到文件（``/media`` 端点）
+    check("音频导出：列表项带 id（删除要用）",
+          all(f.get("id") for f in items), f"得到 {items[:2]}")
+    # 播放用的 url 要真的能取到文件（产物自己的 raw 端点）
     if items:
         code2, raw = _api("GET", items[0]["url"], base=base, binary=True)
-        check("音频导出：产物能通过 /media 取到", code2 == 200, f"得到 {code2}")
-        check("音频导出：/media 取到的是真音频（RIFF 头）",
+        check("音频导出：产物能通过 raw 端点取到", code2 == 200, f"得到 {code2}")
+        check("音频导出：raw 取到的是真音频（RIFF 头）",
               isinstance(raw, bytes) and raw[:4] == b"RIFF",
               f"前 4 字节 {raw[:4]!r}")
 
@@ -579,13 +593,14 @@ def part_d(base: str) -> None:
 
     audio = st.get("audio_path") or ""
     video = st.get("video_path") or ""
-    check("视频导出：音频产物在源同级目录",
-          audio and Path(audio).parent == uploads, f"得到 {audio}")
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import dub_output_root
+    check("视频导出：音频产物在**产物目录**",
+          audio and Path(audio).parent == dub_output_root(), f"得到 {audio}")
     check("视频导出：音频文件名符合规则",
           audio and Path(audio).name == "asr_zh_seek_test_en_news_female.wav",
           f"得到 {Path(audio).name if audio else ''}")
-    check("视频导出：视频产物在源同级目录",
-          video and Path(video).parent == uploads, f"得到 {video}")
+    check("视频导出：视频产物在**产物目录**",
+          video and Path(video).parent == dub_output_root(), f"得到 {video}")
     check("视频导出：视频文件名符合规则",
           video and Path(video).name == "asr_zh_seek_test_en_news_female.mp4",
           f"得到 {Path(video).name if video else ''}")

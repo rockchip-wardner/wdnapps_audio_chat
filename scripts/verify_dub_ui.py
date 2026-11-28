@@ -457,11 +457,25 @@ def main() -> int:
             print("    产物:", opts[:3])
             # ⚠️ **音频产物 ⇒ 音频播放器；视频产物 ⇒ 视频播放器**
             # （``_dubSyncPlayer`` 会把另一个元素的 src 清掉）⇒ 两个都看。
+            #
+            # ⚠️ **2026-11-28**：产物的播放地址是**自己的 raw 端点**
+            #    （``/api/qwen3-asr/dub/files/{id}/raw``）—— **不再**走
+            #    ``/media``（那个端点的路径闸是「必须在 ``base.resource_dir``
+            #    内」⇒ 产物目录换了位置就播不了）。
             srcs = page.evaluate(
                 "() => [document.getElementById('asr-dub-player')?.src || '',"
                 " document.getElementById('asr-dub-video')?.src || '']")
             check("播放器拿到了产物 URL",
-                  any("/api/qwen3-asr/media" in s for s in srcs), str(srcs))
+                  any("/api/qwen3-asr/dub/files/" in s and s.endswith("/raw")
+                      for s in srcs), str(srcs))
+            # ⚠️ **下拉的 value 是产物 id**（不是 URL）⇒ 播放地址是从清单里
+            #    查出来的（``item.url``）⇒ 断言下拉值不是 URL。
+            vals = page.evaluate(
+                "() => Array.from(document.getElementById('asr-dub-files')"
+                "?.options || []).map(o => o.value).filter(Boolean)")
+            check("下拉的 value 是**产物 id**（不是 URL）",
+                  all(not v.startswith("http") and not v.startswith("/") for v in vals),
+                  f"实际 = {vals!r}")
 
         section("F2. 配音导出结果面板：逐句原文/译文 + **两种语言**")
         # ⚠️ **为什么要有这一段**（2026-11-27 用户要求）——
@@ -689,6 +703,10 @@ def main() -> int:
                     resetDisabled: b ? b.disabled : null,
                     hintText: (document.getElementById('asr-hint')
                                ?.textContent || '').trim(),
+                    // ⚠️ **配音导出自己的状态行**（2026-11-28 用户要求：
+                    //    去掉那里的「已清空」）—— 它只该说**导出**的状态。
+                    dubStatus: (document.getElementById('asr-dub-status')
+                                ?.textContent || '').trim(),
                     why: {
                         source: A._source,
                         mode: document.getElementById('asr-mode')?.value,
@@ -711,6 +729,16 @@ def main() -> int:
         check("清空后提示行 = 「已清空」",
               cleared["hintText"] == "已清空",
               f"实际 = {cleared['hintText']!r}")
+        # ⚠️⚠️ **「配音导出」自己的状态行里**不许**再出现「已清空」**
+        #    （2026-11-28 用户要求）—— 「已清空」是**全卡**的反馈，已经写在
+        #    上面那条共用提示行里了 ⇒ 配音导出这一行重复写一遍是噪音，
+        #    而且会让人以为「配音导出」自己出过一次结果。
+        check("「配音导出」状态行里**没有**「已清空」",
+              "已清空" not in cleared["dubStatus"],
+              f"实际 = {cleared['dubStatus']!r}")
+        check("「配音导出」状态行回到「未开始」",
+              cleared["dubStatus"] == "未开始",
+              f"实际 = {cleared['dubStatus']!r}")
 
         # ⚠️ **服务端也要清** —— 页面进时会拉一次**最新那个作业**
         #    ⇒ 只清前端 DOM 的话，用户**一刷新页面**，上次的逐句结果又回来了。

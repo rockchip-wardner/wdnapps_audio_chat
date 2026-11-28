@@ -1169,6 +1169,7 @@ async def post_dub_start(payload: Optional[DubStartPayload] = Body(None)) -> dic
     """
     from wdnapps_audio_chat.cards.qwen3_asr.dub import (
         DubBusyError,
+        DubQuotaError,
         get_dub_engine,
     )
 
@@ -1202,6 +1203,10 @@ async def post_dub_start(payload: Optional[DubStartPayload] = Body(None)) -> dic
         # ⚠️⚠️ **严格互斥**（2026-11-27 用户要求）—— 页面上的识别在跑 ⇒
         #    **直接拒**（409），**不打断它、也不等它跑完**。
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DubQuotaError as exc:
+        # ⚠️ **磁盘闸**（2026-11-28）—— 产物目录超上限 ⇒ 507
+        #    （「配额/空间不够」⇒ 与 409 / 400 / 502 分开）。
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -1240,15 +1245,75 @@ async def post_dub_reset() -> dict:
 
 
 @router.get("/dub/files")
-async def get_dub_files(path: str = Query(..., description="设备端源文件绝对路径")) -> dict:
-    """列出源文件同级目录里**已经生成**的配音文件（页面下拉用）。"""
+async def get_dub_files(path: Optional[str] = Query(
+        None, description="（已废弃）设备端源文件绝对路径 —— 不再按源文件筛")) -> dict:
+    """列出**已生成**的配音产物（页面下拉用）。
+
+    ⚠️ **2026-11-28 起是全局的** —— 产物统一落在本卡专属的**产物目录**
+    （``app/uploads/qwen3_asr/dub/``，在**工程目录**内）⇒ 清单就是那一个
+    目录里的东西 ⇒ **跟当前选的源文件无关**。
+
+    ⇒ 「重启不消失」：清单**落盘**（``index.json``）⇒ 服务重启、页面刷新
+    之后都还在。
+
+    ⚠️ ``path`` **保留但不再使用** —— 旧调用方还会传 ⇒ 别让它报错。
+
+    ⇒ ``{items, count, total_size, total_size_text, limit, limit_text, dir}``。
+    """
     from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
 
-    try:
-        src = _resolve_media_path(path)
-    except HTTPException:
-        raise
-    return {"items": get_dub_engine().list_outputs(str(src))}
+    return get_dub_engine().list_artifacts()
+
+
+@router.delete("/dub/files/{artifact_id}")
+async def delete_dub_file(artifact_id: str) -> dict:
+    """删掉**一个**配音产物（文件 + 清单项）。
+
+    ⚠️ 这个 webui **没有鉴权** ⇒ id 只能是**产物目录里的一个裸文件名**
+    （服务端会自己校验：带 ``/`` / ``..`` / 越界的一律拒）⇒ 不能让它
+    变成「任意文件删除」的口子。
+
+    ⇒ ``{ok, deleted, id, name}``；找不到 ⇒ ``{ok: False, reason}``。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    return get_dub_engine().delete_output(artifact_id)
+
+
+@router.post("/dub/files/clear")
+async def clear_dub_files() -> dict:
+    """**一键清空**：产物目录里所有产物 + 清单。
+
+    ⚠️ **不可撤销** —— 前端要点 ``confirm()`` 确认。
+
+    ⇒ ``{ok, removed, freed, freed_text}``。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    return get_dub_engine().clear_outputs()
+
+
+@router.get("/dub/files/{artifact_id}/raw")
+async def get_dub_file_raw(artifact_id: str):
+    """把一个配音产物交给浏览器播放。
+
+    ⚠️ **为什么不用 ``/media``** —— 那个端点的路径闸是「必须在
+    ``base.resource_dir`` 内」（``/media`` 的根目录白名单）⇒ 产物目录
+    换了位置就可能落在根外 ⇒ 播不了。
+
+    ⇒ 这里**按清单里的 id 解析**（不收用户给的路径）⇒ 没有路径穿越风险。
+
+    ⚠️ 用 ``FileResponse``（**支持 Range 请求**）—— ``<video>`` 拖进度条、
+    ``<audio>`` 定位都靠它。
+    """
+    from wdnapps_audio_chat.cards.qwen3_asr.dub import get_dub_engine
+
+    engine = get_dub_engine()
+    p = engine.output_path(artifact_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(p, media_type=_media_type(p),
+                        filename=p.name, content_disposition_type="inline")
 
 
 @router.websocket("/ws")

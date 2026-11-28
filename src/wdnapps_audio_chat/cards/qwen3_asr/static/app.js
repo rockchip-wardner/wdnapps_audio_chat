@@ -613,7 +613,7 @@ const Qwen3Asr = {
    * **双字幕**（原文 + 译文）并与新音轨重新封装。
    *
    * ⚠️ 文件名规则在**服务端**（``dub.py::_output_path``）—— 前端只负责
-   * 把生成的文件列出来让用户挑着播。
+   * 把生成的文件列出来让用户挑着播、或者删掉。
    */
   _dub: {
     targetLang: "",       // 目标语言（provider 的语言 key）
@@ -631,7 +631,9 @@ const Qwen3Asr = {
     sourceLang: "",      // 识别出来的语种（如 "English"）—— 结果面板要标「源语言」
     hasRows: false,       // 导出结果面板**有内容**吗 ⇒ 藏掉重复的「实时结果」
     hasJob: false,        // 服务端**还有导出作业**吗 ⇒ 「清空」该不该可点
-    files: [],            // 源文件同级目录里已生成的产物 [{name, path, kind, url}]
+    files: [],            // 已生成的产物 [{id, name, kind, size, url, ...}]
+    totalSize: 0,         // 产物**总量**（字节）⇒ 页面显示占用量
+    limit: 0,             // 产物总量**上限**（字节）⇒ 超了不让再导出
     timer: null,          // 轮询定时器
     gen: 0,               // **代次**（清空时 +1）⇒ 作废在途的那一帧（旧结果不许长回来）
     loaded: false,        // 语言 / 音色下拉拉过了
@@ -926,12 +928,24 @@ const Qwen3Asr = {
     //    允许的；只是不能 import 它的代码）。
     $("asr-dub-start")?.addEventListener("click", () => this._dubStart());
     $("asr-dub-stop")?.addEventListener("click", () => this._dubStop());
-    $("asr-dub-files")?.addEventListener("change", () => this._dubSyncPlayer());
+    $("asr-dub-files")?.addEventListener("change", () => {
+      // ⚠️ **换选 ⇒ 「删除选中的」的可点状态要跟着变**（2026-11-28）。
+      this._dubSyncFilesUi();
+      this._dubSyncPlayer();
+    });
+    // ⚠️ **删除 / 全部清除**（2026-11-28 用户要求）—— 删的是**磁盘上的
+    //    产物文件**（不是页面上的结果）⇒ 与「显示模式」旁边那个「清空」
+    //    是两件事。
+    $("asr-dub-del")?.addEventListener("click", () => this._dubDeleteSelected());
+    $("asr-dub-clear")?.addEventListener("click", () => this._dubClearAll());
     this._dubLoadOptions();
     this._dubSyncButtons();
     // ⚠️ **拉一次上次的作业** —— 刷新页面后也能看到上次的导出结果
     //    （逐句原文 / 译文 + 两种语言）。
     this._dubRefreshStatus();
+    // ⚠️ **产物列表也要拉一次**（2026-11-28）—— 清单在**服务端**落盘 ⇒
+    //    「重启不消失」⇒ 页面一进来就该看到上次的产物。
+    this._dubRefreshFiles();
     // ⚠️ **刷新页面后要把「同传还在跑」接回来**（2026-11-25）——
     //
     // 症状（实测）：用户在同传跑着的时候刷新了页面 ⇒ 前端的
@@ -2698,6 +2712,8 @@ const Qwen3Asr = {
     if (mode === "rounds") this._renderRounds();
     // 视频来源下「文字显示框」= 字幕同款转写框 → 切模式时要重画。
     this._renderTranscript();
+    // ⚠️ **计数跟着模式走**（2026-11-28）——「共 N 句」/「共 N 轮」。
+    this._syncResultCount();
   },
 
   /**
@@ -5193,6 +5209,11 @@ const Qwen3Asr = {
    */
   _renderSentences(box, sentences, tail, unfixed) {
     if (!box) return;
+    // ⚠️ **先记「用户是不是在底部」**（渲染**之前**）—— 渲染完再判断就
+    //    晚了：新句子把 ``scrollHeight`` 撑大 ⇒ 永远判成「不在底部」⇒
+    //    实时识别时**最新那句反而看不见**（结果框限高 + 框内滚动之后
+    //    才会暴露出来的问题）。
+    const stick = this._isAtBottom(box);
     if (!box._sentRows) {
       box._sentRows = new Map();
       box._sentTail = document.createElement("div");
@@ -5276,6 +5297,65 @@ const Qwen3Asr = {
       box._sentLive.textContent = unfixed || "";
     }
     box._sentLive.classList.toggle("hidden", !unfixed);
+    // ⚠️ **自动滚到底部**（2026-11-28）—— 结果框限高 + 框内滚动之后，
+    //    新句子落在框的**下面** ⇒ 实时识别时用户看不见最新那句 ⇒
+    //    「用户本来就在底部」就跟着滚。
+    //
+    //    ⚠️ **用户往上拖了回看 ⇒ 别把他拽回去** ⇒ 判据在渲染**前**取。
+    this._stickToBottom(box, stick);
+    this._syncResultCount();
+  },
+
+  /**
+   * 这个滚动框**现在是不是在底部**？
+   *
+   * ⚠️ 没溢出（内容装得下）⇒ 算「在底部」（⇒ 后面有内容了就跟着滚）。
+   * ⚠️ 差 24 px 以内也算（⇒ 用户刚滚到最底下、手抖一下也不该被拽走）。
+   */
+  _isAtBottom(box) {
+    if (!box) return true;
+    const over = box.scrollHeight - box.clientHeight;
+    if (over <= 2) return true;
+    return box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  },
+
+  /** 滚到底部（**只在** ``stick`` 为真时）。 */
+  _stickToBottom(box, stick) {
+    if (!box || !stick) return;
+    box.scrollTop = box.scrollHeight;
+  },
+
+  /**
+   * 结果区的**计数**（2026-11-28）。
+   *
+   * ⚠️ **为什么要计数** —— 用户要求「实时结果」「识别过程」别无限往下长
+   *    ⇒ 加了限高 + 框内滚动条。但**光有滚动条**，用户不知道下面还剩
+   *    多少 ⇒ 把「共 N 句 / 共 N 轮」摆在**一直看得见**的那一行（状态组）
+   *    ⇒ 一眼知道「下面还有内容可以拖」。
+   */
+  _syncResultCount() {
+    const el = document.getElementById("asr-count");
+    if (!el) return;
+    const mode = document.getElementById("asr-mode")?.value || "single";
+    let n = 0;
+    let unit = "句";
+    if (mode === "rounds") {
+      n = (this.rounds || []).length;
+      unit = "轮";
+    } else {
+      const vis = (id) => {
+        const e = document.getElementById(id);
+        return e && !e.classList.contains("hidden");
+      };
+      if (vis("asr-sentences")) {
+        n = document.querySelectorAll("#asr-sentences .asr-sent").length;
+      } else if (vis("asr-rt-sentences")) {
+        n = document.querySelectorAll("#asr-rt-sentences .asr-sent").length;
+      } else {
+        n = document.querySelectorAll("#asr-transcript-body .asr-sub-line").length;
+      }
+    }
+    el.textContent = n ? ("共 " + n + " " + unit) : "";
   },
 
   /**
@@ -5312,6 +5392,7 @@ const Qwen3Asr = {
     }
     if (this._roundsShown === n) {
       box.scrollTop = box.scrollHeight;
+      this._syncResultCount();
       return;
     }
     // ③ 只追加新增的轮次
@@ -5341,6 +5422,8 @@ const Qwen3Asr = {
     this._roundsShown = n;
     this._roundsPrev = prev;
     box.scrollTop = box.scrollHeight;
+    // ⚠️ **计数跟着更新**（2026-11-28）—— 「共 N 轮」⇒ 用户知道下面还有。
+    this._syncResultCount();
   },
 
   // ------------------------------------------------------------------ WS
@@ -7085,8 +7168,8 @@ const Qwen3Asr = {
     this._setHint("正在生成配音版…");
     let path = this._dubSourcePath();
     if (!path && this._file) {
-      // ⚠️ 本机上传的文件**先传到设备端** —— 导出要在设备端跑，产物也
-      // 要落在设备端（源文件同级目录）。
+      // ⚠️ 本机上传的文件**先传到设备端** —— 导出要在设备端跑（产物落在
+      // 设备端的**产物目录**，见 ``dub.py::dub_output_root``）。
       this._dubSetStatus("正在上传到设备端…");
       path = await this._dubUpload(this._file);
       if (!path) return;
@@ -7154,7 +7237,7 @@ const Qwen3Asr = {
    *    **一个按钮清所有结果** ⇒ 这段由 ``reset()`` 调用。
    *
    * ⚠️ **清的是「逐句结果」**（原文 + 译文）—— **不删生成的文件**
-   *    （产物在源文件同级目录里，用户还要拿去播 / 拿去用）。
+   *    （产物在**产物目录**里，用户还要拿去播 / 拿去用）。
    *
    * ⚠️⚠️ **本地这份必须同步清**（2026-11-28）—— 合并规则是「配音导出有
    *    内容 ⇒ **藏掉**『实时结果』框」⇒ 配音面板还在的这段时间里，**识别
@@ -7169,7 +7252,14 @@ const Qwen3Asr = {
     //    （导出没内容了 ⇒ 「实时结果」框回来）。
     this._dub.hasJob = false;
     this._dubClearResult();
-    this._dubSetStatus("已清空");
+    // ⚠️⚠️ **这里写「未开始」，不写「已清空」**（2026-11-28 用户要求：
+    //    去掉「配音导出」里的「已清空」状态）——
+    //    这一行是**配音导出自己的状态行** ⇒ 它只该说**导出**的状态
+    //    （未开始 / 处理中 / 完成 / 失败…）；「已清空」是**全卡**的反馈，
+    //    已经写在「显示模式」上一行那条**共用提示行**里了（`_setOutcome`）
+    //    ⇒ 在这里再写一遍是**重复**，而且会让用户以为「配音导出」自己
+    //    出过一次结果。
+    this._dubSetStatus("未开始");
     this._dubSyncButtons();
   },
 
@@ -7202,7 +7292,9 @@ const Qwen3Asr = {
       return false;
     }
     this._dub.hasJob = false;
-    this._dubSetStatus("已清空");
+    // ⚠️ **同 ``_dubClearLocal()``** —— 状态行回到「未开始」，**不写
+    //    「已清空」**（2026-11-28 用户要求：去掉「配音导出」里的「已清空」）。
+    this._dubSetStatus("未开始");
     this._dubSyncButtons();
     return true;
   },
@@ -7530,24 +7622,34 @@ const Qwen3Asr = {
     if (body.textContent !== text) body.textContent = text;
   },
 
-  /** 重新列一次源文件同级目录里的产物。 */
+  /**
+   * 重新列一次**已生成的产物**（全局，不再按源文件筛）。
+   *
+   * ⚠️ **2026-11-28**：产物统一落在**工程目录的产物目录**
+   *    （``app/uploads/qwen3_asr/dub/``）⇒ 清单在**服务端落盘** ⇒
+   *    ① 跟当前源文件**无关**（换源文件也还在）；
+   *    ② **重启不消失**（服务重启、页面刷新都还在）。
+   *
+   * ⚠️ **不再需要 ``path``** —— 上一版要传源路径（扫源文件同级目录），
+   *    而那个路径会被「恢复会话」改写成临时音轨路径 ⇒ 越出资源根 ⇒ 400。
+   */
   async _dubRefreshFiles() {
-    // ⚠️⚠️ **优先用作业自己的源路径**（``/dub/status`` 里的
-    // ``source_path``）—— ``this._path`` 会被「恢复会话」改写（ASR 会话
-    // 报的可能是**临时音轨**路径，作业结束就没了）⇒ 拿它列产物会 400
-    // （临时目录在资源根之外）。
-    const path = this._dub.sourcePath || this._dubSourcePath();
-    if (!path) return;
     let items = [];
+    let total = 0;
+    let limit = 0;
     try {
-      const r = await fetch("/api/qwen3-asr/dub/files?path=" +
-                            encodeURIComponent(path), { cache: "no-store" });
+      const r = await fetch("/api/qwen3-asr/dub/files",
+                            { cache: "no-store" });
       const d = await r.json();
       items = (d && d.items) || [];
+      total = Number(d && d.total_size) || 0;
+      limit = Number(d && d.limit) || 0;
     } catch (e) {
       items = [];
     }
     this._dub.files = items;
+    this._dub.totalSize = total;
+    this._dub.limit = limit;
     const sel = document.getElementById("asr-dub-files");
     if (sel) {
       const prev = sel.value;
@@ -7560,16 +7662,138 @@ const Qwen3Asr = {
       } else {
         items.forEach((it) => {
           const o = document.createElement("option");
-          o.value = it.url;
+          o.value = it.id || it.name;
+          // ⚠️ **一行里带上类型 + 大小**（2026-11-28）—— 用户要靠这个
+          //    判断「哪些是我要的、哪些可以删」⇒ 光有文件名不够。
           o.textContent = it.name + "（" +
-            (it.kind === "video" ? "视频" : "音频") + "）";
+            (it.kind === "video" ? "视频" : "音频") + " · " +
+            (it.size_text || this._dubFormatSize(it.size)) + "）";
           sel.appendChild(o);
         });
         // ⚠️ 保持用户当前的选择（刷新列表别把选择冲掉）。
-        if (items.some((it) => it.url === prev)) sel.value = prev;
+        if (items.some((it) => (it.id || it.name) === prev)) sel.value = prev;
       }
     }
+    this._dubSyncFilesUi();
     this._dubSyncPlayer();
+  },
+
+  /** 字节数 ⇒ 人话（KB / MB / GB）。 */
+  _dubFormatSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + " MB";
+    return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
+  },
+
+  /**
+   * 产物那一栏的**占用量 / 按钮可用态**（2026-11-28）。
+   *
+   * ⚠️ **占用量要看得见** —— 用户的原话是「防止生成的文件可能占满本地
+   *    磁盘的风险」⇒ 光有删除按钮，用户不知道该不该删 ⇒ 把「共几个 /
+   *    占了多少 / 上限多少」摆在旁边，占到警戒线就**变色**。
+   */
+  _dubSyncFilesUi() {
+    const info = document.getElementById("asr-dub-files-info");
+    const n = this._dub.files.length;
+    const used = this._dub.totalSize || 0;
+    const limit = this._dub.limit || 0;
+    if (info) {
+      if (!n) {
+        info.textContent = "";
+        info.classList.remove("asr-dub-files-warn");
+      } else {
+        info.textContent = "共 " + n + " 个 · 占用 " +
+          this._dubFormatSize(used) +
+          (limit ? " / 上限 " + this._dubFormatSize(limit) : "");
+        // ⚠️ **超过上限的八成就标红**（提前提醒，别等真满了）。
+        info.classList.toggle("asr-dub-files-warn",
+                              !!limit && used >= limit * 0.8);
+      }
+    }
+    const del = document.getElementById("asr-dub-del");
+    const clr = document.getElementById("asr-dub-clear");
+    const sel = document.getElementById("asr-dub-files");
+    const picked = sel && sel.value ? sel.value : "";
+    if (del) del.disabled = !picked;
+    if (clr) clr.disabled = n === 0;
+  },
+
+  /**
+   * 删掉下拉里**选中的**那个产物（2026-11-28 用户要求：「增加可以删除的
+   * 功能」）。
+   *
+   * ⚠️ **不可撤销** ⇒ 弹 ``confirm()``。
+   * ⚠️ 删的是**磁盘上的文件** —— 与「显示模式」旁边那个「清空」（清页面
+   *    上的结果）是两件事。
+   */
+  async _dubDeleteSelected() {
+    const sel = document.getElementById("asr-dub-files");
+    const id = sel ? String(sel.value || "") : "";
+    if (!id) {
+      this._dubSetFilesStatus("先在下拉里选一个文件");
+      return;
+    }
+    const name = this._dub.files.find((it) => (it.id || it.name) === id);
+    const label = (name && name.name) || id;
+    if (!window.confirm("删掉「" + label + "」？\n（文件会被真的删除，删了就找不回来了）")) {
+      return;
+    }
+    this._dubSetFilesStatus("正在删除…");
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/files/" +
+                            encodeURIComponent(id), { method: "DELETE" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) {
+        this._dubSetFilesStatus("删不掉：" + (d.reason || d.detail || "未知错误"));
+        return;
+      }
+      this._dubSetFilesStatus("已删除：" + label);
+      await this._dubRefreshFiles();
+    } catch (e) {
+      this._dubSetFilesStatus("删除失败：" + e);
+    }
+  },
+
+  /**
+   * **一键清除所有**产物（2026-11-28 用户要求：「还要有一键清除所有」）。
+   *
+   * ⚠️ **不可撤销** ⇒ 弹 ``confirm()``，并且**把要删的数量与占用量**
+   *    写进确认语（用户得知道自己要删掉多少）。
+   */
+  async _dubClearAll() {
+    const n = this._dub.files.length;
+    if (!n) {
+      this._dubSetFilesStatus("没有产物可清");
+      return;
+    }
+    const used = this._dubFormatSize(this._dub.totalSize || 0);
+    if (!window.confirm("删掉**全部** " + n + " 个配音产物（共 " + used +
+                        "）？\n（文件会被真的删除，删了就找不回来了）")) {
+      return;
+    }
+    this._dubSetFilesStatus("正在清除…");
+    try {
+      const r = await fetch("/api/qwen3-asr/dub/files/clear", { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) {
+        this._dubSetFilesStatus("清不掉：" + (d.reason || d.detail || "未知错误"));
+        return;
+      }
+      this._dubSetFilesStatus("已清除 " + (d.removed || 0) + " 个文件（释放 " +
+                              (d.freed_text || this._dubFormatSize(d.freed || 0)) +
+                              "）");
+      await this._dubRefreshFiles();
+    } catch (e) {
+      this._dubSetFilesStatus("清除失败：" + e);
+    }
+  },
+
+  /** 产物那一栏的状态文字（跟「生成配音版」那个状态分开）。 */
+  _dubSetFilesStatus(text) {
+    const el = document.getElementById("asr-dub-files-status");
+    if (el) el.textContent = text || "";
   },
 
   /** 下拉里选中的那个文件 ⇒ 播给用户听 / 给他看。 */
@@ -7579,8 +7803,12 @@ const Qwen3Asr = {
     const audio = $("asr-dub-player");
     const video = $("asr-dub-video");
     if (!sel) return;
-    const url = sel.value || "";
-    const item = this._dub.files.find((it) => it.url === url);
+    // ⚠️ **下拉的 value 是产物的 id**（2026-11-28 改成按 id 选）⇒
+    //    播放地址要从清单里**查出来**（``item.url``），不能拿 value 当 URL。
+    const id = sel.value || "";
+    const item = this._dub.files.find(
+      (it) => (it.id || it.name) === id);
+    const url = item ? (item.url || "") : "";
     const isVideo = item && item.kind === "video";
     if (video) {
       video.classList.toggle("hidden", !isVideo);

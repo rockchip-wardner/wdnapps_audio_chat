@@ -11,13 +11,33 @@
                         ③ ①+② 重新封装成的一个音视频文件
 ======================  ==================================================
 
-文件名 = **源文件名称 + 目标语言 + 音色**，存在**源文件同级目录**：
+文件名 = **源文件名称 + 目标语言 + 音色**，存在**工程目录的产物目录**里
+（``app/uploads/qwen3_asr/dub/`` —— 宿主 ``app.core.uploads`` 给本卡
+预留的可写目录）：
 
 .. code-block:: text
 
-    会议录音.wav      →  会议录音_zh-CN_news_female.wav
-    宣传片.mp4        →  宣传片_zh-CN_news_female.wav
-                       宣传片_zh-CN_news_female.mp4
+    会议录音.wav      →  <工程目录>/app/uploads/qwen3_asr/dub/会议录音_zh-CN_news_female.wav
+    宣传片.mp4        →  <工程目录>/app/uploads/qwen3_asr/dub/宣传片_zh-CN_news_female.wav
+                       <工程目录>/app/uploads/qwen3_asr/dub/宣传片_zh-CN_news_female.mp4
+
+⚠️ **产物为什么不再落在源文件同级目录**（2026-11-28 用户要求）
+--------------------------------------------------------------
+
+上一版把产物写进**源文件的同级目录** ⇒ 三个毛病：
+
+1. **源目录可能是只读的**（系统目录 / 挂载的只读分区）⇒ 导出直接失败；
+2. **产物散落在各处** —— 源文件在哪儿，产物就在哪儿 ⇒ 用户回头找
+   不到自己生成的东西；
+3. **没法统一管** —— 「占满本地磁盘」的风险管不住（这正是用户要
+   「删除 / 一键清除」的原因）。
+
+⇒ 现在统一落到**本卡自己的产物目录**（工程目录内）：一处可列、可播、
+可删、可一键清空 ⇒ 磁盘占用始终看得见、管得住。
+
+⚠️ **文件名规则没变**（``<源名>_<目标语言>_<音色>``）⇒ 同样的源 + 同样
+的语言 + 同样的音色 ⇒ **同一个文件名** ⇒ 重复导出是**覆盖**，不是
+无限堆积（这也是「不会占满磁盘」的一半保证）。
 
 ⚠️ **为什么「导出」而不是「同传」**
 ----------------------------------
@@ -56,6 +76,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -74,6 +95,76 @@ DUB_KINDS = ("audio", "video")
 
 #: 一条字幕最短显示时长（秒）—— 太短会一闪而过。
 _MIN_CUE_SEC = 0.6
+
+# --------------------------------------------------------------------------- #
+# 产物目录（2026-11-28 用户要求：产物落到**工程目录**里，不落源文件旁边）
+# --------------------------------------------------------------------------- #
+
+#: 本卡在宿主 ``app/uploads/`` 下的子目录名（**与 manifest 的
+#: ``uploads_dir`` 一致** —— ``uploads/qwen3_asr``）。
+#:
+#: ⚠️ 用**下划线**不是连字符 —— 卡 id 是 ``qwen3-asr``，但 manifest 里
+#:    声明的目录名是 ``uploads/qwen3_asr`` ⇒ 两边必须一致。
+_DUB_CARD_ID = "qwen3_asr"
+
+#: 产物目录里那个**清单**文件的名字（不是产物本身，别把它当产物列出去）。
+_DUB_INDEX_NAME = "index.json"
+
+#: 产物**总量**上限（字节）—— 超过就不让再导出。
+#:
+#: ⚠️ **为什么要上限**（用户原话：「防止生成的文件可能占满本地磁盘」）——
+#:    产物是**用户点一次生成一次** ⇒ 没人盯着的话几十分钟就能堆几十 G
+#:    ⇒ 光有「删除」按钮不够，得**在源头**拦住。
+_DUB_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024      # 2 GiB
+
+#: 产物允许的后缀（音频 + 视频）。
+_DUB_ARTIFACT_EXTS = (".wav", ".mp4")
+
+
+def dub_output_root() -> Path:
+    """配音导出的**产物目录**（工程目录内）。
+
+    ⚠️ **走宿主那一份**（``app.core.uploads.get_card_uploads_root``）——
+       卡片**不自己拼路径**（宿主那边是唯一的真值源，且带「卡 id 合法性」
+       校验与「目录不存在就建」的逻辑）。
+
+    ⇒ 实际路径：``<宿主工程目录>/app/uploads/qwen3_asr/dub/``。
+
+    ⚠️ ``OSError`` **不抛** —— 目录建不出来（只读 fs）时，让**第一次真的
+       写文件**去报错（错误信息更贴近真正的原因）。
+    """
+    from app.core.uploads import get_card_uploads_root
+
+    root = get_card_uploads_root(_DUB_CARD_ID) / "dub"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:  # noqa: BLE001
+        LOG.warning("dub: 产物目录建不出来（%s）: %s", root, exc)
+    return root
+
+
+def _format_size(n: int) -> str:
+    """字节数 ⇒ 人话（KB / MB / GB）。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n < 1024:
+        return "{} B".format(n)
+    if n < 1024 * 1024:
+        return "{:.1f} KB".format(n / 1024.0)
+    if n < 1024 * 1024 * 1024:
+        return "{:.1f} MB".format(n / (1024.0 * 1024))
+    return "{:.2f} GB".format(n / (1024.0 * 1024 * 1024))
+
+
+class DubQuotaError(Exception):
+    """产物目录**已超上限** ⇒ 不让再导出（防占满磁盘）。
+
+    ⚠️ **单独一个异常类型** —— API 层要把它映射成 **507**
+    （「磁盘/配额不够」），跟 409（互斥）/ 400（参数错）/ 502（模型没起来）
+    分开。
+    """
 
 #: ⚠️ **不再等页面上正在跑的识别**（2026-11-27 用户要求：严格互斥）——
 #:    上一版是「等它跑完（上限 1800 s），超时才停掉它」⇒ 用户明确说
@@ -193,6 +284,284 @@ class DubJob:
         }
 
 
+class DubArtifactStore:
+    """配音导出**产物的清单**（落盘 JSON ⇒ **重启不消失**）。
+
+    ⚠️ **为什么要有清单**（2026-11-28 用户要求：「做成可以下拉的列表，
+       重启不消失」）—— 上一版是**扫源文件同级目录**找 ``<源名>_*``：
+    文件确实还在盘上，但① 清单是「扫出来的」，源文件换了就再也列不出来；
+    ② 目录里**混着用户的其它文件**（扫不出哪些是产物）；③ **重启后**
+    页面拉不到任何东西（列表依赖当前的源路径）。
+
+    ⇒ 现在：**产物目录是本卡专属的**（``app/uploads/qwen3_asr/dub/``）⇒
+    目录里**只有**产物 ⇒ 可以放心列、放心删、放心一键清空。
+
+    ⚠️ **清单与磁盘互为兜底**（:meth:`list`）：
+    * 清单里有、盘上没了 ⇒ **从清单里去掉**（文件被用户手工删了）；
+    * 盘上有、清单里没有 ⇒ **补进清单**（老版本产物 / 清单丢了 /
+      用户把文件拷进来）⇒ **不会有「看不见的产物」**。
+
+    ⚠️ **写清单要原子**（先写临时文件再 ``replace``）—— 断电 / 进程被
+       杀 ⇒ 清单不会写成半截 JSON（半截 ⇒ 读不出来 ⇒ 产物全成了
+       「孤儿」）。
+    """
+
+    def __init__(self, root: Optional[Path] = None) -> None:
+        self._root = root
+        self._lock = threading.RLock()
+        self._items: Dict[str, Dict[str, Any]] = {}
+        self._loaded = False
+
+    # ------------------------------------------------------------------ #
+    # 内部
+    # ------------------------------------------------------------------ #
+    @property
+    def root(self) -> Path:
+        """产物目录（**每次现取** —— 目录可能被配置改掉）。"""
+        if self._root is not None:
+            return self._root
+        return dub_output_root()
+
+    @property
+    def index_path(self) -> Path:
+        return self.root / _DUB_INDEX_NAME
+
+    def _load_locked(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        raw = ""
+        try:
+            raw = self.index_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            LOG.info("dub: 读不到产物清单（%s）⇒ 稍后按磁盘重建", exc)
+            return
+        try:
+            data = json.loads(raw or "{}")
+        except ValueError as exc:
+            LOG.warning("dub: 产物清单是坏 JSON（%s）⇒ 按磁盘重建", exc)
+            return
+        items = (data or {}).get("items")
+        if not isinstance(items, list):
+            return
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = str(it.get("name") or "").strip()
+            if not name:
+                continue
+            self._items[name] = dict(it)
+
+    def _save_locked(self) -> None:
+        payload = {
+            "version": 1,
+            "updated_at": time.time(),
+            "items": list(self._items.values()),
+        }
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            tmp = self.root / (_DUB_INDEX_NAME + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            tmp.replace(self.index_path)
+        except OSError as exc:
+            LOG.warning("dub: 产物清单写不下去（%s）: %s", self.index_path, exc)
+
+    def _safe_path(self, artifact_id: str) -> Optional[Path]:
+        """把**产物 id**（= 文件名）解析成目录内的真实路径。
+
+        ⚠️ **必须是目录里的一个裸文件名** —— 不许带 ``/``、不许是
+        ``..``、不许越界 ⇒ 这套端点**没有鉴权** ⇒ 不能让它变成
+        「任意文件删除」的口子。
+        """
+        name = str(artifact_id or "").strip()
+        if not name or name in (".", ".."):
+            return None
+        if "/" in name or "\\" in name or "\x00" in name:
+            return None
+        if name == _DUB_INDEX_NAME:
+            return None
+        root = self.root
+        try:
+            p = (root / name).resolve(strict=False)
+        except (OSError, RuntimeError):
+            return None
+        try:
+            if not p.is_relative_to(root.resolve(strict=False)):
+                return None
+        except (AttributeError, ValueError):  # pragma: no cover
+            if not str(p).startswith(str(root)):
+                return None
+        return p
+
+    # ------------------------------------------------------------------ #
+    # 对外
+    # ------------------------------------------------------------------ #
+    def list(self) -> List[Dict[str, Any]]:
+        """列出**全部**产物（新的在前）+ 和磁盘对账。"""
+        with self._lock:
+            self._load_locked()
+            root = self.root
+            on_disk: Dict[str, Path] = {}
+            try:
+                for p in root.iterdir():
+                    if not p.is_file():
+                        continue
+                    if p.name == _DUB_INDEX_NAME:
+                        continue
+                    if p.suffix.lower() not in _DUB_ARTIFACT_EXTS:
+                        continue
+                    on_disk[p.name] = p
+            except OSError as exc:
+                LOG.debug("dub: 扫产物目录失败（%s）: %s", root, exc)
+
+            dirty = False
+            # 清单里有、盘上没了 ⇒ 去掉
+            for name in list(self._items.keys()):
+                if name not in on_disk:
+                    self._items.pop(name, None)
+                    dirty = True
+            # 盘上有、清单里没有 ⇒ 补进去
+            for name, p in on_disk.items():
+                if name in self._items:
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                self._items[name] = {
+                    "name": name,
+                    "kind": "video" if p.suffix.lower() == ".mp4" else "audio",
+                    "size": int(st.st_size),
+                    "created_at": float(st.st_mtime),
+                    "source_name": "",
+                    "target_lang": "",
+                    "voice": "",
+                    "duration_sec": 0.0,
+                    "orphan": True,
+                }
+                dirty = True
+            # 大小 / 时间刷新（用户可能手工改过文件）
+            for name, p in on_disk.items():
+                it = self._items.get(name)
+                if it is None:
+                    continue
+                try:
+                    size = int(p.stat().st_size)
+                except OSError:
+                    continue
+                if it.get("size") != size:
+                    it["size"] = size
+                    dirty = True
+            if dirty:
+                self._save_locked()
+
+            out: List[Dict[str, Any]] = []
+            for it in self._items.values():
+                item = dict(it)
+                item["id"] = item.get("name") or ""
+                item["path"] = str(root / item["id"])
+                item["size_text"] = _format_size(item.get("size") or 0)
+                item["url"] = "/api/qwen3-asr/dub/files/{}/raw".format(
+                    _urlquote(item["id"]))
+                out.append(item)
+            out.sort(key=lambda it: (float(it.get("created_at") or 0.0),
+                                     it.get("id") or ""), reverse=True)
+            return out
+
+    def total_size(self) -> int:
+        """产物**总量**（字节）—— 用于「占满磁盘」的提示。"""
+        return int(sum(int(it.get("size") or 0) for it in self.list()))
+
+    def register(self, path: Path, *, kind: str = "audio",
+                 source_name: str = "", target_lang: str = "",
+                 voice: str = "", duration_sec: float = 0.0) -> Dict[str, Any]:
+        """登记一个产物（导出成功后调用）。"""
+        p = Path(path)
+        with self._lock:
+            self._load_locked()
+            try:
+                st = p.stat()
+                size = int(st.st_size)
+                mtime = float(st.st_mtime)
+            except OSError:
+                size, mtime = 0, time.time()
+            item = {
+                "name": p.name,
+                "kind": kind or ("video" if p.suffix.lower() == ".mp4" else "audio"),
+                "size": size,
+                "created_at": time.time(),
+                "mtime": mtime,
+                "source_name": source_name or "",
+                "target_lang": target_lang or "",
+                "voice": voice or "",
+                "duration_sec": round(float(duration_sec or 0.0), 2),
+            }
+            self._items[p.name] = item
+            self._save_locked()
+            return dict(item)
+
+    def delete(self, artifact_id: str) -> bool:
+        """删掉一个产物（文件 + 清单）。"""
+        p = self._safe_path(artifact_id)
+        if p is None:
+            return False
+        with self._lock:
+            self._load_locked()
+            existed = False
+            try:
+                if p.is_file():
+                    p.unlink()
+                    existed = True
+            except OSError as exc:
+                LOG.warning("dub: 删不掉产物 %s（%s）: %s", p, exc, exc)
+                return False
+            if self._items.pop(p.name, None) is not None:
+                existed = True
+            self._save_locked()
+            return existed
+
+    def clear(self) -> Dict[str, Any]:
+        """**一键清空**：删掉目录里所有产物 + 清掉清单。"""
+        removed = 0
+        freed = 0
+        with self._lock:
+            self._load_locked()
+            root = self.root
+            try:
+                for p in list(root.iterdir()):
+                    if not p.is_file():
+                        continue
+                    if p.name == _DUB_INDEX_NAME:
+                        continue
+                    if p.suffix.lower() not in _DUB_ARTIFACT_EXTS:
+                        continue
+                    try:
+                        freed += int(p.stat().st_size)
+                        p.unlink()
+                        removed += 1
+                    except OSError as exc:
+                        LOG.warning("dub: 清空时删不掉 %s（%s）", p, exc)
+            except OSError as exc:
+                LOG.warning("dub: 清空产物目录失败（%s）: %s", root, exc)
+            had = len(self._items)
+            self._items.clear()
+            self._save_locked()
+        return {"removed": max(removed, had), "freed": freed}
+
+    def path_of(self, artifact_id: str) -> Optional[Path]:
+        """产物 id ⇒ 真实路径（**只在目录内**；不在就 None）。"""
+        p = self._safe_path(artifact_id)
+        if p is None:
+            return None
+        try:
+            if not p.is_file():
+                return None
+        except OSError:
+            return None
+        return p
+
+
 def write_wav(path: Path, pcm: bytes, sample_rate: int) -> Path:
     """float32 单声道 PCM ⇒ 16-bit WAV 文件。"""
     import numpy as np
@@ -275,6 +644,19 @@ def split_audio_track(video: Path, out_wav: Path) -> Tuple[float, float]:
             pass
 
 
+def _wav_duration_sec(path: Path) -> float:
+    """WAV 文件的**时长**（秒）—— 读文件头，不解码。
+
+    ⚠️ **别拿 ``len(pcm) / sample_rate`` 算** —— ``pcm`` 是**字节数**
+    （float32 = 4 字节/采样）⇒ 那样算出来是真实时长的 **4 倍**（踩过）。
+    """
+    try:
+        with wave.open(str(path), "rb") as wf:
+            return float(wf.getnframes()) / float(max(1, wf.getframerate()))
+    except Exception:  # noqa: BLE001 — 读不到就当没有
+        return 0.0
+
+
 def _media_duration_sec(path: Path) -> float:
     """媒体的**时长**（秒）—— 只读容器头，不解码。
 
@@ -341,6 +723,8 @@ class DubEngine:
         self._thread: Optional[threading.Thread] = None
         self._cancel = threading.Event()
         self._seq = 0
+        #: **产物清单**（落盘 ⇒ 重启不消失）。
+        self._store = DubArtifactStore()
 
     # ------------------------------------------------------------------ #
     # 对外接口
@@ -379,6 +763,15 @@ class DubEngine:
         #    （``start()`` 里会 ``self._cancel.set()`` + 新建作业）⇒ 明明
         #    这次没起成，却把上一个搞没了。
         self._assert_page_asr_idle()
+
+        # ⚠️⚠️ **磁盘闸**（2026-11-28 用户要求：「防止生成的文件可能占满
+        #    本地磁盘」）—— 产物目录已经**超过上限** ⇒ **直接拒**（507）
+        #    ⇒ 用户得先删几个文件（或一键清空）才能再导出。
+        #
+        #    ⇒ 拦在**建作业之前** —— 否则这次调用会把上一个作业顶掉
+        #    （``start()`` 里会 ``self._cancel.set()``）⇒ 明明没起成，
+        #    却把上一个搞没了。
+        self._assert_quota()
 
         # ⚠️ **主事件循环** —— API 层是 async ⇒ 这里能抓到。译文广播要靠它
         # 回到主循环（``asyncio.Queue`` 不是线程安全的）。
@@ -471,8 +864,11 @@ class DubEngine:
         页面进的时候会拉一次**最新那个作业**的状态（``GET /dub/status``）
         ⇒ 只在前端清 DOM 的话，用户**一刷新页面**，上次的逐句结果又回来了。
 
-        ⚠️ **产物文件不删** —— 生成的配音文件在源文件同级目录里（用户还要
+        ⚠️ **产物文件不删** —— 生成的配音文件在**产物目录**里（用户还要
         拿去播 / 拿去用）⇒ 「清空」只清**结果**，不动文件。
+
+        ⇒ 要删文件 ⇒ 用「生成的文件」那一栏的**「删除」/「全部清除」**
+        （那是**另一个**动作，见 :meth:`delete_output` / :meth:`clear_outputs`）。
 
         ⚠️ **正在跑的时候不清** —— 否则会清出一个「半截」的作业状态
         （句子清了、作业还在跑）⇒ 拒掉，让用户先点「停止」。
@@ -497,40 +893,66 @@ class DubEngine:
             self._thread = None
         return {"ok": True, "cleared": True}
 
-    def list_outputs(self, source_path: str) -> List[Dict[str, Any]]:
-        """列出源文件同级目录里**已经生成**的配音文件（供页面下拉选择）。
+    def list_outputs(self, source_path: str = "") -> List[Dict[str, Any]]:
+        """列出**已经生成**的配音产物（供页面下拉选择）。
 
-        ⚠️ **只认本作业生成的文件名规则**（``<源名>_<语言>_<音色>``）——
-        不扫目录里的其它文件（用户目录里什么都有）。
+        ⚠️ **2026-11-28 起是全局的**（不再按源文件筛）—— 产物统一落在
+        本卡专属的产物目录（``app/uploads/qwen3_asr/dub/``）⇒ 清单就是
+        那一个目录里的东西 ⇒ 跟当前源文件**无关**。
+
+        ⚠️ ``source_path`` **保留但不再使用** —— 旧调用方（回归脚本 /
+        旧前端）还会传 ⇒ 别让它报错。
+
+        ⇒ 「重启不消失」靠的是**清单落盘**（见 :class:`DubArtifactStore`），
+        不是靠扫目录猜。
         """
-        src = Path(source_path or "")
-        if not src.name:
-            return []
-        parent = src.parent if str(src.parent) else Path(".")
-        try:
-            entries = sorted(parent.iterdir())
-        except OSError:
-            return []
-        out: List[Dict[str, Any]] = []
-        for p in entries:
-            if not p.is_file():
-                continue
-            if not p.name.startswith(src.stem + "_"):
-                continue
-            if p.suffix.lower() not in (".wav", ".mp4"):
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            out.append({
-                "name": p.name,
-                "path": str(p),
-                "kind": "video" if p.suffix.lower() == ".mp4" else "audio",
-                "size": size,
-                "url": "/api/qwen3-asr/media?path=" + _urlquote(str(p)),
-            })
-        return out
+        return self._store.list()
+
+    def list_artifacts(self) -> Dict[str, Any]:
+        """产物列表 + 占用量（页面「生成的文件」那一栏要的就是这个）。"""
+        items = self._store.list()
+        total = int(sum(int(it.get("size") or 0) for it in items))
+        return {
+            "items": items,
+            "count": len(items),
+            "total_size": total,
+            "total_size_text": _format_size(total),
+            "limit": _DUB_MAX_TOTAL_BYTES,
+            "limit_text": _format_size(_DUB_MAX_TOTAL_BYTES),
+            "dir": str(dub_output_root()),
+        }
+
+    def output_path(self, artifact_id: str) -> Optional[Path]:
+        """产物 id ⇒ 真实路径（**只在产物目录内**；不在 / 不存在 ⇒ None）。
+
+        ⚠️ API 层用它来**回放**文件 ⇒ 它是「不收用户给的路径」的那道闸
+        （只认清单里的裸文件名）。
+        """
+        return self._store.path_of(artifact_id)
+
+    def delete_output(self, artifact_id: str) -> Dict[str, Any]:
+        """删掉**一个**产物（文件 + 清单项）。
+
+        ⚠️ **只认清单里的 id**（= 产物目录里的一个裸文件名）⇒ 端点
+        没有鉴权，这道闸不能松。
+        """
+        p = self._store.path_of(artifact_id)
+        if p is None:
+            return {"ok": False, "deleted": False,
+                    "reason": "找不到这个文件（可能已经被删了）"}
+        ok = self._store.delete(artifact_id)
+        return {"ok": bool(ok), "deleted": bool(ok),
+                "id": artifact_id, "name": p.name}
+
+    def clear_outputs(self) -> Dict[str, Any]:
+        """**一键清空**：产物目录里所有产物 + 清单。"""
+        res = self._store.clear()
+        return {
+            "ok": True,
+            "removed": res.get("removed", 0),
+            "freed": res.get("freed", 0),
+            "freed_text": _format_size(res.get("freed", 0)),
+        }
 
     # ------------------------------------------------------------------ #
     # 内部
@@ -558,6 +980,27 @@ class DubEngine:
         status = mgr.status()
         if not status.get("running"):
             mgr.ensure()
+
+    def _assert_quota(self) -> None:
+        """产物目录**已超上限**吗 ⇒ 超了就**拒**（抛 :class:`DubQuotaError`）。
+
+        ⚠️ **为什么要这道闸**（2026-11-28 用户原话：「这样做的目的是为了
+        防止说生成的文件可能占满本地磁盘的风险」）——
+        产物是「点一次生成一次」⇒ 用户不盯着就能堆几十 G ⇒ 光有
+        「删除 / 一键清除」按钮不够，得**在源头**拦住。
+
+        ⚠️ **拦在起作业之前** ⇒ 不会把上一个正在跑的作业顶掉。
+        """
+        try:
+            used = self._store.total_size()
+        except Exception as exc:  # noqa: BLE001 — 算不出来就放行
+            LOG.debug("dub: 算产物占用失败（放行）: %s", exc)
+            return
+        if used >= _DUB_MAX_TOTAL_BYTES:
+            raise DubQuotaError(
+                "配音产物目录已经用了 {}（上限 {}）⇒ 先在「生成的文件」"
+                "那里删掉几个，或点「全部清除」，再导出".format(
+                    _format_size(used), _format_size(_DUB_MAX_TOTAL_BYTES)))
 
     def _assert_page_asr_idle(self) -> None:
         """页面上**有识别在跑**吗 ⇒ 有就**拒**（抛 :class:`DubBusyError`）。
@@ -755,6 +1198,10 @@ class DubEngine:
             out_audio = self._output_path(job, ".wav")
             write_wav(out_audio, pcm, sr)
             job.audio_path = str(out_audio)
+            # ⚠️ **登记进产物清单**（2026-11-28）—— 页面上的下拉列表靠它
+            #    ⇒ 清单落盘 ⇒ **重启不消失**。
+            self._register_artifact(job, out_audio, "audio",
+                                    duration_sec=_wav_duration_sec(out_audio))
 
             # ---------- ⑤ 视频：烧双字幕 + 重新封装 ---------------------- #
             if job.kind == "video":
@@ -764,6 +1211,17 @@ class DubEngine:
             self._set_phase(job, "完成", 1.0)
             job.state = "done"
             job.message = "完成"
+            # ⚠️ **超了上限就说一声**（产物已经写好了，不能扔）⇒ 页面上的
+            #    「生成的文件」那一栏会把占用量显示出来 ⇒ 用户自己决定删不删。
+            try:
+                used = self._store.total_size()
+            except Exception:  # noqa: BLE001
+                used = 0
+            if used >= _DUB_MAX_TOTAL_BYTES:
+                job.warnings.append(
+                    "配音产物目录已经用了 {}（上限 {}）⇒ 建议在「生成的文件」"
+                    "那里删掉几个，或点「全部清除」".format(
+                        _format_size(used), _format_size(_DUB_MAX_TOTAL_BYTES)))
         except Exception as exc:  # noqa: BLE001
             LOG.exception("dub: 作业失败")
             job.state = "error"
@@ -774,13 +1232,37 @@ class DubEngine:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             job.finished_at = time.time()
 
+    def _register_artifact(self, job: DubJob, path: Path, kind: str,
+                           duration_sec: float = 0.0) -> None:
+        """把产物登记进清单（**失败不致命** —— 清单只是给人看的列表）。"""
+        try:
+            self._store.register(
+                path,
+                kind=kind,
+                source_name=job.source_name or Path(job.source_path).name,
+                target_lang=job.target_lang or "",
+                voice=job.ref_speaker or job.speaker or "",
+                duration_sec=duration_sec,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("dub: 登记产物失败（%s）: %s", path, exc)
+
     def _set_phase(self, job: DubJob, phase: str, progress: float) -> None:
         job.phase = phase
         job.progress = float(max(0.0, min(1.0, progress)))
         job.message = phase
 
     def _output_path(self, job: DubJob, suffix: str) -> Path:
-        """``<源文件名>_<目标语言>_<音色><后缀>``（在源文件同级目录）。"""
+        """``<源文件名>_<目标语言>_<音色><后缀>``，落在**产物目录**里。
+
+        ⚠️ **不再落源文件同级目录**（2026-11-28 用户要求）—— 落到
+        ``app/uploads/qwen3_asr/dub/``（工程目录内，本卡专属）⇒
+        ① 源目录只读也能导出；② 产物集中一处，用户找得到；
+        ③ 能统一列 / 统一删 ⇒ **磁盘占用管得住**。
+
+        ⚠️ **文件名规则没变** ⇒ 同样的源 + 语言 + 音色 ⇒ **同一个文件**
+        ⇒ 重复导出是**覆盖**，不会无限堆积。
+        """
         src = Path(job.source_path)
         voice = job.ref_speaker or job.speaker or "default"
         name = "{}_{}_{}{}".format(
@@ -789,7 +1271,7 @@ class DubEngine:
             sanitize_name(voice, "default"),
             suffix,
         )
-        return src.parent / name
+        return dub_output_root() / name
 
     # ------------------------------------------------------------------ #
     # ASR + 翻译
@@ -1183,6 +1665,10 @@ class DubEngine:
             cancel=self._cancelled,
         )
         job.video_path = str(out_video)
+        # ⚠️ **登记进产物清单**（2026-11-28）—— 与音频产物同一个清单 ⇒
+        #    页面的下拉里两个都在。
+        self._register_artifact(job, out_video, "video",
+                                duration_sec=_media_duration_sec(out_video))
         for w in result.warnings:
             job.warnings.append(w)
         if result.frames == 0:

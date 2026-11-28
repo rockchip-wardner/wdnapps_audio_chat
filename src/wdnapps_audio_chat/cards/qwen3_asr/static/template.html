@@ -361,8 +361,9 @@
                                    ② **双字幕**（原文 + 译文）烧进画面
                                    ③ ①② 重新封装成一个音视频文件。
 
-              文件名 = **源文件名 + 导出语言 + 音色**，存在**源文件同级目录**
-              ⇒ 生成完可以在下面**挑一个文件播放**。
+              文件名 = **源文件名 + 导出语言 + 音色**，存在**工程目录的产物
+              目录**里（``app/uploads/qwen3_asr/dub/``）⇒ 生成完可以在
+              下面**挑一个文件播放**，也能**删掉**它（防占满磁盘）。
 
               ⚠️ 这一块与「实时翻译」「字幕实时显示」**并行**：翻译照旧实时
               显示在页面底部，配音版是**另外**跑一遍导出的产物。
@@ -419,16 +420,51 @@
               <div class="asr-tr-hint">
                 「导出语言」决定生成的文件里的语言（音轨和烧进画面的字幕）。它与上面的「显示语言」互不影响 —— 改了显示语言，生成的文件仍然是导出语言。
               </div>
+              <!--
+                ⚠️ **产物落在工程目录里**（2026-11-28 用户要求）——
+                原来落在**源文件同级目录** ⇒ 源目录只读就导不出、产物散落
+                各处找不到、也没法统一清理（占满磁盘的风险管不住）。
+
+                ⇒ 现在统一落在本卡专属的产物目录：
+                ``<工程目录>/app/uploads/qwen3_asr/dub/``
+
+                ⚠️ **这一栏现在是全局的** —— 下拉里列的是**所有**已生成的
+                产物（**不再**只列当前源文件的）⇒ 清单落盘 ⇒ **重启不消失**。
+              -->
               <div class="asr-tr-head">
                 <label class="asr-file-label" for="asr-dub-files">生成的文件</label>
                 <select id="asr-dub-files" class="tts-select"></select>
+                <!--
+                  ⚠️ **占用量显示在这里**（2026-11-28 用户要求）—— 用户的
+                  原话是「防止生成的文件可能占满本地磁盘的风险」⇒ 光有
+                  「删除」不够，**得看得见占了多少** ⇒ 超过警戒线就变色。
+                -->
+                <span class="asr-dub-files-info" id="asr-dub-files-info"></span>
                 <audio id="asr-dub-player" class="asr-preview asr-preview-audio"
                        controls preload="metadata"></audio>
                 <video id="asr-dub-video" class="asr-preview hidden" controls
                        preload="metadata" playsinline></video>
               </div>
+              <!--
+                ⚠️ **删除**（2026-11-28 用户要求：「请帮忙规划增加可以删除的
+                功能，并且还要有一键清除所有」）——
+
+                * 「删除选中的」—— 删下拉里当前选中的那一个；
+                * 「全部清除」—— 删掉产物目录里**所有**产物（一键）。
+
+                ⚠️ **别跟「显示模式」旁边那个「清空」混起来** —— 那个清的是
+                **页面上的结果**（原文 / 译文），这两个删的是**磁盘上的文件**
+                ⇒ 一个在结果区旁边，一个在产物旁边 ⇒ 各自挨着自己管的东西。
+              -->
+              <div class="asr-tr-head">
+                <span class="asr-btn-group">
+                  <button type="button" class="vd-btn" id="asr-dub-del" disabled>删除选中的</button>
+                  <button type="button" class="vd-btn" id="asr-dub-clear" disabled>全部清除</button>
+                </span>
+                <span class="asr-live-status" id="asr-dub-files-status"></span>
+              </div>
               <div class="asr-tr-note" id="asr-dub-hint">
-                生成的文件保存在源文件同级目录，文件名 = 源文件名 + 导出语言 + 音色。「清空」按钮在「显示模式」下拉右边，点它会清掉页面上的所有结果，生成的文件不会删。
+                生成的文件保存在工程目录的 app/uploads/qwen3_asr/dub/ 下，文件名 = 源文件名 + 导出语言 + 音色（同样的参数会覆盖同一个文件）。「删除选中的」「全部清除」删的是这些文件；「显示模式」下拉右边的「清空」清的是页面上的结果，不会删文件。
               </div>
             </div>
 
@@ -486,6 +522,16 @@
               <span class="asr-status-group">
                 <span class="imb-status" id="asr-state-badge" data-state="idle">空闲</span>
                 <span class="imb-meta-inline" id="asr-language"></span>
+                <!--
+                  ⚠️ **计数**（2026-11-28 用户要求）—— 「实时结果」「识别过程」
+                  现在都是**限高 + 框内滚动条** ⇒ 用户看得见「框里还有内容
+                  可以拖」，但**不知道下面还剩多少** ⇒ 把「共 N 句 / 共 N 轮」
+                  摆在**一直看得见**的这一行（状态组）⇒ 一眼有数。
+
+                  ⚠️ **这一行是「实时结果」与「识别过程」共用的** ⇒ 计数随
+                  「显示模式」切换（句 ↔ 轮）。
+                -->
+                <span class="imb-meta-inline" id="asr-count"></span>
               </span>
             </div>
 
